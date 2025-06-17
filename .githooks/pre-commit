@@ -1,0 +1,16 @@
+#!/bin/bash
+
+echo "Running pre-commit hook..."
+
+# Run Helm commands
+echo "Running Helm package command..."
+helm package charts/strapi-sync-wizard -d charts/
+
+echo "Running Helm repo index command..."
+helm repo index charts/ --url https://ivseb.github.io/strapi-sync-wizard/charts
+
+# Add any changes to the staging area
+echo "Adding changes to staging area..."
+git add charts/
+
+echo "Pre-commit hook completed successfully."

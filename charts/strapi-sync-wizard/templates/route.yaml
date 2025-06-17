@@ -1,0 +1,25 @@
+{{- if and .Values.openshift.enabled .Values.openshift.route.enabled -}}
+{{- $fullName := include "strapi-sync-wizard.fullname" . -}}
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "strapi-sync-wizard.labels" . | nindent 4 }}
+    router: {{ .Values.openshift.route.routerLabel | default "internal" }}
+spec:
+  {{- if .Values.openshift.route.host }}
+  host: {{ .Values.openshift.route.host }}
+  {{- end }}
+  to:
+    kind: Service
+    name: {{ $fullName }}
+    weight: 100
+  port:
+    targetPort: http
+  {{- if .Values.openshift.route.tls.enabled }}
+  tls:
+    termination: {{ .Values.openshift.route.tls.termination }}
+    insecureEdgeTerminationPolicy: {{ .Values.openshift.route.tls.insecureEdgeTerminationPolicy }}
+  {{- end }}
+{{- end }}

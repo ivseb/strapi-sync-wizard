@@ -1,0 +1,47 @@
+Thank you for installing {{ .Chart.Name }}.
+
+Your release is named {{ .Release.Name }}.
+
+To learn more about the release, try:
+
+  $ helm status {{ .Release.Name }}
+  $ helm get all {{ .Release.Name }}
+
+{{- if .Values.ingress.enabled }}
+{{- range $host := .Values.ingress.hosts }}
+  {{- range .paths }}
+You can access the application at http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host.host }}{{ .path }}
+  {{- end }}
+{{- end }}
+{{- else if and .Values.openshift.enabled .Values.openshift.route.enabled }}
+You can access the application at:
+{{- if .Values.openshift.route.host }}
+  http{{ if .Values.openshift.route.tls.enabled }}s{{ end }}://{{ .Values.openshift.route.host }}
+{{- else }}
+  Run the following command to get the application URL:
+  $ oc get route {{ include "strapi-sync-wizard.fullname" . }} -o jsonpath='{.spec.host}'
+{{- end }}
+{{- else }}
+To access the application from within the cluster:
+
+  $ kubectl port-forward svc/{{ include "strapi-sync-wizard.fullname" . }} 8080:{{ .Values.service.port }}
+
+Then access the application at: http://localhost:8080
+{{- end }}
+
+{{- if not .Values.database.external }}
+{{- if .Values.database.postgresql.enabled }}
+A PostgreSQL database has been deployed as part of this release.
+
+Database connection details:
+  Host: {{ include "strapi-sync-wizard.fullname" . }}-postgresql
+  Port: 5432
+  Database: {{ .Values.database.postgresql.auth.database }}
+  Username: {{ .Values.database.postgresql.auth.username }}
+  Password: Use the following command to retrieve the password:
+    $ kubectl get secret {{ include "strapi-sync-wizard.fullname" . }} -o jsonpath="{.data.database-password}" | base64 --decode
+{{- end }}
+{{- end }}
+
+For more information and configuration options, see the chart's README.md or run:
+  $ helm show values {{ .Chart.Name }}

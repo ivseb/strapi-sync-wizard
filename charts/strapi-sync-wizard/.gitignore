@@ -1,0 +1,3 @@
+# Helm chart generated files
+*.tgz
+charts/

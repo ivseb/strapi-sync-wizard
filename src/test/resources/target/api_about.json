@@ -1,0 +1,28 @@
+{
+  "data": {
+    "id": 1,
+    "documentId": "viicol1ha9q6tu2s2n3div83",
+    "title": "About the strapi blog",
+    "createdAt": "2025-05-07T16:35:36.556Z",
+    "updatedAt": "2025-05-07T16:35:36.556Z",
+    "publishedAt": "2025-05-07T16:35:36.551Z",
+    "blocks": [
+      {
+        "__component": "shared.quote",
+        "id": 1,
+        "title": "Thelonius Monk",
+        "body": "You've got to dig it to dig it, you dig?"
+      },
+      {
+        "__component": "shared.rich-text",
+        "id": 1,
+        "body": "## Dedit imago conspicuus cum capillis totidem inhibere\n\nLorem markdownum **rerum**, est limine: columbas: ab infelix hostem arbore nudis\ncrudelis. Videtur reliquit ambo ferrum dote sub amne fatis **illuc**, in magis,\nnec."
+      },
+      {
+        "__component": "shared.media",
+        "id": 1
+      }
+    ]
+  },
+  "meta": {}
+}
