@@ -268,6 +268,35 @@ const MergeRequestDetails: React.FC = () => {
         }
     };
 
+    // Function to update all selections for a specific content type and direction
+    const updateAllSelections = async (contentType: string, direction: string, documentIds: string[], isSelected: boolean) => {
+        if (!id) return false;
+
+        try {
+            await axios.post(`/api/merge-requests/${id}/bulk-selection`, {
+                contentType,
+                direction,
+                documentIds,
+                isSelected
+            });
+
+            // Fetch the updated merge request details
+            const updatedMergeRequest = await axios.get(`/api/merge-requests/${id}`);
+            setMergeRequestDetail(updatedMergeRequest.data);
+
+            return true;
+        } catch (err: any) {
+            console.error('Error updating bulk selections:', err);
+            toast.current?.show({
+                severity: 'error',
+                summary: 'Error',
+                detail: err.response?.data?.message || 'Failed to update selections',
+                life: 3000
+            });
+            return false;
+        }
+    };
+
     // Merge single types - now just updates status and proceeds to next step
     const mergeSingleTypes = async () => {
         if (!id) return;
@@ -593,11 +622,11 @@ const MergeRequestDetails: React.FC = () => {
                         {/* Step 3: Merge Files */}
                         <StepperPanel header="Merge Files">
                             <MergeFilesStep
-
                                 mergeRequestId={mergeRequestDetail.mergeRequest.id}
                                 filesData={mergeRequestDetail.mergeRequestData?.files}
                                 loading={false}
                                 updateSingleSelection={updateSingleSelection}
+                                updateAllSelections={updateAllSelections}
                                 selections={mergeRequestDetail.mergeRequestData?.selections}
                             />
                             <div className="flex py-4 gap-2 justify-content-between">

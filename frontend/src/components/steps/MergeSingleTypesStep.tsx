@@ -74,6 +74,11 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
     const [expandedToDeleteTypes, setExpandedToDeleteTypes] = useState<Record<string, boolean>>({});
     const [expandedIdenticalTypes, setExpandedIdenticalTypes] = useState<Record<string, boolean>>({});
 
+    // Loading states for each table
+    const [createTableLoading, setCreateTableLoading] = useState<boolean>(false);
+    const [updateTableLoading, setUpdateTableLoading] = useState<boolean>(false);
+    const [deleteTableLoading, setDeleteTableLoading] = useState<boolean>(false);
+
     // State for editor modal
     const [editorDialogVisible, setEditorDialogVisible] = useState<boolean>(false);
     const [editorContent, setEditorContent] = useState<any>(null);
@@ -178,6 +183,15 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
             documentId = previousEntries[0];
         }
 
+        // Set loading state based on the type
+        if (type === 'create') {
+            setCreateTableLoading(true);
+        } else if (type === 'update') {
+            setUpdateTableLoading(true);
+        } else if (type === 'delete') {
+            setDeleteTableLoading(true);
+        }
+
         try {
             let success = false;
 
@@ -213,6 +227,15 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
             }
         } catch (err: any) {
             console.error(`Error updating selection for ${contentType}:`, err);
+        } finally {
+            // Clear loading state based on the type
+            if (type === 'create') {
+                setCreateTableLoading(false);
+            } else if (type === 'update') {
+                setUpdateTableLoading(false);
+            } else if (type === 'delete') {
+                setDeleteTableLoading(false);
+            }
         }
     };
 
@@ -470,7 +493,77 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
                     <DataTable
                         value={toCreateTypes}
                         selectionMode="multiple"
+                        loading={createTableLoading}
                         selection={toCreateTypes.filter(ct => selectedEntries[ct.contentType]?.entriesToCreate.length > 0)}
+                        selectAll={toCreateTypes.length > 0 && 
+                                  toCreateTypes.length === toCreateTypes.filter(ct => 
+                                    selectedEntries[ct.contentType]?.entriesToCreate.length > 0).length}
+                        onSelectAllChange={e => {
+                            // For each content type, collect the document IDs
+                            const contentTypeDocumentIds: Record<string, string[]> = {};
+
+                            toCreateTypes.forEach(ct => {
+                                if (ct.onlyInSource) {
+                                    const contentType = ct.contentType;
+                                    const documentId = ct.onlyInSource.metadata.documentId;
+
+                                    if (!contentTypeDocumentIds[contentType]) {
+                                        contentTypeDocumentIds[contentType] = [];
+                                    }
+
+                                    contentTypeDocumentIds[contentType].push(documentId);
+                                }
+                            });
+
+                            // Set loading state
+                            setCreateTableLoading(true);
+
+                            // For each content type, make a bulk API call
+                            const promises = Object.entries(contentTypeDocumentIds).map(([contentType, documentIds]) => {
+                                if (documentIds.length === 0) return Promise.resolve();
+
+                                // Make the API call
+                                return axios.post(`/api/merge-requests/${mergeRequestId}/bulk-selection`, {
+                                    contentType,
+                                    direction: 'TO_CREATE',
+                                    documentIds,
+                                    isSelected: e.checked
+                                })
+                                .then(response => {
+                                    if (response.data.success) {
+                                        // If successful, update the local state
+                                        setSelectedEntries(prevState => {
+                                            const newState = { ...prevState };
+
+                                            if (e.checked) {
+                                                // Select all items
+                                                newState[contentType] = {
+                                                    ...newState[contentType],
+                                                    entriesToCreate: documentIds
+                                                };
+                                            } else {
+                                                // Deselect all items
+                                                newState[contentType] = {
+                                                    ...newState[contentType],
+                                                    entriesToCreate: []
+                                                };
+                                            }
+
+                                            return newState;
+                                        });
+                                    }
+                                })
+                                .catch(err => {
+                                    console.error(`Error in select all for ${contentType}:`, err);
+                                });
+                            });
+
+                            // Clear loading state when all promises are resolved
+                            Promise.all(promises)
+                                .finally(() => {
+                                    setCreateTableLoading(false);
+                                });
+                        }}
                         onSelectionChange={(e) => {
                             const selectedContentTypes = e.value as ContentTypeComparisonResultWithRelationships[];
                             const previouslySelected = toCreateTypes.filter(ct =>
@@ -550,7 +643,77 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
                     <DataTable
                         value={toUpdateTypes}
                         selectionMode="multiple"
+                        loading={updateTableLoading}
                         selection={toUpdateTypes.filter(ct => selectedEntries[ct.contentType]?.entriesToUpdate.indexOf(ct.different!!.source.metadata.documentId) > -1)}
+                        selectAll={toUpdateTypes.length > 0 && 
+                                  toUpdateTypes.length === toUpdateTypes.filter(ct => 
+                                    selectedEntries[ct.contentType]?.entriesToUpdate.indexOf(ct.different!!.source.metadata.documentId) > -1).length}
+                        onSelectAllChange={e => {
+                            // For each content type, collect the document IDs
+                            const contentTypeDocumentIds: Record<string, string[]> = {};
+
+                            toUpdateTypes.forEach(ct => {
+                                if (ct.different) {
+                                    const contentType = ct.contentType;
+                                    const documentId = ct.different.source.metadata.documentId;
+
+                                    if (!contentTypeDocumentIds[contentType]) {
+                                        contentTypeDocumentIds[contentType] = [];
+                                    }
+
+                                    contentTypeDocumentIds[contentType].push(documentId);
+                                }
+                            });
+
+                            // Set loading state
+                            setUpdateTableLoading(true);
+
+                            // For each content type, make a bulk API call
+                            const promises = Object.entries(contentTypeDocumentIds).map(([contentType, documentIds]) => {
+                                if (documentIds.length === 0) return Promise.resolve();
+
+                                // Make the API call
+                                return axios.post(`/api/merge-requests/${mergeRequestId}/bulk-selection`, {
+                                    contentType,
+                                    direction: 'TO_UPDATE',
+                                    documentIds,
+                                    isSelected: e.checked
+                                })
+                                .then(response => {
+                                    if (response.data.success) {
+                                        // If successful, update the local state
+                                        setSelectedEntries(prevState => {
+                                            const newState = { ...prevState };
+
+                                            if (e.checked) {
+                                                // Select all items
+                                                newState[contentType] = {
+                                                    ...newState[contentType],
+                                                    entriesToUpdate: documentIds
+                                                };
+                                            } else {
+                                                // Deselect all items
+                                                newState[contentType] = {
+                                                    ...newState[contentType],
+                                                    entriesToUpdate: []
+                                                };
+                                            }
+
+                                            return newState;
+                                        });
+                                    }
+                                })
+                                .catch(err => {
+                                    console.error(`Error in select all for ${contentType}:`, err);
+                                });
+                            });
+
+                            // Clear loading state when all promises are resolved
+                            Promise.all(promises)
+                                .finally(() => {
+                                    setUpdateTableLoading(false);
+                                });
+                        }}
                         onSelectionChange={(e) => {
                             const selectedContentTypes = e.value as ContentTypeComparisonResultWithRelationships[];
                             const previouslySelected = toUpdateTypes.filter(ct =>
@@ -590,7 +753,7 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
                         dataKey="different.source.metadata.documentId"
                         paginator
                         rows={5}
-                        rowsPerPageOptions={[5, 10, 25]}
+                        rowsPerPageOptions={[5, 10, 25,50]}
                         emptyMessage="No content types to update"
                         expandedRows={expandedToUpdateTypes}
                         onRowToggle={(e) => {
@@ -630,7 +793,77 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
                     <DataTable
                         value={toDeleteTypes}
                         selectionMode="multiple"
+                        loading={deleteTableLoading}
                         selection={toDeleteTypes.filter(ct => selectedEntries[ct.contentType]?.entriesToDelete.length > 0)}
+                        selectAll={toDeleteTypes.length > 0 && 
+                                  toDeleteTypes.length === toDeleteTypes.filter(ct => 
+                                    selectedEntries[ct.contentType]?.entriesToDelete.length > 0).length}
+                        onSelectAllChange={e => {
+                            // For each content type, collect the document IDs
+                            const contentTypeDocumentIds: Record<string, string[]> = {};
+
+                            toDeleteTypes.forEach(ct => {
+                                if (ct.onlyInTarget) {
+                                    const contentType = ct.contentType;
+                                    const documentId = ct.onlyInTarget.metadata.documentId;
+
+                                    if (!contentTypeDocumentIds[contentType]) {
+                                        contentTypeDocumentIds[contentType] = [];
+                                    }
+
+                                    contentTypeDocumentIds[contentType].push(documentId);
+                                }
+                            });
+
+                            // Set loading state
+                            setDeleteTableLoading(true);
+
+                            // For each content type, make a bulk API call
+                            const promises = Object.entries(contentTypeDocumentIds).map(([contentType, documentIds]) => {
+                                if (documentIds.length === 0) return Promise.resolve();
+
+                                // Make the API call
+                                return axios.post(`/api/merge-requests/${mergeRequestId}/bulk-selection`, {
+                                    contentType,
+                                    direction: 'TO_DELETE',
+                                    documentIds,
+                                    isSelected: e.checked
+                                })
+                                .then(response => {
+                                    if (response.data.success) {
+                                        // If successful, update the local state
+                                        setSelectedEntries(prevState => {
+                                            const newState = { ...prevState };
+
+                                            if (e.checked) {
+                                                // Select all items
+                                                newState[contentType] = {
+                                                    ...newState[contentType],
+                                                    entriesToDelete: documentIds
+                                                };
+                                            } else {
+                                                // Deselect all items
+                                                newState[contentType] = {
+                                                    ...newState[contentType],
+                                                    entriesToDelete: []
+                                                };
+                                            }
+
+                                            return newState;
+                                        });
+                                    }
+                                })
+                                .catch(err => {
+                                    console.error(`Error in select all for ${contentType}:`, err);
+                                });
+                            });
+
+                            // Clear loading state when all promises are resolved
+                            Promise.all(promises)
+                                .finally(() => {
+                                    setDeleteTableLoading(false);
+                                });
+                        }}
                         onSelectionChange={(e) => {
                             const selectedContentTypes = e.value as ContentTypeComparisonResultWithRelationships[];
                             const previouslySelected = toDeleteTypes.filter(ct =>
@@ -670,7 +903,7 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
                         dataKey="contentType"
                         paginator
                         rows={5}
-                        rowsPerPageOptions={[5, 10, 25]}
+                        rowsPerPageOptions={[5, 10, 25,50]}
                         emptyMessage="No content types to delete"
                         expandedRows={expandedToDeleteTypes}
                         onRowToggle={(e) => {
@@ -712,7 +945,7 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
                         dataKey="contentType"
                         paginator
                         rows={5}
-                        rowsPerPageOptions={[5, 10, 25]}
+                        rowsPerPageOptions={[5, 10, 25,50]}
                         emptyMessage="No identical content types"
                         expandedRows={expandedIdenticalTypes}
                         onRowToggle={(e) => {

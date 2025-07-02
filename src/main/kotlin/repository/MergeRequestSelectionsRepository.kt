@@ -186,6 +186,58 @@ class MergeRequestSelectionsRepository {
     }
 
     /**
+     * Update all selections for a specific content type and direction
+     * Adds or removes all selections based on the isSelected parameter
+     */
+    suspend fun updateAllSelections(
+        mergeRequestId: Int,
+        contentType: String,
+        direction: Direction,
+        documentIds: List<String>,
+        isSelected: Boolean
+    ): Boolean = dbQuery {
+        if (isSelected) {
+            // Add all selections that don't already exist
+            documentIds.forEach { documentId ->
+                // Check if the selection already exists
+                val existingSelection = MergeRequestSelectionsTable.selectAll()
+                    .where {
+                        (MergeRequestSelectionsTable.mergeRequestId eq mergeRequestId) and
+                        (MergeRequestSelectionsTable.contentType eq contentType) and
+                        (MergeRequestSelectionsTable.documentId eq documentId) and
+                        (MergeRequestSelectionsTable.direction eq direction)
+                    }
+                    .singleOrNull()
+
+                if (existingSelection == null) {
+                    // Add the selection
+                    MergeRequestSelectionsTable.insert {
+                        it[MergeRequestSelectionsTable.mergeRequestId] = mergeRequestId
+                        it[MergeRequestSelectionsTable.contentType] = contentType
+                        it[MergeRequestSelectionsTable.documentId] = documentId
+                        it[MergeRequestSelectionsTable.direction] = direction
+                    }
+                }
+            }
+            true
+        } else {
+            // Remove all selections for this content type and direction
+            // Since we can't use 'inList' directly, we'll delete each document ID individually
+            var anyDeleted = false
+            documentIds.forEach { documentId ->
+                val deleted = MergeRequestSelectionsTable.deleteWhere {
+                    (MergeRequestSelectionsTable.mergeRequestId eq mergeRequestId) and
+                    (MergeRequestSelectionsTable.contentType eq contentType) and
+                    (MergeRequestSelectionsTable.documentId eq documentId) and
+                    (MergeRequestSelectionsTable.direction eq direction)
+                } > 0
+                if (deleted) anyDeleted = true
+            }
+            anyDeleted
+        }
+    }
+
+    /**
      * Update the sync status of a selection
      */
     suspend fun updateSyncStatus(

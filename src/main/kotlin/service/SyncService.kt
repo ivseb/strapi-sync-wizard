@@ -5,11 +5,12 @@ import it.sebi.client.client
 import it.sebi.models.*
 import it.sebi.repository.MergeRequestDocumentMappingRepository
 import it.sebi.utils.calculateMD5Hash
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.*
 import java.time.OffsetDateTime
-import kotlin.collections.component1
-import kotlin.collections.component2
-import kotlin.collections.set
+import kotlin.script.experimental.api.asSuccess
 
 
 class SyncService(private val mergeRequestDocumentMappingRepository: MergeRequestDocumentMappingRepository) {
@@ -264,19 +265,29 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         // Build content type relationships
         val contentTypeRelationships = buildContentTypeRelationships(sourceContentTypes, components)
 
+
         // Cache for content entries to avoid repeated API calls
         val sourceEntriesCache = mutableMapOf<String, List<EntryElement>>()
         val targetEntriesCache = mutableMapOf<String, List<EntryElement>>()
 
-        // Fetch all entries for each content type once
-        for (contentType in sourceContentTypes) {
-            val entries = sourceClient.getContentEntries(contentType, null)
-            sourceEntriesCache[contentType.uid] = entries
-        }
+        // Fetch all entries for each content type once in parallel
+        coroutineScope {
+            val sourceDeferred = async {
+                sourceContentTypes.map { contentType ->
 
-        for (contentType in sourceContentTypes) {
-            val entries = targetClient.getContentEntries(contentType, mappings)
-            targetEntriesCache[contentType.uid] = entries
+
+                    val entries = sourceClient.getContentEntries(contentType, null)
+                    sourceEntriesCache[contentType.uid] = entries
+
+                }
+            }
+            val targetDeferred = async { sourceContentTypes.map { contentType ->
+                    val entries = targetClient.getContentEntries(contentType, mappings)
+                    targetEntriesCache[contentType.uid] = entries
+                }
+            }
+            sourceDeferred.await()
+            targetDeferred.await()
         }
 
 
@@ -292,8 +303,6 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
         for (contentType in singleTypes) {
             val comparisonResult = compareContentType(
-                sourceClient,
-                targetClient,
                 mergeRequest.sourceInstance,
                 mergeRequest.targetInstance,
                 contentType,
@@ -840,9 +849,11 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                     fieldValue is JsonObject && fieldValue.containsKey("documentId") -> {
                         listOf(fieldValue.jsonObject)
                     }
+
                     fieldValue is JsonArray && fieldValue.jsonArray.isNotEmpty() -> {
                         fieldValue.jsonArray.toList().map { it.jsonObject }
                     }
+
                     else -> listOf()
                 }
 
@@ -1157,8 +1168,6 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
      * @param targetEntriesCache Optional cache of target entries to avoid repeated API calls
      */
     private suspend fun compareContentType(
-        sourceClient: StrapiClient,
-        targetClient: StrapiClient,
         sourceInstance: StrapiInstance,
         targetInstance: StrapiInstance,
         contentType: StrapiContentType,

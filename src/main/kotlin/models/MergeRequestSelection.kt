@@ -77,6 +77,17 @@ data class SingleSelectionDTO(
 )
 
 /**
+ * Data transfer object for bulk selection updates
+ */
+@Serializable
+data class BulkSelectionDTO(
+    val contentType: String,
+    val direction: String,
+    val documentIds: List<String>,
+    val isSelected: Boolean
+)
+
+/**
  * Data transfer object for the response to a selection update
  */
 @Serializable

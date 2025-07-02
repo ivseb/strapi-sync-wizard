@@ -15,6 +15,8 @@ import it.sebi.JsonParser
 import it.sebi.models.*
 import it.sebi.utils.calculateMD5Hash
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
@@ -140,6 +142,11 @@ class StrapiClient(
     private val username: String,
     private val password: String
 ) {
+
+    companion object {
+        private val loginMutex = Mutex()
+    }
+
     constructor(strapiInstance: StrapiInstance) : this(
         strapiInstance.name,
         strapiInstance.url,
@@ -153,7 +160,7 @@ class StrapiClient(
     val selector = ClientSelector()
 
 
-    suspend fun getLoginToken(): StrapiLoginData {
+    suspend fun getLoginToken(): StrapiLoginData = loginMutex.withLock {
         val now = System.currentTimeMillis()
         val cacheTimeout = 20 * 60 * 1000 // 20 minutes in milliseconds
 
@@ -442,77 +449,82 @@ class StrapiClient(
         contentType: StrapiContentType,
         mappings: List<MergeRequestDocumentMapping>?
     ): List<EntryElement> {
-        val url = "$baseUrl/content-manager/${contentType.schema.kebabCaseKind}/${contentType.uid}?locate=it"
-
-        // Get component schemas
-//        val components = getComponentSchema()
-//        val componentByUid = components.associateBy { it.uid }
+        val baseUrl = "$baseUrl/content-manager/${contentType.schema.kebabCaseKind}/${contentType.uid}?locate=it"
         val token = getLoginToken().token
 
-        val response: JsonObject = try {
-            selector.getClientForUrl(url).get(url) {
-                headers {
-                    append(HttpHeaders.Authorization, "Bearer ${token}")
+        // For SingleType, we don't need pagination
+        if (contentType.schema.kind == StrapiContentTypeKind.SingleType) {
+            val response: JsonObject = try {
+                selector.getClientForUrl(baseUrl).get(baseUrl) {
+                    headers {
+                        append(HttpHeaders.Authorization, "Bearer ${token}")
+                    }
+                }.body()
+            } catch (e: io.ktor.client.plugins.ClientRequestException) {
+                if (e.response.status == HttpStatusCode.NotFound) {
+                    return emptyList()
                 }
-            }.body()
-        } catch (e: io.ktor.client.plugins.ClientRequestException) {
-            if (e.response.status == HttpStatusCode.NotFound) {
-                return emptyList()
+                throw e
             }
-            throw e
+
+            val dataElement = response["data"] ?: response["results"]
+
+            val entries = when {
+                dataElement == null -> emptyList()
+                dataElement is JsonNull -> emptyList()
+                dataElement is JsonObject -> listOf(dataElement)
+                else -> if (dataElement is JsonObject) listOf(dataElement) else dataElement.jsonArray.map { it.jsonObject }
+            }
+
+            return processEntries(entries, mappings)
         }
 
-//        val response: JsonObject = try {
-//            selector.getClientForUrl(url).get(url) {
-//                headers {
-//                    append(HttpHeaders.Authorization, "Bearer $apiKey")
-//                }
-//                url {
-//                    contentType.schema.attributes.forEach { (key, attribute) ->
-//                        when (attribute.type) {
-//                            "component" -> {
-//                                println("[DEBUG_LOG] Adding parameter for $key")
-//                                parameters.append("populate[$key][populate]", "*")
-//
-//                                // Process nested components
-//                                processComponentParameters(
-//                                    parameters,
-//                                    "[$key]",
-//                                    attribute.component,
-//                                    componentByUid
-//                                )
-//                            }
-//                            "dynamiczone", "media", "relation" -> {
-//                                println("[DEBUG_LOG] Adding parameter for $key")
-//                                parameters.append("populate[$key][populate]", "*")
-//                            }
-//                        }
-//                    }
-//                }
-//            }.body()
-//        } catch (e: io.ktor.client.plugins.ClientRequestException) {
-//            if (e.response.status == HttpStatusCode.NotFound) {
-//                return emptyList()
-//            }
-//            throw e
-//        }
+        // For CollectionType, handle pagination
+        val allEntries = mutableListOf<JsonObject>()
+        var currentPage = 1
+        val pageSize = 100 // Use a larger page size to reduce the number of API calls
 
+        do {
+            val url = "$baseUrl&page=$currentPage&pageSize=$pageSize"
 
-        val dataElement = response["data"]
+            val response: JsonObject = try {
+                selector.getClientForUrl(url).get(url) {
+                    headers {
+                        append(HttpHeaders.Authorization, "Bearer ${token}")
+                    }
+                }.body()
+            } catch (e: io.ktor.client.plugins.ClientRequestException) {
+                if (e.response.status == HttpStatusCode.NotFound) {
+                    return emptyList()
+                }
+                throw e
+            }
 
-        val entries = when {
-            dataElement == null -> emptyList()
-            dataElement is JsonNull -> emptyList()
-            contentType.schema.kind == StrapiContentTypeKind.SingleType && dataElement is JsonObject -> listOf(
-                dataElement
-            )
+            val resultsElement = response["results"]
+            val results = when {
+                resultsElement == null -> emptyList()
+                resultsElement is JsonNull -> emptyList()
+                resultsElement is JsonArray -> resultsElement.map { it.jsonObject }
+                else -> listOf(resultsElement.jsonObject)
+            }
 
-            contentType.schema.kind == StrapiContentTypeKind.CollectionType && dataElement is JsonArray -> dataElement.map { it.jsonObject }
-            contentType.schema.kind == StrapiContentTypeKind.CollectionType && dataElement !is JsonArray ->
-                if (dataElement is JsonObject) listOf(dataElement) else dataElement.jsonArray.map { it.jsonObject }
+            allEntries.addAll(results)
 
-            else -> if (dataElement is JsonObject) listOf(dataElement) else dataElement.jsonArray.map { it.jsonObject }
-        }
+            // Get pagination information
+            val pageCount = response["pagination"]?.jsonObject?.let { 
+                pagination -> pagination["pageCount"]?.jsonPrimitive?.int 
+            } ?: 0
+
+            currentPage++
+        } while (currentPage <= pageCount)
+
+        return processEntries(allEntries, mappings)
+    }
+
+    private fun processEntries(
+        entries: List<JsonObject>,
+        mappings: List<MergeRequestDocumentMapping>?
+    ): List<EntryElement> {
 
         return entries.map { entry ->
             val id = entry["id"]!!.jsonPrimitive.content.toInt()
@@ -529,8 +541,7 @@ class StrapiClient(
             val content = StrapiContent(StrapiContentMetadata(id, documentId), entry, cleanupStrapiJson.jsonObject)
 
 
-
-            EntryElement(content, cleanupStrapiJson.jsonObject.generateHash())
+            EntryElement(content, cleanupStrapiJson.jsonObject.generateHash(fieldsToIgnore = listOf("documentId")))
         }
     }
 
@@ -645,6 +656,7 @@ class StrapiClient(
     private fun JsonObject.generateHash(fieldsToIgnore: List<String> = listOf()): String {
         fun filterRecursively(element: JsonElement): JsonElement = when (element) {
             is JsonObject -> JsonObject(element.filterKeys { it !in fieldsToIgnore }
+                .toSortedMap()
                 .mapValues { (_, v) -> filterRecursively(v) })
 
             is JsonArray -> JsonArray(element.map { filterRecursively(it) })

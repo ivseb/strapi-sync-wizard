@@ -176,6 +176,42 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
             }
         }
 
+        // Update all selections for a specific content type and direction
+        post("/{id}/bulk-selection") {
+            val id = call.parameters["id"]?.toIntOrNull()
+                ?: return@post call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+
+            // Get bulk selection data from request body
+            val bulkSelectionData = call.receive<BulkSelectionDTO>()
+
+            val direction = try {
+                Direction.valueOf(bulkSelectionData.direction)
+            } catch (e: IllegalArgumentException) {
+                return@post call.respond(HttpStatusCode.BadRequest, "Invalid direction")
+            }
+
+            try {
+                val response = mergeRequestService.updateAllSelections(
+                    id,
+                    bulkSelectionData.contentType,
+                    direction,
+                    bulkSelectionData.documentIds,
+                    bulkSelectionData.isSelected
+                )
+                call.respond(HttpStatusCode.OK, response)
+            } catch (e: IllegalArgumentException) {
+                call.respond(
+                    HttpStatusCode.NotFound,
+                    MergeResponse(success = false, message = e.message ?: "Merge request not found")
+                )
+            } catch (e: Exception) {
+                call.respond(
+                    HttpStatusCode.InternalServerError,
+                    MergeResponse(success = false, message = e.message ?: "An error occurred")
+                )
+            }
+        }
+
         // Get selections
         get("/{id}/selections") {
             val id = call.parameters["id"]?.toIntOrNull()

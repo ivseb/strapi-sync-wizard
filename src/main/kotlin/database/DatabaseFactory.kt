@@ -12,9 +12,9 @@ import it.sebi.tables.MergeRequestsTable
 import it.sebi.tables.StrapiInstancesTable
 import kotlinx.coroutines.Dispatchers
 import org.jetbrains.exposed.v1.jdbc.Database
+import org.jetbrains.exposed.v1.jdbc.SchemaUtils
 import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
-import org.jetbrains.exposed.v1.migration.MigrationUtils
 
 fun Application.initDatabaseConnection() {
     // Connect to the database
@@ -23,13 +23,13 @@ fun Application.initDatabaseConnection() {
 
     // Create tables
     transaction(database) {
-        val statement = MigrationUtils.statementsRequiredForDatabaseMigration(
+        SchemaUtils.create(
             StrapiInstancesTable,
             MergeRequestsTable,
             MergeRequestDocumentMappingTable,
-            MergeRequestSelectionsTable
+            MergeRequestSelectionsTable,
+            inBatch = true
         )
-        this.execInBatch(statement)
     }
 }
 

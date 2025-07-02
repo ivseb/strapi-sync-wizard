@@ -78,6 +78,12 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
     const [expandedDeleteEntries, setExpandedDeleteEntries] = useState<Record<string, boolean>>({});
     const [expandedIdenticalEntries, setExpandedIdenticalEntries] = useState<Record<string, boolean>>({});
 
+    // Loading states for each table
+    const [contentTypesTableLoading, setContentTypesTableLoading] = useState<boolean>(false);
+    const [createTableLoading, setCreateTableLoading] = useState<boolean>(false);
+    const [updateTableLoading, setUpdateTableLoading] = useState<boolean>(false);
+    const [deleteTableLoading, setDeleteTableLoading] = useState<boolean>(false);
+
     // State for editor modal
     const [editorDialogVisible, setEditorDialogVisible] = useState<boolean>(false);
     const [editorContent, setEditorContent] = useState<any>(null);
@@ -304,6 +310,15 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
         // Get the direction based on the type
         const direction = type === 'create' ? 'TO_CREATE' : type === 'update' ? 'TO_UPDATE' : 'TO_DELETE';
 
+        // Set loading state based on the type
+        if (type === 'create') {
+            setCreateTableLoading(true);
+        } else if (type === 'update') {
+            setUpdateTableLoading(true);
+        } else if (type === 'delete') {
+            setDeleteTableLoading(true);
+        }
+
         try {
             // Process added entries
             for (const entry of addedEntries) {
@@ -331,6 +346,14 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
 
                     // If the API call failed, we should not update the state
                     if (!success) {
+                        // Clear loading state
+                        if (type === 'create') {
+                            setCreateTableLoading(false);
+                        } else if (type === 'update') {
+                            setUpdateTableLoading(false);
+                        } else if (type === 'delete') {
+                            setDeleteTableLoading(false);
+                        }
                         return;
                     }
                 }
@@ -362,6 +385,14 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
 
                     // If the API call failed, we should not update the state
                     if (!success) {
+                        // Clear loading state
+                        if (type === 'create') {
+                            setCreateTableLoading(false);
+                        } else if (type === 'update') {
+                            setUpdateTableLoading(false);
+                        } else if (type === 'delete') {
+                            setDeleteTableLoading(false);
+                        }
                         return;
                     }
                 }
@@ -374,6 +405,15 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
             await fetchLatestSelections();
         } catch (err) {
             console.error(`Error updating selections:`, err);
+        } finally {
+            // Clear loading state
+            if (type === 'create') {
+                setCreateTableLoading(false);
+            } else if (type === 'update') {
+                setUpdateTableLoading(false);
+            } else if (type === 'delete') {
+                setDeleteTableLoading(false);
+            }
         }
     };
 
@@ -658,7 +698,7 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
                         className="mb-3"
                         paginator
                         rows={5}
-                        rowsPerPageOptions={[5, 10, 25]}
+                        rowsPerPageOptions={[5, 10, 25,50]}
                     >
                         <Column field="contentType" header="Content Type" sortable/>
                         <Column field="kind" header="Kind" sortable/>
@@ -694,12 +734,65 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
                                     <DataTable
                                         value={contentTypes[activeContentType].onlyInSource}
                                         selectionMode="multiple"
+                                        loading={createTableLoading}
                                         selection={selectedEntries[activeContentType]?.entriesToCreate || []}
+                                        selectAll={contentTypes[activeContentType].onlyInSource.length > 0 && 
+                                                 selectedEntries[activeContentType]?.entriesToCreate.length === contentTypes[activeContentType].onlyInSource.length}
+                                        onSelectAllChange={e => {
+                                            const allEntries = contentTypes[activeContentType].onlyInSource;
+                                            if (allEntries.length === 0) return;
+
+                                            // Collect all document IDs
+                                            const documentIds = allEntries.map(entry => entry.metadata?.documentId).filter(Boolean) as string[];
+                                            if (documentIds.length === 0) return;
+
+                                            // Set loading state
+                                            setCreateTableLoading(true);
+
+                                            // Make the bulk API call
+                                            axios.post(`/api/merge-requests/${mergeRequestId}/bulk-selection`, {
+                                                contentType: activeContentType,
+                                                direction: 'TO_CREATE',
+                                                documentIds,
+                                                isSelected: e.checked
+                                            })
+                                            .then(response => {
+                                                if (response.data.success) {
+                                                    // If successful, update the local state
+                                                    setSelectedEntries(prevState => {
+                                                        const newState = { ...prevState };
+
+                                                        if (e.checked) {
+                                                            // Select all items
+                                                            newState[activeContentType] = {
+                                                                ...newState[activeContentType],
+                                                                entriesToCreate: allEntries
+                                                            };
+                                                        } else {
+                                                            // Deselect all items
+                                                            newState[activeContentType] = {
+                                                                ...newState[activeContentType],
+                                                                entriesToCreate: []
+                                                            };
+                                                        }
+
+                                                        return newState;
+                                                    });
+                                                }
+                                                // Clear loading state
+                                                setCreateTableLoading(false);
+                                            })
+                                            .catch(err => {
+                                                console.error(`Error in select all for ${activeContentType}:`, err);
+                                                // Clear loading state on error
+                                                setCreateTableLoading(false);
+                                            });
+                                        }}
                                         onSelectionChange={(e) => handleSelectionChange(activeContentType, 'create', e.value)}
                                         dataKey="metadata.documentId"
                                         paginator
                                         rows={5}
-                                        rowsPerPageOptions={[5, 10, 25]}
+                                        rowsPerPageOptions={[5, 10, 25,50]}
                                         expandedRows={expandedCreateEntries}
                                         onRowToggle={(e) => {
                                             // Convert DataTableExpandedRows to Record<string, boolean>
@@ -751,12 +844,65 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
                                     <DataTable
                                         value={contentTypes[activeContentType].different}
                                         selectionMode="multiple"
+                                        loading={updateTableLoading}
                                         selection={selectedEntries[activeContentType]?.entriesToUpdate || []}
+                                        selectAll={contentTypes[activeContentType].different.length > 0 && 
+                                                 selectedEntries[activeContentType]?.entriesToUpdate.length === contentTypes[activeContentType].different.length}
+                                        onSelectAllChange={e => {
+                                            const allEntries = contentTypes[activeContentType].different;
+                                            if (allEntries.length === 0) return;
+
+                                            // Collect all document IDs
+                                            const documentIds = allEntries.map(entry => entry.source?.metadata?.documentId).filter(Boolean) as string[];
+                                            if (documentIds.length === 0) return;
+
+                                            // Set loading state
+                                            setUpdateTableLoading(true);
+
+                                            // Make the bulk API call
+                                            axios.post(`/api/merge-requests/${mergeRequestId}/bulk-selection`, {
+                                                contentType: activeContentType,
+                                                direction: 'TO_UPDATE',
+                                                documentIds,
+                                                isSelected: e.checked
+                                            })
+                                            .then(response => {
+                                                if (response.data.success) {
+                                                    // If successful, update the local state
+                                                    setSelectedEntries(prevState => {
+                                                        const newState = { ...prevState };
+
+                                                        if (e.checked) {
+                                                            // Select all items
+                                                            newState[activeContentType] = {
+                                                                ...newState[activeContentType],
+                                                                entriesToUpdate: allEntries
+                                                            };
+                                                        } else {
+                                                            // Deselect all items
+                                                            newState[activeContentType] = {
+                                                                ...newState[activeContentType],
+                                                                entriesToUpdate: []
+                                                            };
+                                                        }
+
+                                                        return newState;
+                                                    });
+                                                }
+                                                // Clear loading state
+                                                setUpdateTableLoading(false);
+                                            })
+                                            .catch(err => {
+                                                console.error(`Error in select all for ${activeContentType}:`, err);
+                                                // Clear loading state on error
+                                                setUpdateTableLoading(false);
+                                            });
+                                        }}
                                         onSelectionChange={(e) => handleSelectionChange(activeContentType, 'update', e.value)}
                                         dataKey="source.metadata.documentId"
                                         paginator
                                         rows={5}
-                                        rowsPerPageOptions={[5, 10, 25]}
+                                        rowsPerPageOptions={[5, 10, 25,50]}
                                         expandedRows={expandedUpdateEntries}
                                         onRowToggle={(e) => {
                                             // Convert DataTableExpandedRows to Record<string, boolean>
@@ -809,11 +955,56 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
                                         value={contentTypes[activeContentType].onlyInTarget}
                                         selectionMode="multiple"
                                         selection={selectedEntries[activeContentType]?.entriesToDelete || []}
+                                        selectAll={contentTypes[activeContentType].onlyInTarget.length > 0 && 
+                                                 selectedEntries[activeContentType]?.entriesToDelete.length === contentTypes[activeContentType].onlyInTarget.length}
+                                        onSelectAllChange={e => {
+                                            const allEntries = contentTypes[activeContentType].onlyInTarget;
+                                            if (allEntries.length === 0) return;
+
+                                            // Collect all document IDs
+                                            const documentIds = allEntries.map(entry => entry.metadata?.documentId).filter(Boolean) as string[];
+                                            if (documentIds.length === 0) return;
+
+                                            // Make the bulk API call
+                                            axios.post(`/api/merge-requests/${mergeRequestId}/bulk-selection`, {
+                                                contentType: activeContentType,
+                                                direction: 'TO_DELETE',
+                                                documentIds,
+                                                isSelected: e.checked
+                                            })
+                                            .then(response => {
+                                                if (response.data.success) {
+                                                    // If successful, update the local state
+                                                    setSelectedEntries(prevState => {
+                                                        const newState = { ...prevState };
+
+                                                        if (e.checked) {
+                                                            // Select all items
+                                                            newState[activeContentType] = {
+                                                                ...newState[activeContentType],
+                                                                entriesToDelete: allEntries
+                                                            };
+                                                        } else {
+                                                            // Deselect all items
+                                                            newState[activeContentType] = {
+                                                                ...newState[activeContentType],
+                                                                entriesToDelete: []
+                                                            };
+                                                        }
+
+                                                        return newState;
+                                                    });
+                                                }
+                                            })
+                                            .catch(err => {
+                                                console.error(`Error in select all for ${activeContentType}:`, err);
+                                            });
+                                        }}
                                         onSelectionChange={(e) => handleSelectionChange(activeContentType, 'delete', e.value)}
                                         dataKey="metadata.documentId"
                                         paginator
                                         rows={5}
-                                        rowsPerPageOptions={[5, 10, 25]}
+                                        rowsPerPageOptions={[5, 10, 25,50]}
                                         expandedRows={expandedDeleteEntries}
                                         onRowToggle={(e) => {
                                             // Convert DataTableExpandedRows to Record<string, boolean>
@@ -857,7 +1048,7 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
                                         dataKey="metadata.documentId"
                                         paginator
                                         rows={5}
-                                        rowsPerPageOptions={[5, 10, 25]}
+                                        rowsPerPageOptions={[5, 10, 25,50]}
                                         expandedRows={expandedIdenticalEntries}
                                         onRowToggle={(e) => {
                                             // Convert DataTableExpandedRows to Record<string, boolean>

@@ -220,6 +220,41 @@ class MergeRequestService(
     }
 
     /**
+     * Update all selections for a merge request for a specific content type and direction
+     * @param id Merge request ID
+     * @param contentType Content type
+     * @param direction Direction (TO_CREATE, TO_UPDATE, TO_DELETE)
+     * @param documentIds List of document IDs to select or deselect
+     * @param isSelected Whether the entries should be selected or not
+     * @return SelectionUpdateResponseDTO containing success status
+     */
+    suspend fun updateAllSelections(
+        id: Int,
+        contentType: String,
+        direction: Direction,
+        documentIds: List<String>,
+        isSelected: Boolean
+    ): SelectionUpdateResponseDTO {
+        // Check if merge request exists
+        mergeRequestRepository.getMergeRequest(id)
+            ?: throw IllegalArgumentException("Merge request not found")
+
+        // Update all selections for the specified content type and direction
+        val result = mergeRequestSelectionsRepository.updateAllSelections(
+            id,
+            contentType,
+            direction,
+            documentIds,
+            isSelected
+        )
+
+        return SelectionUpdateResponseDTO(
+            success = result,
+            additionalSelections = emptyList() // No additional selections for bulk operations
+        )
+    }
+
+    /**
      * Find relationships for a specific entry
      * @param contentComparison The content comparison data
      * @param contentType The content type of the entry
