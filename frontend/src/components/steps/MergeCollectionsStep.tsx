@@ -702,18 +702,27 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
                     >
                         <Column field="contentType" header="Content Type" sortable/>
                         <Column field="kind" header="Kind" sortable/>
-                        <Column header="Only in Source" body={(rowData) => (
-                            <Badge value={rowData.onlyInSource.length}
-                                   severity={rowData.onlyInSource.length > 0 ? "warning" : "success"}/>
-                        )}/>
-                        <Column header="Only in Target" body={(rowData) => (
-                            <Badge value={rowData.onlyInTarget.length}
-                                   severity={rowData.onlyInTarget.length > 0 ? "warning" : "success"}/>
-                        )}/>
-                        <Column header="Different" body={(rowData) => (
-                            <Badge value={rowData.different.length}
-                                   severity={rowData.different.length > 0 ? "danger" : "success"}/>
-                        )}/>
+                        <Column header="Only in Source" body={(rowData) => {
+                            const selectedCount = selectedEntries[rowData.contentType]?.entriesToCreate?.length || 0;
+                            return (
+                                <Badge value={`${selectedCount}/${rowData.onlyInSource.length}`}
+                                       severity={rowData.onlyInSource.length > 0 ? "warning" : "success"}/>
+                            );
+                        }}/>
+                        <Column header="Only in Target" body={(rowData) => {
+                            const selectedCount = selectedEntries[rowData.contentType]?.entriesToDelete?.length || 0;
+                            return (
+                                <Badge value={`${selectedCount}/${rowData.onlyInTarget.length}`}
+                                       severity={rowData.onlyInTarget.length > 0 ? "warning" : "success"}/>
+                            );
+                        }}/>
+                        <Column header="Different" body={(rowData) => {
+                            const selectedCount = selectedEntries[rowData.contentType]?.entriesToUpdate?.length || 0;
+                            return (
+                                <Badge value={`${selectedCount}/${rowData.different.length}`}
+                                       severity={rowData.different.length > 0 ? "danger" : "success"}/>
+                            );
+                        }}/>
                         <Column header="Identical" body={(rowData) => (
                             <Badge value={rowData.identical.length} severity="success"/>
                         )}/>

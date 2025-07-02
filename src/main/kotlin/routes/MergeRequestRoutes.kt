@@ -239,20 +239,29 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
             val id = call.parameters["id"]?.toIntOrNull()
                 ?: return@post call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
 
+            try {
+                val success = mergeRequestService.completeMergeRequest(id)
+                if (success) {
+                    call.respond(
+                        HttpStatusCode.OK,
+                        MergeResponse(success = true, message = "Merge request completed successfully")
+                    )
+                } else {
+                    call.respond(
+                        HttpStatusCode.InternalServerError,
+                        MergeResponse(success = false, message = "Failed to complete merge request")
+                    )
+                }
+            } catch (e: Exception) {
+                // Log the exception
+                e.printStackTrace()
 
-            val success = mergeRequestService.completeMergeRequest(id)
-            if (success) {
-                call.respond(
-                    HttpStatusCode.OK,
-                    MergeResponse(success = true, message = "Merge request completed successfully")
-                )
-            } else {
+                // Return an error response
                 call.respond(
                     HttpStatusCode.InternalServerError,
-                    MergeResponse(success = false, message = "Failed to complete merge request")
+                    MergeResponse(success = false, message = "Error during merge request completion: ${e.message}")
                 )
             }
-
         }
     }
 }

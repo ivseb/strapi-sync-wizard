@@ -1,15 +1,32 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {Button} from 'primereact/button';
 import {Message} from 'primereact/message';
-import {Accordion, AccordionTab} from 'primereact/accordion';
 import {Tag} from 'primereact/tag';
 import {Tooltip} from 'primereact/tooltip';
+import {ProgressBar} from 'primereact/progressbar';
+import {Toast} from 'primereact/toast';
+import {DataTable} from 'primereact/datatable';
+import {Column} from 'primereact/column';
+import {TabView, TabPanel} from 'primereact/tabview';
+import {Card} from 'primereact/card';
 import {MergeRequestSelectionDTO, MergeRequestData, SelectionStatusInfo} from '../../types';
 import { getRepresentativeAttributes } from '../../utils/attributeUtils';
 import EditorDialog from '../common/EditorDialog';
 
 // Content type for files
 const STRAPI_FILE_CONTENT_TYPE_NAME = "plugin::upload.file";
+
+// Interface for sync progress updates from the WebSocket
+interface SyncProgressUpdate {
+    mergeRequestId: number;
+    totalItems: number;
+    processedItems: number;
+    currentItem: string;
+    currentItemType: string;
+    currentOperation: string;
+    status: string;
+    message?: string;
+}
 
 interface CompleteMergeStepProps {
     status: string;
@@ -39,6 +56,141 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
     const [originalContent, setOriginalContent] = useState<any>(null);
     const [modifiedContent, setModifiedContent] = useState<any>(null);
     const [editorDialogHeader, setEditorDialogHeader] = useState<string>("View Content");
+
+    // State for sync progress
+    const [syncProgress, setSyncProgress] = useState<SyncProgressUpdate | null>(null);
+    const [syncInProgress, setSyncInProgress] = useState<boolean>(false);
+    const [syncCompleted, setSyncCompleted] = useState<boolean>(false);
+    const [syncFailed, setSyncFailed] = useState<boolean>(false);
+    const [syncItemsStatus, setSyncItemsStatus] = useState<Record<string, { status: string, message?: string }>>({});
+
+    // Reference for EventSource connection
+    const eventSourceRef = useRef<EventSource | null>(null);
+
+    // Reference for Toast component
+    const toast = useRef<Toast>(null);
+
+    // Effect to handle EventSource connection and cleanup
+    useEffect(() => {
+        return () => {
+            // Cleanup EventSource connection when component unmounts
+            if (eventSourceRef.current) {
+                eventSourceRef.current.close();
+                eventSourceRef.current = null;
+            }
+        };
+    }, []);
+
+    // Function to start the SSE connection for sync progress updates
+    const startSyncProgressSSE = (mergeRequestId: number) => {
+        // Close existing connection if any
+        if (eventSourceRef.current) {
+            eventSourceRef.current.close();
+            eventSourceRef.current = null;
+        }
+
+        // Reset sync state
+        setSyncProgress(null);
+        setSyncInProgress(true);
+        setSyncCompleted(false);
+        setSyncFailed(false);
+        setSyncItemsStatus({});
+
+        // Create new EventSource connection
+        const sseUrl = `http://localhost:8080/api/sync-progress/${mergeRequestId}`;
+        const eventSource = new EventSource(sseUrl);
+
+        // Handle connection open
+        eventSource.onopen = () => {
+            console.log('SSE connection established');
+        };
+
+        // Handle connected event
+        eventSource.addEventListener('connected', (event) => {
+            console.log('SSE connected event received:', event);
+        });
+
+        // Handle progress events
+        eventSource.addEventListener('progress', (event) => {
+            try {
+                const update: SyncProgressUpdate = JSON.parse(event.data);
+                console.log('Received sync progress update:', update);
+
+                // Update sync progress state
+                setSyncProgress(update);
+
+                // Update item status
+                if (update.currentItem && update.currentItem !== 'Starting synchronization' && 
+                    update.currentItem !== 'Processing content types' && 
+                    update.currentItem !== 'Content types processed' &&
+                    update.currentItem !== 'Synchronization completed' &&
+                    update.currentItem !== 'Synchronization failed') {
+                    setSyncItemsStatus(prev => ({
+                        ...prev,
+                        [update.currentItem]: {
+                            status: update.status,
+                            message: update.message
+                        }
+                    }));
+                }
+
+                // Handle completion or failure
+                if (update.status === 'SUCCESS' && update.currentOperation === 'COMPLETED') {
+                    setSyncInProgress(false);
+                    setSyncCompleted(true);
+
+                    // Close EventSource connection
+                    eventSource.close();
+                } else if (update.status === 'ERROR') {
+                    setSyncInProgress(false);
+                    setSyncFailed(true);
+
+                    // Close EventSource connection
+                    eventSource.close();
+                }
+            } catch (error) {
+                console.error('Error parsing SSE message:', error);
+            }
+        });
+
+        // Handle errors
+        eventSource.onerror = (error) => {
+            console.error('SSE error:', error);
+            setSyncInProgress(false);
+            setSyncFailed(true);
+
+            // Close EventSource connection
+            eventSource.close();
+        };
+
+        eventSourceRef.current = eventSource;
+    };
+
+    // Function to handle the complete merge button click
+    const handleCompleteMerge = () => {
+        // Get merge request ID from the URL
+        const urlParts = window.location.pathname.split('/');
+        const mergeRequestId = parseInt(urlParts[urlParts.length - 1], 10);
+
+
+        if (!isNaN(mergeRequestId)) {
+            // Start SSE connection for progress updates
+            startSyncProgressSSE(mergeRequestId);
+
+            // Call the original completeMerge function
+            completeMerge();
+        } else {
+            console.error('Could not determine merge request ID from URL');
+
+            // Show error toast
+            toast.current?.show({
+                severity: 'error',
+                summary: 'Error',
+                detail: 'Could not determine merge request ID.',
+                life: 5000
+            });
+        }
+    };
 
     // Function to find an entry in allMergeData based on contentType and documentId
     const findEntry = (contentType: string, documentId: string) => {
@@ -135,7 +287,36 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
     };
 
     // Function to render status badge
-    const renderStatusBadge = (status: SelectionStatusInfo | undefined) => {
+    const renderStatusBadge = (status: SelectionStatusInfo | undefined, contentType: string, documentId: string) => {
+        // Check if we have live status from WebSocket
+        const liveStatus = syncItemsStatus[documentId];
+
+        if (liveStatus) {
+            if (liveStatus.status === 'SUCCESS') {
+                return <Tag severity="success" value="Success" />;
+            } else if (liveStatus.status === 'ERROR') {
+                return (
+                    <div className="flex align-items-center">
+                        <Tag 
+                            className={`failed-tag-${documentId}`}
+                            severity="danger" 
+                            value="Failed" 
+                            data-pr-tooltip={liveStatus.message || "Unknown error"}
+                        />
+                        <Tooltip target={`.failed-tag-${documentId}`} position="top" />
+                    </div>
+                );
+            } else if (liveStatus.status === 'IN_PROGRESS') {
+                return (
+                    <div className="flex align-items-center">
+                        <i className="pi pi-spin pi-spinner mr-2"></i>
+                        <Tag severity="info" value="Processing" />
+                    </div>
+                );
+            }
+        }
+
+        // Fall back to original status if no live status
         if (!status || status.syncSuccess === null) {
             return <Tag severity="info" value="Pending" />;
         }
@@ -146,12 +327,12 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
             return (
                 <div className="flex align-items-center">
                     <Tag 
-                        className="failed-tag"
+                        className={`failed-tag-${documentId}`}
                         severity="danger" 
                         value="Failed" 
                         data-pr-tooltip={status.syncFailureResponse || "Unknown error"}
                     />
-                    <Tooltip target=".failed-tag" position="top" />
+                    <Tooltip target={`.failed-tag-${documentId}`} position="top" />
                 </div>
             );
         }
@@ -160,13 +341,11 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
     // Function to render representative attributes or images for an entry
     const renderRepresentativeContent = (contentType: string, documentId: string, operation: 'create' | 'update' | 'delete') => {
         const entry = findEntry(contentType, documentId);
-        const statusInfo = findStatusInfo(contentType, documentId, operation);
 
         if (!entry) {
             return (
                 <div className="flex align-items-center justify-content-between">
                     <span className="font-medium">{documentId}</span>
-                    {renderStatusBadge(statusInfo)}
                 </div>
             );
         }
@@ -195,21 +374,6 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                             <span className="font-medium">{documentId}</span>
                         )}
                     </div>
-                    <div className="flex align-items-center">
-                        {renderStatusBadge(statusInfo)}
-                        <Button
-                            icon="pi pi-eye"
-                            className="p-button-text p-button-sm ml-2"
-                            tooltip="View Details"
-                            onClick={() => {
-                                if (isUpdate) {
-                                    openEditorDialog(null, true, source, target, "View Differences");
-                                } else {
-                                    openEditorDialog(entry, false, null, null, "View Content");
-                                }
-                            }}
-                        />
-                    </div>
                 </div>
             );
         }
@@ -221,21 +385,6 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
             return (
                 <div className="flex align-items-center justify-content-between">
                     <span className="font-medium">{documentId}</span>
-                    <div className="flex align-items-center">
-                        {renderStatusBadge(statusInfo)}
-                        <Button
-                            icon="pi pi-eye"
-                            className="p-button-text p-button-sm ml-2"
-                            tooltip="View Details"
-                            onClick={() => {
-                                if (isUpdate) {
-                                    openEditorDialog(null, true, source, target, "View Differences");
-                                } else {
-                                    openEditorDialog(entry, false, null, null, "View Content");
-                                }
-                            }}
-                        />
-                    </div>
                 </div>
             );
         }
@@ -249,21 +398,6 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                             <span>{attr.value}</span>
                         </div>
                     ))}
-                </div>
-                <div className="flex align-items-center">
-                    {renderStatusBadge(statusInfo)}
-                    <Button
-                        icon="pi pi-eye"
-                        className="p-button-text p-button-sm ml-2"
-                        tooltip="View Details"
-                        onClick={() => {
-                            if (isUpdate) {
-                                openEditorDialog(null, true, source, target, "View Differences");
-                            } else {
-                                openEditorDialog(entry, false, null, null, "View Content");
-                            }
-                        }}
-                    />
                 </div>
             </div>
         );
@@ -315,6 +449,111 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
         return { isUpdate: false, source: null, target: null };
     };
 
+    // Prepare data for DataTable
+    const prepareItemsForDataTable = () => {
+        const items: any[] = [];
+
+        selections.forEach(selection => {
+            // Add items to create
+            selection.entriesToCreate.forEach(id => {
+                items.push({
+                    contentType: selection.contentType,
+                    documentId: id,
+                    operation: 'create',
+                    statusInfo: findStatusInfo(selection.contentType, id, 'create')
+                });
+            });
+
+            // Add items to update
+            selection.entriesToUpdate.forEach(id => {
+                items.push({
+                    contentType: selection.contentType,
+                    documentId: id,
+                    operation: 'update',
+                    statusInfo: findStatusInfo(selection.contentType, id, 'update')
+                });
+            });
+
+            // Add items to delete
+            selection.entriesToDelete.forEach(id => {
+                items.push({
+                    contentType: selection.contentType,
+                    documentId: id,
+                    operation: 'delete',
+                    statusInfo: findStatusInfo(selection.contentType, id, 'delete')
+                });
+            });
+        });
+
+        return items;
+    };
+
+    const allItems = prepareItemsForDataTable();
+    const createItems = allItems.filter(item => item.operation === 'create');
+    const updateItems = allItems.filter(item => item.operation === 'update');
+    const deleteItems = allItems.filter(item => item.operation === 'delete');
+
+    // Function to render operation icon
+    const renderOperationIcon = (operation: string) => {
+        switch (operation) {
+            case 'create':
+                return <i className="pi pi-plus-circle text-success mr-2"></i>;
+            case 'update':
+                return <i className="pi pi-sync text-warning mr-2"></i>;
+            case 'delete':
+                return <i className="pi pi-trash text-danger mr-2"></i>;
+            default:
+                return null;
+        }
+    };
+
+    // Function to render operation badge
+    const renderOperationBadge = (operation: string) => {
+        switch (operation) {
+            case 'create':
+                return <Tag severity="success" value="Create" />;
+            case 'update':
+                return <Tag severity="warning" value="Update" />;
+            case 'delete':
+                return <Tag severity="danger" value="Delete" />;
+            default:
+                return null;
+        }
+    };
+
+    // Function to render content
+    const renderContent = (rowData: any) => {
+        return renderRepresentativeContent(rowData.contentType, rowData.documentId, rowData.operation as 'create' | 'update' | 'delete');
+    };
+
+    // Function to render status
+    const renderStatus = (rowData: any) => {
+        return renderStatusBadge(rowData.statusInfo, rowData.contentType, rowData.documentId);
+    };
+
+    // Function to render view button
+    const renderViewButton = (rowData: any) => {
+        const entry = findEntry(rowData.contentType, rowData.documentId);
+        if (!entry) return null;
+
+        const { isUpdate, source, target } = isUpdateEntry(rowData.contentType, rowData.documentId);
+
+        return (
+            <Button
+                icon="pi pi-eye"
+                className="p-button-text p-button-sm"
+                tooltip="View Details"
+                onClick={() => {
+                    if (isUpdate) {
+                        openEditorDialog(null, true, source, target, "View Differences");
+                    } else {
+                        openEditorDialog(entry, false, null, null, "View Content");
+                    }
+                }}
+            />
+        );
+    };
+
     return (
         <div>
             <h3>Complete Merge</h3>
@@ -322,7 +561,6 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                 This step completes the merge process and finalizes the synchronization between the source and target
                 instances.
             </p>
-
 
             <h4>Merge Summary</h4>
             <p>The following items will be synchronized between the source and target instances:</p>
@@ -347,103 +585,219 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
             )}
 
             {totalItems > 0 && (
-                <Accordion multiple>
-                    {selections.map((selection, index) => {
-                        const hasItems = selection.entriesToCreate.length > 0 ||
-                            selection.entriesToUpdate.length > 0 ||
-                            selection.entriesToDelete.length > 0;
-
-                        if (!hasItems) return null;
-
-                        return (
-                            <AccordionTab
-                                key={index}
-                                header={
-                                    <div className="flex align-items-center">
-                                        <span className="font-bold">{selection.contentType}</span>
-                                        <span className="ml-3">
-                                                    {selection.entriesToCreate.length > 0 && (
-                                                        <span className="mr-2">
-                                                            <i className="pi pi-plus-circle text-success mr-1"></i>
-                                                            {selection.entriesToCreate.length}
-                                                        </span>
-                                                    )}
-                                            {selection.entriesToUpdate.length > 0 && (
-                                                <span className="mr-2">
-                                                            <i className="pi pi-sync text-warning mr-1"></i>
-                                                    {selection.entriesToUpdate.length}
-                                                        </span>
-                                            )}
-                                            {selection.entriesToDelete.length > 0 && (
-                                                <span>
-                                                            <i className="pi pi-trash text-danger mr-1"></i>
-                                                    {selection.entriesToDelete.length}
-                                                        </span>
-                                            )}
-                                                </span>
-                                    </div>
-                                }
+                <Card>
+                    <TabView>
+                        <TabPanel header={`All Items (${totalItems})`}>
+                            <DataTable 
+                                value={allItems}
+                                paginator 
+                                rows={10} 
+                                rowsPerPageOptions={[5, 10, 25, 50]}
+                                sortField="contentType"
+                                sortOrder={1}
+                                filterDisplay="row"
+                                emptyMessage="No items selected for synchronization."
+                                className="p-datatable-sm"
                             >
-                                <div className="p-3">
-                                    {selection.entriesToCreate.length > 0 && (
-                                        <div className="mb-3">
-                                            <h5 className="flex align-items-center">
-                                                <i className="pi pi-plus-circle text-success mr-2"></i>
-                                                Items to Create
-                                            </h5>
-                                            <ul className="list-none p-0 m-0">
-                                                {selection.entriesToCreate.map((id, idx) => (
-                                                    <li key={idx}
-                                                        className="mb-2 p-2 border-1 border-round surface-border">
-                                                        {renderRepresentativeContent(selection.contentType, id, 'create')}
-                                                    </li>
-                                                ))}
-                                            </ul>
-                                        </div>
-                                    )}
+                                <Column 
+                                    field="contentType" 
+                                    header="Content Type" 
+                                    sortable 
+                                    filter 
+                                    filterPlaceholder="Search by content type"
+                                    style={{ width: '20%' }}
+                                />
+                                <Column 
+                                    field="operation" 
+                                    header="Operation" 
+                                    sortable 
+                                    filter 
+                                    filterPlaceholder="Search by operation"
+                                    style={{ width: '10%' }}
+                                    body={rowData => renderOperationBadge(rowData.operation)}
+                                />
+                                <Column 
+                                    header="Content"
+                                    body={renderContent}
+                                    style={{ width: '50%' }}
+                                />
+                                <Column 
+                                    header="Status" 
+                                    body={renderStatus}
+                                    style={{ width: '10%' }}
+                                />
+                                <Column 
+                                    header="Actions" 
+                                    body={renderViewButton}
+                                    style={{ width: '10%' }}
+                                />
+                            </DataTable>
+                        </TabPanel>
 
-                                    {selection.entriesToUpdate.length > 0 && (
-                                        <div className="mb-3">
-                                            <h5 className="flex align-items-center">
-                                                <i className="pi pi-sync text-warning mr-2"></i>
-                                                Items to Update
-                                            </h5>
-                                            <ul className="list-none p-0 m-0">
-                                                {selection.entriesToUpdate.map((id, idx) => (
-                                                    <li key={idx}
-                                                        className="mb-2 p-2 border-1 border-round surface-border">
-                                                        {renderRepresentativeContent(selection.contentType, id, 'update')}
-                                                    </li>
-                                                ))}
-                                            </ul>
-                                        </div>
-                                    )}
+                        <TabPanel header={`Create (${totalToCreate})`}>
+                            <DataTable 
+                                value={createItems}
+                                paginator 
+                                rows={10} 
+                                rowsPerPageOptions={[5, 10, 25, 50]}
+                                sortField="contentType"
+                                sortOrder={1}
+                                filterDisplay="row"
+                                emptyMessage="No items to create."
+                                className="p-datatable-sm"
+                            >
+                                <Column 
+                                    field="contentType" 
+                                    header="Content Type" 
+                                    sortable 
+                                    filter 
+                                    filterPlaceholder="Search by content type"
+                                    style={{ width: '20%' }}
+                                />
+                                <Column 
+                                    header="Content"
+                                    body={renderContent}
+                                    style={{ width: '60%' }}
+                                />
+                                <Column 
+                                    header="Status" 
+                                    body={renderStatus}
+                                    style={{ width: '10%' }}
+                                />
+                                <Column 
+                                    header="Actions" 
+                                    body={renderViewButton}
+                                    style={{ width: '10%' }}
+                                />
+                            </DataTable>
+                        </TabPanel>
 
-                                    {selection.entriesToDelete.length > 0 && (
-                                        <div>
-                                            <h5 className="flex align-items-center">
-                                                <i className="pi pi-trash text-danger mr-2"></i>
-                                                Items to Delete
-                                            </h5>
-                                            <ul className="list-none p-0 m-0">
-                                                {selection.entriesToDelete.map((id, idx) => (
-                                                    <li key={idx}
-                                                        className="mb-2 p-2 border-1 border-round surface-border">
-                                                        {renderRepresentativeContent(selection.contentType, id, 'delete')}
-                                                    </li>
-                                                ))}
-                                            </ul>
-                                        </div>
-                                    )}
+                        <TabPanel header={`Update (${totalToUpdate})`}>
+                            <DataTable 
+                                value={updateItems}
+                                paginator 
+                                rows={10} 
+                                rowsPerPageOptions={[5, 10, 25, 50]}
+                                sortField="contentType"
+                                sortOrder={1}
+                                filterDisplay="row"
+                                emptyMessage="No items to update."
+                                className="p-datatable-sm"
+                            >
+                                <Column 
+                                    field="contentType" 
+                                    header="Content Type" 
+                                    sortable 
+                                    filter 
+                                    filterPlaceholder="Search by content type"
+                                    style={{ width: '20%' }}
+                                />
+                                <Column 
+                                    header="Content" 
+                                    body={renderContent}
+                                    style={{ width: '60%' }}
+                                />
+                                <Column 
+                                    header="Status" 
+                                    body={renderStatus}
+                                    style={{ width: '10%' }}
+                                />
+                                <Column 
+                                    header="Actions" 
+                                    body={renderViewButton}
+                                    style={{ width: '10%' }}
+                                />
+                            </DataTable>
+                        </TabPanel>
+
+                        <TabPanel header={`Delete (${totalToDelete})`}>
+                            <DataTable 
+                                value={deleteItems}
+                                paginator 
+                                rows={10} 
+                                rowsPerPageOptions={[5, 10, 25, 50]}
+                                sortField="contentType"
+                                sortOrder={1}
+                                filterDisplay="row"
+                                emptyMessage="No items to delete."
+                                className="p-datatable-sm"
+                            >
+                                <Column 
+                                    field="contentType" 
+                                    header="Content Type" 
+                                    sortable 
+                                    filter 
+                                    filterPlaceholder="Search by content type"
+                                    style={{ width: '20%' }}
+                                />
+                                <Column 
+                                    header="Content" 
+                                    body={renderContent}
+                                    style={{ width: '60%' }}
+                                />
+                                <Column 
+                                    header="Status" 
+                                    body={renderStatus}
+                                    style={{ width: '10%' }}
+                                />
+                                <Column 
+                                    header="Actions" 
+                                    body={renderViewButton}
+                                    style={{ width: '10%' }}
+                                />
+                            </DataTable>
+                        </TabPanel>
+                    </TabView>
+                </Card>
+            )}
+
+            {/* Sync Progress Section */}
+            {(syncInProgress || syncCompleted || syncFailed) && (
+                <div className="my-4 p-3 border-1 border-round surface-border">
+                    <h4 className="mb-3">Synchronization Progress</h4>
+
+                    {syncProgress && (
+                        <div className="mb-3">
+                            <div className="flex justify-content-between align-items-center mb-2">
+                                <span className="font-medium">
+                                    {syncProgress.processedItems} of {syncProgress.totalItems} items processed
+                                </span>
+                                <span className="font-medium">
+                                    {Math.round((syncProgress.processedItems / syncProgress.totalItems) * 100)}%
+                                </span>
+                            </div>
+                            <ProgressBar 
+                                value={Math.round((syncProgress.processedItems / syncProgress.totalItems) * 100)} 
+                                showValue={false}
+                                className="mb-2"
+                            />
+
+                            <div className="p-2 border-1 border-round surface-border mb-3">
+                                <div className="flex align-items-center">
+                                    <i className={`pi ${syncProgress.status === 'IN_PROGRESS' ? 'pi-spin pi-spinner' : syncProgress.status === 'SUCCESS' ? 'pi-check-circle text-success' : 'pi-times-circle text-danger'} mr-2`}></i>
+                                    <span className="font-medium">{syncProgress.currentItem}</span>
                                 </div>
-                            </AccordionTab>
-                        );
-                    })}
-                </Accordion>
+                                {syncProgress.message && (
+                                    <div className="mt-2 p-2 bg-red-50 text-red-700 border-round">
+                                        {syncProgress.message}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Status messages */}
+                    {syncCompleted && (
+                        <Message severity="success" text="Synchronization completed successfully!" className="w-full mb-3" />
+                    )}
+                    {syncFailed && (
+                        <Message severity="error" text="Synchronization failed. Please check the logs for details." className="w-full mb-3" />
+                    )}
+                </div>
             )}
 
             <div className="flex flex-column align-items-center my-5">
-                {status === 'COMPLETED' && (
+                {status === 'COMPLETED' && !syncInProgress && !syncFailed && (
                     <div className="mb-3">
                         <Message
                             severity="success"
@@ -452,16 +806,19 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                         />
                     </div>
                 )}
-                {status !== 'COMPLETED' &&
+                {/*{status !== 'COMPLETED' && !syncInProgress && !syncCompleted && (*/}
                     <Button
                         label="Complete Merge"
                         icon="pi pi-check"
                         loading={completing}
                         // disabled={completing || status !== 'MERGED_COLLECTIONS'}
-                        onClick={completeMerge}
+                        onClick={handleCompleteMerge}
                     />
-                }
+                {/*)}*/}
             </div>
+
+            {/* Toast for notifications */}
+            <Toast ref={toast} position="top-right" />
 
             {/* Editor Dialog */}
             <EditorDialog

@@ -61,6 +61,7 @@ dependencies {
     implementation("org.postgresql:postgresql:42.5.4")
     implementation("io.ktor:ktor-server-netty")
     implementation("ch.qos.logback:logback-classic:$logback_version")
+    implementation("io.ktor:ktor-server-cors:3.1.3")
     testImplementation("io.ktor:ktor-server-test-host")
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit:$kotlin_version")
     testImplementation("io.mockk:mockk:1.13.5")
@@ -126,4 +127,3 @@ ktor {
     }
 
 }
-

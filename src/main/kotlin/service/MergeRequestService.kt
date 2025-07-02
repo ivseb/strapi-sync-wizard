@@ -2,6 +2,8 @@ package it.sebi.service
 
 import io.ktor.server.config.*
 import it.sebi.JsonParser
+import it.sebi.SyncProgressService
+import it.sebi.SyncProgressUpdate
 import it.sebi.client.StrapiClient
 import it.sebi.client.client
 import it.sebi.database.dbQuery
@@ -604,28 +606,179 @@ class MergeRequestService(
         // 2. Retrieve files related to the merge request from the table
         val (mergeRequestFiles, contentSelections) = mergeRequestSelection.partition { it.contentType == STRAPI_FILE_CONTENT_TYPE_NAME }
 
-        // 3. Process files if there are any
-        if (mergeRequestFiles.isNotEmpty()) {
-            val comparisonData = comparisonDataMap.files
-            mergeRequestFileMergeProcess(mergeRequest, sourceClient, targetClient, mergeRequestFiles, comparisonData)
-        }
+        // Calculate total items for progress tracking
+        val totalFiles = mergeRequestFiles.size
+        val totalContentItems = contentSelections.size
+        val totalItems = totalFiles + totalContentItems
+        var processedItems = 0
 
-        // 4. Retrieve content selections from the database
-        val groupedSelections = contentSelections.groupBy { it.contentType }
-
-        // 5. Process singleTypes and collectionTypes
-        if (groupedSelections.isNotEmpty()) {
-            mergeRequestContentMergeProcess(
-                mergeRequest,
-                sourceClient,
-                targetClient,
-                groupedSelections,
-                comparisonDataMap
+        // Send initial progress update
+        SyncProgressService.sendProgressUpdate(
+            SyncProgressUpdate(
+                mergeRequestId = id,
+                totalItems = totalItems,
+                processedItems = processedItems,
+                currentItem = "Starting synchronization",
+                currentItemType = "",
+                currentOperation = "INIT",
+                status = "IN_PROGRESS"
             )
-        }
+        )
 
-        // 6. Update the merge request status
-        return mergeRequestRepository.updateMergeRequestStatus(id, MergeRequestStatus.COMPLETED)
+        try {
+            // 3. Process files if there are any
+            if (mergeRequestFiles.isNotEmpty()) {
+                val comparisonData = comparisonDataMap.files
+
+                // Process each file and send progress updates
+                mergeRequestFiles.forEachIndexed { index, file ->
+                    val currentItem = "File ${index + 1}/${mergeRequestFiles.size}"
+
+                    // Send progress update before processing the file
+                    SyncProgressService.sendProgressUpdate(
+                        SyncProgressUpdate(
+                            mergeRequestId = id,
+                            totalItems = totalItems,
+                            processedItems = processedItems,
+                            currentItem = file.documentId,
+                            currentItemType = STRAPI_FILE_CONTENT_TYPE_NAME,
+                            currentOperation = "PROCESSING",
+                            status = "IN_PROGRESS"
+                        )
+                    )
+
+                    try {
+                        // Process the file
+                        val fileList = listOf(file)
+                        mergeRequestFileMergeProcess(mergeRequest, sourceClient, targetClient, fileList, comparisonData)
+
+                        // Update processed items count and send success update
+                        processedItems++
+                        SyncProgressService.sendProgressUpdate(
+                            SyncProgressUpdate(
+                                mergeRequestId = id,
+                                totalItems = totalItems,
+                                processedItems = processedItems,
+                                currentItem = file.documentId,
+                                currentItemType = STRAPI_FILE_CONTENT_TYPE_NAME,
+                                currentOperation = "PROCESSED",
+                                status = "SUCCESS"
+                            )
+                        )
+                    } catch (e: Exception) {
+                        // Send failure update
+                        SyncProgressService.sendProgressUpdate(
+                            SyncProgressUpdate(
+                                mergeRequestId = id,
+                                totalItems = totalItems,
+                                processedItems = processedItems,
+                                currentItem = file.documentId,
+                                currentItemType = STRAPI_FILE_CONTENT_TYPE_NAME,
+                                currentOperation = "FAILED",
+                                status = "ERROR",
+                                message = e.message
+                            )
+                        )
+                        throw e
+                    }
+                }
+            }
+
+            // 4. Retrieve content selections from the database
+            val groupedSelections = contentSelections.groupBy { it.contentType }
+
+            // 5. Process singleTypes and collectionTypes
+            if (groupedSelections.isNotEmpty()) {
+                // Send progress update before processing content
+                SyncProgressService.sendProgressUpdate(
+                    SyncProgressUpdate(
+                        mergeRequestId = id,
+                        totalItems = totalItems,
+                        processedItems = processedItems,
+                        currentItem = "Processing content types",
+                        currentItemType = "content",
+                        currentOperation = "PROCESSING",
+                        status = "IN_PROGRESS"
+                    )
+                )
+
+                // We need to modify the mergeRequestContentMergeProcess method to track progress,
+                // but for now we'll just process all content and then update progress
+                try {
+                    mergeRequestContentMergeProcess(
+                        mergeRequest,
+                        sourceClient,
+                        targetClient,
+                        groupedSelections,
+                        comparisonDataMap
+                    )
+
+                    // Update processed items count
+                    processedItems += totalContentItems
+
+                    // Send success update
+                    SyncProgressService.sendProgressUpdate(
+                        SyncProgressUpdate(
+                            mergeRequestId = id,
+                            totalItems = totalItems,
+                            processedItems = processedItems,
+                            currentItem = "Content types processed",
+                            currentItemType = "content",
+                            currentOperation = "PROCESSED",
+                            status = "SUCCESS"
+                        )
+                    )
+                } catch (e: Exception) {
+                    // Send failure update
+                    SyncProgressService.sendProgressUpdate(
+                        SyncProgressUpdate(
+                            mergeRequestId = id,
+                            totalItems = totalItems,
+                            processedItems = processedItems,
+                            currentItem = "Content types processing failed",
+                            currentItemType = "content",
+                            currentOperation = "FAILED",
+                            status = "ERROR",
+                            message = e.message
+                        )
+                    )
+                    throw e
+                }
+            }
+
+            // 6. Update the merge request status
+            val result = mergeRequestRepository.updateMergeRequestStatus(id, MergeRequestStatus.COMPLETED)
+
+            // Send final success update
+            SyncProgressService.sendProgressUpdate(
+                SyncProgressUpdate(
+                    mergeRequestId = id,
+                    totalItems = totalItems,
+                    processedItems = totalItems,
+                    currentItem = "Synchronization completed",
+                    currentItemType = "",
+                    currentOperation = "COMPLETED",
+                    status = "SUCCESS"
+                )
+            )
+
+            return result
+        } catch (e: Exception) {
+            // Send final error update
+            SyncProgressService.sendProgressUpdate(
+                SyncProgressUpdate(
+                    mergeRequestId = id,
+                    totalItems = totalItems,
+                    processedItems = processedItems,
+                    currentItem = "Synchronization failed",
+                    currentItemType = "",
+                    currentOperation = "FAILED",
+                    status = "ERROR",
+                    message = e.message
+                )
+            )
+            throw e
+        }
     }
 
     data class ContentMapping(
