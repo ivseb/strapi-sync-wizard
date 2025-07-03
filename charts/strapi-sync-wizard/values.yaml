@@ -99,6 +99,9 @@ application:
     clientTimeout: 30000
     maxRetries: 3
 
+  # Admin password for viewing sensitive instance data
+  adminPassword: ""
+
   # Proxy configuration
   httpProxy: ""
   httpsProxy: ""

@@ -71,6 +71,10 @@ spec:
               value: "{{ .Values.application.strapi.clientTimeout }}"
             - name: STRAPI_CLIENT_MAX_RETRIES
               value: "{{ .Values.application.strapi.maxRetries }}"
+            {{- if .Values.application.adminPassword }}
+            - name: ADMIN_PASSWORD
+              value: "{{ .Values.application.adminPassword }}"
+            {{- end }}
             {{- if .Values.application.httpProxy }}
             - name: HTTP_PROXY
               value: "{{ .Values.application.httpProxy }}"

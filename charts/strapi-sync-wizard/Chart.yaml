@@ -2,8 +2,8 @@ apiVersion: v2
 name: strapi-sync-wizard
 description: A Helm chart for StrapiSyncWizard application
 type: application
-version: 0.2.2
-appVersion: "0.0.7"
+version: 0.2.4
+appVersion: "0.1.0"
 keywords:
   - strapi
   - sync
@@ -12,4 +12,4 @@ keywords:
   - kotlin
 maintainers:
   - name: StrapiSyncWizard Team
-home: https://github.com/ivseb/StrapiSyncWizard
+home: https://github.com/ivseb/strapi-sync-wizard
