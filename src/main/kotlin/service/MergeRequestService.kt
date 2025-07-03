@@ -1388,12 +1388,14 @@ class MergeRequestService(
     private fun prepareDataForCreation(
         sourceData: JsonObject,
         idMappings: Map<String, Map<String, ContentMapping>>,
-        firstPass: Boolean
+        firstPass: Boolean,
+        alreadyInObject: Boolean = false
     ): JsonObject {
         // Create a mutable copy of the source data
         val result = sourceData.toMutableMap()
 
         // Remove metadata fields that should not be included in the creation/update
+        val hasDocumentId = result.containsKey("documentId")
         result.remove("id")
         result.remove("documentId")
         result.remove("createdAt")
@@ -1475,15 +1477,17 @@ class MergeRequestService(
                                 null
                             }
                         } else {
-                            null
+                            prepareDataForCreation(item.jsonObject, idMappings, firstPass, true)
                         }
                     }
 
-                    if (relatedItems.isNotEmpty()) {
+                    if (relatedItems.isNotEmpty() && relatedItems.none { it is JsonObject || it is JsonArray }) {
                         // Replace with target ID references
                         updates[key] = buildJsonObject {
                             put("set", JsonArray(relatedItems.map { it }))
                         }
+                    } else if (relatedItems.isNotEmpty()  && hasDocumentId) {
+                        updates[key] = JsonArray(relatedItems.map { it })
                     } else if (value.jsonArray.isNotEmpty()) {
                         // Process array elements recursively
                         val res = processNestedArray(value, idMappings)
@@ -1769,9 +1773,9 @@ class MergeRequestService(
         // 7. Create or update each image by making appropriate calls to the target
         for ((file, direction) in filesToProcess) {
             // Find the corresponding selection
-            val selection = mergeRequestFiles.find { 
-                it.documentId == file.metadata.documentId && 
-                (it.direction == Direction.TO_CREATE || it.direction == Direction.TO_UPDATE) 
+            val selection = mergeRequestFiles.find {
+                it.documentId == file.metadata.documentId &&
+                        (it.direction == Direction.TO_CREATE || it.direction == Direction.TO_UPDATE)
             }
 
             if (selection == null) continue

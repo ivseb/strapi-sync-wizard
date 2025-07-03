@@ -6,11 +6,9 @@ import it.sebi.models.*
 import it.sebi.repository.MergeRequestDocumentMappingRepository
 import it.sebi.utils.calculateMD5Hash
 import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.*
 import java.time.OffsetDateTime
-import kotlin.script.experimental.api.asSuccess
 
 
 class SyncService(private val mergeRequestDocumentMappingRepository: MergeRequestDocumentMappingRepository) {
@@ -259,8 +257,9 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         )
 
 
-        val sourceContentTypes =
+        var sourceContentTypes =
             contentTypes.filter { it.uid.startsWith("api::") || it.uid == STRAPI_FILE_CONTENT_TYPE_NAME }
+
 
         // Build content type relationships
         val contentTypeRelationships = buildContentTypeRelationships(sourceContentTypes, components)
@@ -281,7 +280,8 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
                 }
             }
-            val targetDeferred = async { sourceContentTypes.map { contentType ->
+            val targetDeferred = async {
+                sourceContentTypes.map { contentType ->
                     val entries = targetClient.getContentEntries(contentType, mappings)
                     targetEntriesCache[contentType.uid] = entries
                 }
@@ -312,15 +312,11 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
             singleTypeComparisonResults[contentType.uid] = comparisonResult
 
-            // Determine dependencies
-            val dependsOn = contentTypeRelationships
-                .filter { it.sourceContentType == contentType.uid }
-                .map { it.targetContentType }
+            // Determine dependencies including transitive dependencies through components
+            val dependsOn = calculateAllDependencies(contentType.uid, contentTypeRelationships)
                 .distinct()
 
-            val dependedOnBy = contentTypeRelationships
-                .filter { it.targetContentType == contentType.uid }
-                .map { it.sourceContentType }
+            val dependedOnBy = calculateAllDependedOnBy(contentType.uid, contentTypeRelationships)
                 .distinct()
 
             // We'll add relationships later
@@ -355,15 +351,11 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
             collectionTypeComparisonResults[contentType.uid] = comparisonResult
 
-            // Determine dependencies
-            val dependsOn = contentTypeRelationships
-                .filter { it.sourceContentType == contentType.uid }
-                .map { it.targetContentType }
+            // Determine dependencies including transitive dependencies through components
+            val dependsOn = calculateAllDependencies(contentType.uid, contentTypeRelationships)
                 .distinct()
 
-            val dependedOnBy = contentTypeRelationships
-                .filter { it.targetContentType == contentType.uid }
-                .map { it.sourceContentType }
+            val dependedOnBy = calculateAllDependedOnBy(contentType.uid, contentTypeRelationships)
                 .distinct()
 
             // We'll add relationships later
@@ -382,8 +374,8 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
         // Now analyze entry relationships with comparison status information
         val entryRelationships = analyzeEntryRelationshipsWithComparisonStatus(
-            sourceClient,
             sourceContentTypes,
+            components,
             contentTypeRelationships,
             sourceEntriesCache,
 
@@ -462,6 +454,8 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         }
     }
 
+    data class MappingStatusRef(val contentTypeId: String, val status: ContentTypeComparisonResultKind)
+
     /**
      * Analyze relationships between entries with comparison status information
      * @param sourceEntriesCache Optional cache of entries to avoid repeated API calls
@@ -470,9 +464,10 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
      * @param files Comparison results for files
      * @return Map of entry ID to list of related entry IDs with comparison status
      */
+
     private fun analyzeEntryRelationshipsWithComparisonStatus(
-        sourceClient: StrapiClient,
         contentTypes: List<StrapiContentType>,
+        strapiComponentTypes: List<StrapiComponent>,
         contentTypeRelationships: List<ContentRelationship>,
         sourceEntriesCache: Map<String, List<EntryElement>>? = null,
         singleTypeComparisonResults: Map<String, ContentTypeComparisonResult>,
@@ -490,8 +485,8 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         }
 
         // Create maps to quickly look up comparison status for entries
-        val singleTypeStatusMap = mutableMapOf<String, ContentTypeComparisonResultKind>()
-        for ((_, result) in singleTypeComparisonResults) {
+        val singleTypeStatusMap = mutableMapOf<String, MappingStatusRef>()
+        for ((k, result) in singleTypeComparisonResults) {
             val documentId = result.onlyInSource?.metadata?.documentId
                 ?: result.different?.source?.metadata?.documentId
                 ?: result.identical?.metadata?.documentId
@@ -504,25 +499,27 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                 result.identical != null -> ContentTypeComparisonResultKind.IDENTICAL
                 else -> continue
             }
-            singleTypeStatusMap[documentId] = status
+            singleTypeStatusMap[documentId] = MappingStatusRef(k, status)
         }
 
-        val collectionTypeStatusMap = mutableMapOf<String, ContentTypeComparisonResultKind>()
-        for ((_, result) in collectionTypeComparisonResults) {
+        val collectionTypeStatusMap = mutableMapOf<String, MappingStatusRef>()
+        for ((k, result) in collectionTypeComparisonResults) {
             // Entries only in source
             for (entry in result.onlyInSource) {
-                collectionTypeStatusMap[entry.metadata.documentId] = ContentTypeComparisonResultKind.ONLY_IN_SOURCE
+                collectionTypeStatusMap[entry.metadata.documentId] =
+                    MappingStatusRef(k, ContentTypeComparisonResultKind.ONLY_IN_SOURCE)
             }
 
             // Different entries
             for (diffEntry in result.different) {
                 collectionTypeStatusMap[diffEntry.source.metadata.documentId] =
-                    ContentTypeComparisonResultKind.DIFFERENT
+                    MappingStatusRef(k, ContentTypeComparisonResultKind.DIFFERENT)
             }
 
             // Identical entries
             for (entry in result.identical) {
-                collectionTypeStatusMap[entry.metadata.documentId] = ContentTypeComparisonResultKind.IDENTICAL
+                collectionTypeStatusMap[entry.metadata.documentId] =
+                    MappingStatusRef(k, ContentTypeComparisonResultKind.IDENTICAL)
             }
         }
 
@@ -544,6 +541,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
         // Analyze relationships between entries
         for (contentType in contentTypes) {
+
             val entries = contentTypeEntries[contentType.uid] ?: continue
 
             for (entry in entries) {
@@ -591,7 +589,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                                 val targetStatus = fileStatusMap[targetDocumentId]
 
                                 // Determine the relationship status based on source and target status
-                                val relationshipStatus = determineRelationshipStatus(sourceStatus, targetStatus)
+                                val relationshipStatus = determineRelationshipStatus(sourceStatus?.status, targetStatus)
 
                                 // Add a relationship to the file
                                 relationships.add(
@@ -625,7 +623,8 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                                     )
 
                                     // Determine the relationship status based on source and target status
-                                    val relationshipStatus = determineRelationshipStatus(sourceStatus, targetStatus)
+                                    val relationshipStatus =
+                                        determineRelationshipStatus(sourceStatus?.status, targetStatus)
 
                                     relationships.add(
                                         EntryRelationship(
@@ -654,7 +653,8 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                                     )
 
                                     // Determine the relationship status based on source and target status
-                                    val relationshipStatus = determineRelationshipStatus(sourceStatus, targetStatus)
+                                    val relationshipStatus =
+                                        determineRelationshipStatus(sourceStatus?.status, targetStatus)
 
                                     relationships.add(
                                         EntryRelationship(
@@ -692,7 +692,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                             val targetStatus = fileStatusMap[targetDocumentId]
 
                             // Determine the relationship status based on source and target status
-                            val relationshipStatus = determineRelationshipStatus(sourceStatus, targetStatus)
+                            val relationshipStatus = determineRelationshipStatus(sourceStatus?.status, targetStatus)
 
                             // Add a relationship to the file
                             relationships.add(
@@ -713,17 +713,22 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                             for (component in fieldData) {
                                 if (component is JsonObject) {
                                     // Process each component in the dynamiczone
+
                                     val componentRelationships = processComponent(
+                                        strapiComponentTypes.find { it.uid == attribute.component },
+                                        contentTypes,
+                                        strapiComponentTypes,
                                         component,
                                         contentType.uid,
                                         documentId,
                                         fieldName,
-                                        sourceStatus,
+                                        sourceStatus?.status,
                                         singleTypeStatusMap,
                                         collectionTypeStatusMap,
                                         fileStatusMap
                                     )
                                     relationships.addAll(componentRelationships)
+
                                 }
                             }
                         }
@@ -734,27 +739,37 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                             for (component in fieldData) {
                                 if (component is JsonObject) {
                                     // Process each component in the array
-                                    val componentRelationships = processComponent(
-                                        component,
-                                        contentType.uid,
-                                        documentId,
-                                        fieldName,
-                                        sourceStatus,
-                                        singleTypeStatusMap,
-                                        collectionTypeStatusMap,
-                                        fileStatusMap
-                                    )
-                                    relationships.addAll(componentRelationships)
+                                    strapiComponentTypes.find { cc -> cc.uid == attribute.component }
+                                        ?.let { componentObj ->
+                                            val componentRelationships = processComponent(
+                                                componentObj,
+                                                contentTypes,
+                                                strapiComponentTypes,
+                                                component,
+                                                contentType.uid,
+                                                documentId,
+                                                fieldName,
+                                                sourceStatus?.status,
+                                                singleTypeStatusMap,
+                                                collectionTypeStatusMap,
+                                                fileStatusMap
+                                            )
+                                            relationships.addAll(componentRelationships)
+                                        }
+
                                 }
                             }
                         } else if (fieldData is JsonObject) {
                             // Handle single component
                             val componentRelationships = processComponent(
+                                strapiComponentTypes.find { it.uid == attribute.component },
+                                contentTypes,
+                                strapiComponentTypes,
                                 fieldData,
                                 contentType.uid,
                                 documentId,
                                 fieldName,
-                                sourceStatus,
+                                sourceStatus?.status,
                                 singleTypeStatusMap,
                                 collectionTypeStatusMap,
                                 fileStatusMap
@@ -804,16 +819,16 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
     private fun getComparisonStatusForTarget(
         targetContentType: String,
         targetId: String,
-        singleTypeStatusMap: Map<String, ContentTypeComparisonResultKind>,
-        collectionTypeStatusMap: Map<String, ContentTypeComparisonResultKind>,
+        singleTypeStatusMap: Map<String, MappingStatusRef>,
+        collectionTypeStatusMap: Map<String, MappingStatusRef>,
         fileStatusMap: Map<String, ContentTypeComparisonResultKind>
     ): ContentTypeComparisonResultKind? {
         return when {
             targetContentType == STRAPI_FILE_CONTENT_TYPE_NAME -> fileStatusMap[targetId]
             // For other content types, we need to determine if it's a single type or collection type
             // This is a simplification - in a real implementation, you'd need to check the content type kind
-            singleTypeStatusMap.containsKey(targetId) -> singleTypeStatusMap[targetId]
-            else -> collectionTypeStatusMap[targetId]
+            singleTypeStatusMap.containsKey(targetId) -> singleTypeStatusMap[targetId]?.status
+            else -> collectionTypeStatusMap[targetId]?.status
         }
     }
 
@@ -821,93 +836,313 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
      * Process a component and extract relationships from it
      */
     private fun processComponent(
+        componentObj: StrapiComponent?,
+        contentTypes: List<StrapiContentType>,
+        strapiComponentTypes: List<StrapiComponent>,
         component: JsonObject,
         sourceContentType: String,
         sourceDocumentId: String,
         sourceField: String,
         sourceStatus: ContentTypeComparisonResultKind?,
-        singleTypeStatusMap: Map<String, ContentTypeComparisonResultKind>,
-        collectionTypeStatusMap: Map<String, ContentTypeComparisonResultKind>,
+        singleTypeStatusMap: Map<String, MappingStatusRef>,
+        collectionTypeStatusMap: Map<String, MappingStatusRef>,
         fileStatusMap: Map<String, ContentTypeComparisonResultKind>
     ): List<EntryRelationship> {
         val relationships = mutableListOf<EntryRelationship>()
 
-        // Process each field in the component
-        for ((fieldName, fieldValue) in component) {
-            // Skip special fields like __component
-            if (fieldName == "__component") continue
+        // Get the component type if available
+        val componentType = component["__component"]?.jsonPrimitive?.content?.trim('"')
 
-            // Skip null or empty values
-            if (fieldValue is JsonNull) continue
-            if (fieldValue is JsonArray && fieldValue.jsonArray.isEmpty()) continue
-            if (fieldValue is JsonObject && fieldValue.jsonObject.isEmpty()) continue
-            if (fieldValue is JsonPrimitive) continue
+        // If componentObj is available, use its schema to determine relationships
+        if (componentObj != null) {
+            // Process each field in the component using the schema
+            for ((fieldName, attribute) in componentObj.schema.attributes) {
+                val fieldData = component[fieldName] ?: continue
 
-            // Handle media fields (files)
-            if (fieldName == "image" || fieldName == "file" || fieldName == "media") {
-                val mediaFiles = when {
-                    fieldValue is JsonObject && fieldValue.containsKey("documentId") -> {
-                        listOf(fieldValue.jsonObject)
+                // Skip null or empty values
+                if (fieldData is JsonNull) continue
+                if (fieldData is JsonArray && fieldData.jsonArray.isEmpty()) continue
+                if (fieldData is JsonObject && fieldData.jsonObject.isEmpty()) continue
+
+                when (attribute.type) {
+                    "relation" -> {
+                        if (attribute.target != null) {
+                            val targetContentType = attribute.target
+
+                            // Extract related entry IDs based on relation type
+                            when (attribute.relation) {
+                                "oneToOne", "manyToOne" -> {
+                                    val targetId = extractRelateddocumentId(fieldData)
+                                    if (targetId != null) {
+                                        // Get the comparison status for the target entry
+                                        val targetStatus = getComparisonStatusForTarget(
+                                            targetContentType,
+                                            targetId,
+                                            singleTypeStatusMap,
+                                            collectionTypeStatusMap,
+                                            fileStatusMap
+                                        )
+
+                                        // Determine the relationship status
+                                        val relationshipStatus = determineRelationshipStatus(sourceStatus, targetStatus)
+
+                                        relationships.add(
+                                            EntryRelationship(
+                                                sourceContentType = sourceContentType,
+                                                sourceDocumentId = sourceDocumentId,
+                                                sourceField = "$sourceField.$fieldName",
+                                                targetContentType = targetContentType,
+                                                targetDocumentId = targetId,
+                                                relationType = attribute.relation,
+                                                compareStatus = relationshipStatus
+                                            )
+                                        )
+                                    }
+                                }
+
+                                "oneToMany", "manyToMany" -> {
+                                    val targetIds = extractRelateddocumentIds(fieldData)
+                                    for (targetId in targetIds) {
+                                        // Get the comparison status for the target entry
+                                        val targetStatus = getComparisonStatusForTarget(
+                                            targetContentType,
+                                            targetId,
+                                            singleTypeStatusMap,
+                                            collectionTypeStatusMap,
+                                            fileStatusMap
+                                        )
+
+                                        // Determine the relationship status
+                                        val relationshipStatus = determineRelationshipStatus(sourceStatus, targetStatus)
+
+                                        relationships.add(
+                                            EntryRelationship(
+                                                sourceContentType = sourceContentType,
+                                                sourceDocumentId = sourceDocumentId,
+                                                sourceField = "$sourceField.$fieldName",
+                                                targetContentType = targetContentType,
+                                                targetDocumentId = targetId,
+                                                relationType = attribute.relation,
+                                                compareStatus = relationshipStatus
+                                            )
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
 
-                    fieldValue is JsonArray && fieldValue.jsonArray.isNotEmpty() -> {
-                        fieldValue.jsonArray.toList().map { it.jsonObject }
+                    "media" -> {
+                        // Handle media attributes (file references)
+                        val mediaFiles = when {
+                            fieldData is JsonObject && fieldData.containsKey("documentId") -> {
+                                listOf(fieldData.jsonObject)
+                            }
+
+                            fieldData is JsonArray && fieldData.jsonArray.isNotEmpty() -> {
+                                fieldData.jsonArray.toList().map { it.jsonObject }
+                            }
+
+                            else -> listOf()
+                        }
+
+                        for (mediaFile in mediaFiles) {
+                            if (mediaFile.containsKey("documentId")) {
+                                val targetDocumentId =
+                                    mediaFile["documentId"]?.jsonPrimitive?.content?.trim('"') ?: continue
+
+                                // Get the comparison status for the file
+                                val targetStatus = fileStatusMap[targetDocumentId]
+
+                                // Determine the relationship status
+                                val relationshipStatus = determineRelationshipStatus(sourceStatus, targetStatus)
+
+                                // Add a relationship to the file
+                                relationships.add(
+                                    EntryRelationship(
+                                        sourceContentType = sourceContentType,
+                                        sourceDocumentId = sourceDocumentId,
+                                        sourceField = "$sourceField.$fieldName",
+                                        targetContentType = STRAPI_FILE_CONTENT_TYPE_NAME,
+                                        targetDocumentId = targetDocumentId,
+                                        relationType = "media",
+                                        compareStatus = relationshipStatus
+                                    )
+                                )
+                            }
+                        }
                     }
 
-                    else -> listOf()
+                    "component" -> {
+                        // Handle component attributes
+                        if (attribute.component != null) {
+                            val nestedComponentType = attribute.component
+                            val nestedComponentObj = strapiComponentTypes.find { it.uid == nestedComponentType }
+
+                            if (attribute.repeatable == true && fieldData is JsonArray) {
+                                // Handle repeatable components (array of components)
+                                for (nestedComponent in fieldData) {
+                                    if (nestedComponent is JsonObject) {
+                                        // Process each component in the array
+                                        val componentRelationships = processComponent(
+                                            nestedComponentObj,
+                                            contentTypes,
+                                            strapiComponentTypes,
+                                            nestedComponent.jsonObject,
+                                            sourceContentType,
+                                            sourceDocumentId,
+                                            "$sourceField.$fieldName",
+                                            sourceStatus,
+                                            singleTypeStatusMap,
+                                            collectionTypeStatusMap,
+                                            fileStatusMap
+                                        )
+                                        relationships.addAll(componentRelationships)
+                                    }
+                                }
+                            } else if (fieldData is JsonObject) {
+                                // Handle single component
+                                val componentRelationships = processComponent(
+                                    nestedComponentObj,
+                                    contentTypes,
+                                    strapiComponentTypes,
+                                    fieldData.jsonObject,
+                                    sourceContentType,
+                                    sourceDocumentId,
+                                    "$sourceField.$fieldName",
+                                    sourceStatus,
+                                    singleTypeStatusMap,
+                                    collectionTypeStatusMap,
+                                    fileStatusMap
+                                )
+                                relationships.addAll(componentRelationships)
+                            }
+                        }
+                    }
+
+                    "dynamiczone" -> {
+                        // Handle dynamiczone attributes
+                        if (fieldData is JsonArray) {
+                            for (dynamicComponent in fieldData) {
+                                if (dynamicComponent is JsonObject) {
+                                    val dynamicComponentType =
+                                        dynamicComponent["__component"]?.jsonPrimitive?.content?.trim('"')
+                                    val dynamicComponentObj = dynamicComponentType?.let { type ->
+                                        strapiComponentTypes.find { it.uid == type }
+                                    }
+
+                                    // Process each component in the dynamiczone
+                                    val componentRelationships = processComponent(
+                                        dynamicComponentObj,
+                                        contentTypes,
+                                        strapiComponentTypes,
+                                        dynamicComponent.jsonObject,
+                                        sourceContentType,
+                                        sourceDocumentId,
+                                        "$sourceField.$fieldName",
+                                        sourceStatus,
+                                        singleTypeStatusMap,
+                                        collectionTypeStatusMap,
+                                        fileStatusMap
+                                    )
+                                    relationships.addAll(componentRelationships)
+                                }
+                            }
+                        }
+                    }
                 }
+            }
 
-                for (mediaFile in mediaFiles) {
-                    if (mediaFile.containsKey("documentId")) {
-                        val targetDocumentId = mediaFile["documentId"]?.jsonPrimitive?.content?.trim('"') ?: continue
+            return relationships
+        } else {
 
-                        // Get the comparison status for the file
-                        val targetStatus = fileStatusMap[targetDocumentId]
+            // If componentObj is not available, use the original implementation
+            // Process each field in the component
+            for ((fieldName, fieldValue) in component) {
+                // Skip special fields like __component
 
-                        // Determine the relationship status
-                        val relationshipStatus = determineRelationshipStatus(sourceStatus, targetStatus)
+                if (fieldName == "__component") continue
 
-                        // Add a relationship to the file
-                        relationships.add(
-                            EntryRelationship(
-                                sourceContentType = sourceContentType,
-                                sourceDocumentId = sourceDocumentId,
-                                sourceField = "$sourceField.$fieldName",
-                                targetContentType = STRAPI_FILE_CONTENT_TYPE_NAME,
-                                targetDocumentId = targetDocumentId,
-                                relationType = "media",
-                                compareStatus = relationshipStatus
-                            )
+                // Skip null or empty values
+                if (fieldValue is JsonNull) continue
+                if (fieldValue is JsonArray && fieldValue.jsonArray.isEmpty()) continue
+                if (fieldValue is JsonObject && fieldValue.jsonObject.isEmpty()) continue
+                if (fieldValue is JsonPrimitive && fieldName != "documentId") continue
+
+                if (fieldName == "documentId") {
+
+                    val documentId = fieldValue.jsonPrimitive.content
+                    val targetStatus = singleTypeStatusMap[documentId] ?: collectionTypeStatusMap[documentId]
+                    if (targetStatus == null) {
+                        continue
+                    }
+
+                    val relationshipStatus = determineRelationshipStatus(sourceStatus, targetStatus.status)
+
+                    // Add a relationship to the file
+                    relationships.add(
+                        EntryRelationship(
+                            sourceContentType = sourceContentType,
+                            sourceDocumentId = sourceDocumentId,
+                            sourceField = "$sourceField.$fieldName",
+                            targetContentType = targetStatus.contentTypeId,
+                            targetDocumentId = documentId,
+                            relationType = "relation",
+                            compareStatus = relationshipStatus
                         )
+                    )
+                }
+
+                // Handle media fields (files)
+                else if (fieldName == "image" || fieldName == "file" || fieldName == "media") {
+                    val mediaFiles = when {
+                        fieldValue is JsonObject && fieldValue.containsKey("documentId") -> {
+                            listOf(fieldValue.jsonObject)
+                        }
+
+                        fieldValue is JsonArray && fieldValue.jsonArray.isNotEmpty() -> {
+                            fieldValue.jsonArray.toList().map { it.jsonObject }
+                        }
+
+                        else -> listOf()
+                    }
+
+                    for (mediaFile in mediaFiles) {
+                        if (mediaFile.containsKey("documentId")) {
+                            val targetDocumentId =
+                                mediaFile["documentId"]?.jsonPrimitive?.content?.trim('"') ?: continue
+
+                            // Get the comparison status for the file
+                            val targetStatus = fileStatusMap[targetDocumentId]
+
+                            // Determine the relationship status
+                            val relationshipStatus = determineRelationshipStatus(sourceStatus, targetStatus)
+
+                            // Add a relationship to the file
+                            relationships.add(
+                                EntryRelationship(
+                                    sourceContentType = sourceContentType,
+                                    sourceDocumentId = sourceDocumentId,
+                                    sourceField = "$sourceField.$fieldName",
+                                    targetContentType = STRAPI_FILE_CONTENT_TYPE_NAME,
+                                    targetDocumentId = targetDocumentId,
+                                    relationType = "media",
+                                    compareStatus = relationshipStatus
+                                )
+                            )
+                        }
                     }
                 }
-            }
 
-            // Handle nested components
-            else if (fieldValue is JsonObject) {
-                // Recursively process nested component
-                val nestedRelationships = processComponent(
-                    fieldValue,
-                    sourceContentType,
-                    sourceDocumentId,
-                    "$sourceField.$fieldName",
-                    sourceStatus,
-                    singleTypeStatusMap,
-                    collectionTypeStatusMap,
-                    fileStatusMap
-                )
-                relationships.addAll(nestedRelationships)
-            }
+                // Handle relation fields - check for data structure that indicates a relation
+                else if (fieldValue is JsonObject && (fieldValue.containsKey("data") || fieldValue.containsKey("documentId"))) {
+                    // Handle single relation
+                    if (fieldValue.containsKey("data") && fieldValue["data"] is JsonObject) {
+                        val data = fieldValue["data"]?.jsonObject
+                        val targetDocumentId = data?.get("documentId")?.jsonPrimitive?.content?.trim('"')
+                        val targetContentType = data?.get("__type")?.jsonPrimitive?.content?.trim('"')
 
-            // Handle arrays (could be repeatable components or relations)
-            else if (fieldValue is JsonArray) {
-                for (item in fieldValue) {
-                    if (item is JsonObject) {
-                        // Check if this is a relation (has documentId)
-                        if (item.containsKey("documentId") && item.containsKey("__type")) {
-                            val targetDocumentId = item["documentId"]?.jsonPrimitive?.content?.trim('"') ?: continue
-                            val targetContentType = item["__type"]?.jsonPrimitive?.content?.trim('"') ?: continue
-
+                        if (targetDocumentId != null && targetContentType != null) {
                             // Get the comparison status for the target
                             val targetStatus = getComparisonStatusForTarget(
                                 targetContentType,
@@ -932,9 +1167,83 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                                     compareStatus = relationshipStatus
                                 )
                             )
-                        } else {
-                            // Recursively process as a nested component
+                        }
+                    }
+                    // Handle multiple relations
+                    else if (fieldValue.containsKey("data") && fieldValue["data"] is JsonArray) {
+                        val dataArray = fieldValue["data"]?.jsonArray ?: continue
+                        for (item in dataArray) {
+                            if (item is JsonObject) {
+                                val targetDocumentId = item["documentId"]?.jsonPrimitive?.content?.trim('"') ?: continue
+                                val targetContentType = item["__type"]?.jsonPrimitive?.content?.trim('"') ?: continue
+
+                                // Get the comparison status for the target
+                                val targetStatus = getComparisonStatusForTarget(
+                                    targetContentType,
+                                    targetDocumentId,
+                                    singleTypeStatusMap,
+                                    collectionTypeStatusMap,
+                                    fileStatusMap
+                                )
+
+                                // Determine the relationship status
+                                val relationshipStatus = determineRelationshipStatus(sourceStatus, targetStatus)
+
+                                // Add a relationship
+                                relationships.add(
+                                    EntryRelationship(
+                                        sourceContentType = sourceContentType,
+                                        sourceDocumentId = sourceDocumentId,
+                                        sourceField = "$sourceField.$fieldName",
+                                        targetContentType = targetContentType,
+                                        targetDocumentId = targetDocumentId,
+                                        relationType = "relation",
+                                        compareStatus = relationshipStatus
+                                    )
+                                )
+                            }
+                        }
+                    }
+                    // Direct documentId reference
+                    else if (fieldValue.containsKey("documentId")) {
+                        val targetDocumentId = fieldValue["documentId"]?.jsonPrimitive?.content?.trim('"') ?: continue
+                        val targetContentType =
+                            fieldValue["__type"]?.jsonPrimitive?.content?.trim('"') ?: STRAPI_FILE_CONTENT_TYPE_NAME
+
+                        // Get the comparison status for the target
+                        val targetStatus = getComparisonStatusForTarget(
+                            targetContentType,
+                            targetDocumentId,
+                            singleTypeStatusMap,
+                            collectionTypeStatusMap,
+                            fileStatusMap
+                        )
+
+                        // Determine the relationship status
+                        val relationshipStatus = determineRelationshipStatus(sourceStatus, targetStatus)
+
+                        // Add a relationship
+                        relationships.add(
+                            EntryRelationship(
+                                sourceContentType = sourceContentType,
+                                sourceDocumentId = sourceDocumentId,
+                                sourceField = "$sourceField.$fieldName",
+                                targetContentType = targetContentType,
+                                targetDocumentId = targetDocumentId,
+                                relationType = "relation",
+                                compareStatus = relationshipStatus
+                            )
+                        )
+                    }
+                } else if (fieldValue is JsonArray) {
+                    // Process each item in the array as a potential nested component or relation
+                    for (item in fieldValue.jsonArray) {
+                        if (item is JsonObject) {
+                            // Check if this is a component with potential relations
                             val nestedRelationships = processComponent(
+                                null,
+                                contentTypes,
+                                strapiComponentTypes,
                                 item,
                                 sourceContentType,
                                 sourceDocumentId,
@@ -948,10 +1257,83 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                         }
                     }
                 }
-            }
-        }
 
-        return relationships
+                // Handle nested components
+                else if (fieldValue is JsonObject) {
+                    // Recursively process nested component
+                    val nestedRelationships = processComponent(
+                        null,
+                        contentTypes,
+                        strapiComponentTypes,
+                        fieldValue,
+                        sourceContentType,
+                        sourceDocumentId,
+                        "$sourceField.$fieldName",
+                        sourceStatus,
+                        singleTypeStatusMap,
+                        collectionTypeStatusMap,
+                        fileStatusMap
+                    )
+                    relationships.addAll(nestedRelationships)
+                }
+
+                // Handle arrays (could be repeatable components or relations)
+                else if (fieldValue is JsonArray) {
+                    for (item in fieldValue) {
+                        if (item is JsonObject) {
+                            // Check if this is a relation (has documentId)
+                            if (item.containsKey("documentId") && item.containsKey("__type")) {
+                                val targetDocumentId = item["documentId"]?.jsonPrimitive?.content?.trim('"') ?: continue
+                                val targetContentType = item["__type"]?.jsonPrimitive?.content?.trim('"') ?: continue
+
+                                // Get the comparison status for the target
+                                val targetStatus = getComparisonStatusForTarget(
+                                    targetContentType,
+                                    targetDocumentId,
+                                    singleTypeStatusMap,
+                                    collectionTypeStatusMap,
+                                    fileStatusMap
+                                )
+
+                                // Determine the relationship status
+                                val relationshipStatus = determineRelationshipStatus(sourceStatus, targetStatus)
+
+                                // Add a relationship
+                                relationships.add(
+                                    EntryRelationship(
+                                        sourceContentType = sourceContentType,
+                                        sourceDocumentId = sourceDocumentId,
+                                        sourceField = "$sourceField.$fieldName",
+                                        targetContentType = targetContentType,
+                                        targetDocumentId = targetDocumentId,
+                                        relationType = "relation",
+                                        compareStatus = relationshipStatus
+                                    )
+                                )
+                            } else {
+                                // Recursively process as a nested component
+                                val nestedRelationships = processComponent(
+                                    null,
+                                    contentTypes,
+                                    strapiComponentTypes,
+                                    item,
+                                    sourceContentType,
+                                    sourceDocumentId,
+                                    "$sourceField.$fieldName",
+                                    sourceStatus,
+                                    singleTypeStatusMap,
+                                    collectionTypeStatusMap,
+                                    fileStatusMap
+                                )
+                                relationships.addAll(nestedRelationships)
+                            }
+                        }
+                    }
+                }
+            }
+
+            return relationships
+        }
     }
 
     /**
@@ -1238,35 +1620,79 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         relationships: MutableList<ContentRelationship>,
         sourceContentType: String,
         sourceField: String,
-        componentUid: String?,
-        componentByUid: Map<String, StrapiComponent>
+        component: StrapiComponent,
+        componentByUid: Map<String, StrapiComponent>,
+        contentTypeByUid: Map<String, StrapiContentType>
     ) {
-        if (componentUid == null) return
-
-        val component = componentByUid[componentUid] ?: return
 
         // Add relationship for this component
         relationships.add(
             ContentRelationship(
                 sourceContentType = sourceContentType,
                 sourceField = sourceField,
-                targetContentType = component.schema.collectionName,
+                targetContentType = component.uid,
                 relationType = "component",
                 isBidirectional = false
             )
         )
 
-        // Process nested components
+        // Process component attributes
         for ((nestedFieldName, nestedAttribute) in component.schema.attributes) {
-            if (nestedAttribute.type == "component") {
-                // Recursively process nested component
-                processComponentRelationships(
-                    relationships,
-                    component.schema.collectionName, // Now the component becomes the source
-                    nestedFieldName,
-                    nestedAttribute.component,
-                    componentByUid
-                )
+            when (nestedAttribute.type) {
+                "component" -> {
+                    // Recursively process nested component
+                    componentByUid[nestedAttribute.component]?.let { nestedComponent ->
+                        processComponentRelationships(
+                            relationships,
+                            component.uid, // Now the component becomes the source
+                            nestedFieldName,
+                            nestedComponent,
+                            componentByUid,
+                            contentTypeByUid
+                        )
+                    }
+                }
+
+                "relation" -> {
+                    // Handle relation attributes within components
+                    if (nestedAttribute.target != null) {
+                        relationships.add(
+                            ContentRelationship(
+                                sourceContentType = component.uid, // The component is the source
+                                sourceField = nestedFieldName,
+                                targetContentType = nestedAttribute.target,
+                                relationType = nestedAttribute.relation ?: "unknown",
+                                isBidirectional = false // Will be updated in second pass
+                            )
+                        )
+                    }
+                }
+
+                "media" -> {
+                    // Add relationship to files for media attributes within components
+                    relationships.add(
+                        ContentRelationship(
+                            sourceContentType = component.uid,
+                            sourceField = nestedFieldName,
+                            targetContentType = STRAPI_FILE_CONTENT_TYPE_NAME,
+                            relationType = "media",
+                            isBidirectional = false
+                        )
+                    )
+                }
+
+                "dynamiczone" -> {
+                    // For dynamiczone within components
+                    relationships.add(
+                        ContentRelationship(
+                            sourceContentType = component.uid,
+                            sourceField = nestedFieldName,
+                            targetContentType = STRAPI_FILE_CONTENT_TYPE_NAME,
+                            relationType = "dynamiczone",
+                            isBidirectional = false
+                        )
+                    )
+                }
             }
         }
     }
@@ -1280,11 +1706,12 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         components: List<StrapiComponent>
     ): List<ContentRelationship> {
         val relationships = mutableListOf<ContentRelationship>()
-        val contentTypeByUid = contentTypes.associateBy { it.uid }
+        val contentTypeByUid: Map<String, StrapiContentType> = contentTypes.associateBy { it.uid }
         val componentByUid = components.associateBy { it.uid }
 
         // First pass: identify all relationships
         for (contentType in contentTypes) {
+
             for ((fieldName, attribute) in contentType.schema.attributes) {
                 if (attribute.type == "relation" && attribute.target != null) {
                     val targetContentType = contentTypeByUid[attribute.target]
@@ -1301,13 +1728,16 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                     }
                 } else if (attribute.type == "component") {
                     // Process component and its nested components
-                    processComponentRelationships(
-                        relationships,
-                        contentType.uid,
-                        fieldName,
-                        attribute.component,
-                        componentByUid
-                    )
+                    componentByUid[attribute.component]?.let { component ->
+                        processComponentRelationships(
+                            relationships,
+                            contentType.uid,
+                            fieldName,
+                            component,
+                            componentByUid,
+                            contentTypeByUid
+                        )
+                    }
                 } else if (attribute.type == "media") {
                     // Add relationship to files for media attributes
                     relationships.add(
@@ -1423,6 +1853,141 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
             println("[DEBUG_LOG] Error extracting related entry IDs: ${e.message}")
             emptyList()
         }
+    }
+
+    /**
+     * Calculate all dependencies (direct and transitive) for a given content type
+     * @param contentTypeUid The UID of the content type
+     * @param relationships The list of content relationships
+     * @return List of content type UIDs that the given content type depends on
+     */
+    private fun calculateAllDependencies(
+        contentTypeUid: String,
+        relationships: List<ContentRelationship>
+    ): List<String> {
+        val result = mutableListOf<String>()
+        val visited = mutableSetOf<String>()
+
+        // Helper function to recursively find dependencies
+        fun findDependencies(currentUid: String) {
+            if (currentUid in visited) return
+            visited.add(currentUid)
+
+            // Find direct dependencies
+            val directDependencies = relationships
+                .filter { it.sourceContentType == currentUid }
+                .map { it.targetContentType }
+
+            for (dependency in directDependencies) {
+                if (dependency !in result && dependency != currentUid) {
+                    result.add(dependency)
+                    // Recursively find dependencies of this dependency
+                    findDependencies(dependency)
+                }
+            }
+
+            // Find component dependencies (where a component depends on a content type)
+            val componentDependencies = relationships
+                .filter { it.relationType == "component" && it.sourceContentType == currentUid }
+                .map { it.targetContentType }
+
+            for (componentUid in componentDependencies) {
+                // Find content types that this component depends on
+                // Need to handle both the component UID and the collection name format
+                val componentName = componentUid.replace("components_", "").replace("_", "-")
+
+                // For components_contacts_section_faq_data_sources, we need to try:
+                // 1. components_contacts_section_faq_data_sources (original)
+                // 2. contacts-section.faq-data-source (category.name format)
+
+                // Split by hyphen and try to identify the category and name parts
+                val parts = componentName.split("-")
+                val categoryNameFormat = if (parts.size >= 2) {
+                    // Assume first two parts are the category, rest is the name
+                    val category = parts.take(2).joinToString("-")
+                    val name = parts.drop(2).joinToString("-")
+                    "$category.$name"
+                } else {
+                    componentName
+                }
+
+                val possibleComponentSources = listOf(
+                    componentUid,
+                    categoryNameFormat
+                )
+
+                val componentContentDependencies = relationships
+                    .filter { possibleComponentSources.contains(it.sourceContentType) && it.relationType != "component" }
+                    .map { it.targetContentType }
+
+                for (dependency in componentContentDependencies) {
+                    if (dependency !in result && dependency != currentUid && dependency.startsWith("api::")) {
+                        result.add(dependency)
+                        // Recursively find dependencies of this dependency
+                        findDependencies(dependency)
+                    }
+                }
+            }
+        }
+
+        findDependencies(contentTypeUid)
+        return result
+    }
+
+    /**
+     * Calculate all content types that depend on a given content type (directly or transitively)
+     * @param contentTypeUid The UID of the content type
+     * @param relationships The list of content relationships
+     * @return List of content type UIDs that depend on the given content type
+     */
+    private fun calculateAllDependedOnBy(
+        contentTypeUid: String,
+        relationships: List<ContentRelationship>
+    ): List<String> {
+        val result = mutableListOf<String>()
+        val visited = mutableSetOf<String>()
+
+        // Helper function to recursively find dependencies
+        fun findDependedOnBy(currentUid: String) {
+            if (currentUid in visited) return
+            visited.add(currentUid)
+
+            // Find direct dependents
+            val directDependents = relationships
+                .filter { it.targetContentType == currentUid }
+                .map { it.sourceContentType }
+
+            for (dependent in directDependents) {
+                if (dependent !in result && dependent != currentUid && dependent.startsWith("api::")) {
+                    result.add(dependent)
+                    // Recursively find content types that depend on this dependent
+                    findDependedOnBy(dependent)
+                }
+            }
+
+            // Find content types that depend on components that depend on this content type
+            val componentsUsingThisContent = relationships
+                .filter { it.targetContentType == currentUid && it.sourceContentType.contains(".") }
+                .map { it.sourceContentType }
+
+            for (componentUid in componentsUsingThisContent) {
+                // Find content types that use this component
+                val contentTypesUsingComponent = relationships
+                    .filter { it.targetContentType == componentUid && it.relationType == "component" }
+                    .map { it.sourceContentType }
+
+                for (dependent in contentTypesUsingComponent) {
+                    if (dependent !in result && dependent != currentUid && dependent.startsWith("api::")) {
+                        result.add(dependent)
+                        // Recursively find content types that depend on this dependent
+                        findDependedOnBy(dependent)
+                    }
+                }
+            }
+        }
+
+        findDependedOnBy(contentTypeUid)
+        return result
     }
 
 
