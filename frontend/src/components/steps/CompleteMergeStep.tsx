@@ -806,15 +806,15 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                         />
                     </div>
                 )}
-                {/*{status !== 'COMPLETED' && !syncInProgress && !syncCompleted && (*/}
+                {status !== 'COMPLETED' && !syncInProgress && !syncCompleted && (
                     <Button
                         label="Complete Merge"
                         icon="pi pi-check"
                         loading={completing}
-                        // disabled={completing || status !== 'MERGED_COLLECTIONS'}
+                        disabled={completing || status !== 'MERGED_COLLECTIONS'}
                         onClick={handleCompleteMerge}
                     />
-                {/*)}*/}
+                )}
             </div>
 
             {/* Toast for notifications */}
