@@ -97,7 +97,7 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
         setSyncItemsStatus({});
 
         // Create new EventSource connection
-        const sseUrl = `http://localhost:8080/api/sync-progress/${mergeRequestId}`;
+        const sseUrl = `/api/sync-progress/${mergeRequestId}`;
         const eventSource = new EventSource(sseUrl);
 
         // Handle connection open
