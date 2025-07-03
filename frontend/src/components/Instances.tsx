@@ -8,6 +8,7 @@ import { Toast } from 'primereact/toast';
 import { useInstanceManagement } from '../hooks/useInstanceManagement';
 import LoadingSpinner from './shared/LoadingSpinner';
 import InstanceFormDialog from './home/InstanceFormDialog';
+import InstanceDetailsDialog from './home/InstanceDetailsDialog';
 import { StrapiInstance } from '../types';
 
 const Instances: React.FC = () => {
@@ -26,7 +27,16 @@ const Instances: React.FC = () => {
     handleInputChange,
     handleTestConnection,
     handleSubmit,
-    handleDelete
+    handleDelete,
+    // Instance details dialog
+    showDetailsModal,
+    selectedInstanceId,
+    fullInstanceData,
+    loadingDetails,
+    detailsError,
+    handleShowDetailsModal,
+    handleCloseDetailsModal,
+    handleVerifyPassword
   } = useInstanceManagement();
 
   if (loading && instances.length === 0) {
@@ -53,6 +63,12 @@ const Instances: React.FC = () => {
               <Column field="url" header="URL" />
               <Column body={(instance: StrapiInstance) => (
                 <div className="flex gap-2">
+                  <Button 
+                    icon="pi pi-eye" 
+                    className="p-button-outlined p-button-info p-button-sm" 
+                    onClick={() => handleShowDetailsModal(instance.id)}
+                    tooltip="View Details"
+                  />
                   <Button 
                     icon="pi pi-pencil" 
                     className="p-button-outlined p-button-primary p-button-sm" 
@@ -82,6 +98,16 @@ const Instances: React.FC = () => {
         onInputChange={handleInputChange}
         onTestConnection={handleTestConnection}
         onSubmit={handleSubmit}
+      />
+
+      <InstanceDetailsDialog
+        visible={showDetailsModal}
+        instanceId={selectedInstanceId}
+        onHide={handleCloseDetailsModal}
+        onVerifyPassword={handleVerifyPassword}
+        fullInstanceData={fullInstanceData}
+        loading={loadingDetails}
+        error={detailsError}
       />
     </div>
   );

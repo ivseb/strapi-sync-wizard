@@ -22,6 +22,13 @@ export const useInstanceManagement = () => {
   const [connectionStatus, setConnectionStatus] = useState<{success: boolean, message: string} | null>(null);
   const toast = useRef<Toast>(null);
 
+  // For instance details dialog
+  const [showDetailsModal, setShowDetailsModal] = useState<boolean>(false);
+  const [selectedInstanceId, setSelectedInstanceId] = useState<number | null>(null);
+  const [fullInstanceData, setFullInstanceData] = useState<StrapiInstance | null>(null);
+  const [loadingDetails, setLoadingDetails] = useState<boolean>(false);
+  const [detailsError, setDetailsError] = useState<string | null>(null);
+
   const fetchInstances = async () => {
     try {
       setLoading(true);
@@ -151,6 +158,42 @@ export const useInstanceManagement = () => {
     }
   };
 
+  // Handle showing the details modal
+  const handleShowDetailsModal = (instanceId: number) => {
+    setSelectedInstanceId(instanceId);
+    setShowDetailsModal(true);
+    setFullInstanceData(null);
+    setDetailsError(null);
+  };
+
+  // Handle closing the details modal
+  const handleCloseDetailsModal = () => {
+    setShowDetailsModal(false);
+    setSelectedInstanceId(null);
+    setFullInstanceData(null);
+    setDetailsError(null);
+  };
+
+  // Handle verifying the admin password and fetching full instance details
+  const handleVerifyPassword = async (password: string, instanceId: number) => {
+    try {
+      setLoadingDetails(true);
+      setDetailsError(null);
+
+      const response = await axios.post(`/api/instances/${instanceId}/full`, { password });
+      setFullInstanceData(response.data);
+    } catch (err: any) {
+      console.error('Error fetching instance details:', err);
+      if (err.response && err.response.status === 401) {
+        setDetailsError('Invalid admin password');
+      } else {
+        setDetailsError('Failed to fetch instance details');
+      }
+    } finally {
+      setLoadingDetails(false);
+    }
+  };
+
   return {
     instances,
     loading,
@@ -167,6 +210,15 @@ export const useInstanceManagement = () => {
     handleInputChange,
     handleTestConnection,
     handleSubmit,
-    handleDelete
+    handleDelete,
+    // Instance details dialog
+    showDetailsModal,
+    selectedInstanceId,
+    fullInstanceData,
+    loadingDetails,
+    detailsError,
+    handleShowDetailsModal,
+    handleCloseDetailsModal,
+    handleVerifyPassword
   };
 };

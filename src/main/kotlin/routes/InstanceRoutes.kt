@@ -1,6 +1,8 @@
 package it.sebi.routes
 
 import io.ktor.http.*
+import io.ktor.server.application.*
+import io.ktor.server.config.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
@@ -10,6 +12,12 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 data class ConnectionTestResponse(val connected: Boolean, val message: String)
+
+@Serializable
+data class AdminPasswordRequest(val password: String)
+
+@Serializable
+data class AdminPasswordResponse(val success: Boolean, val message: String)
 
 fun Route.configureInstanceRoutes(repository: StrapiInstanceRepository) {
     route("/api/instances") {
@@ -102,6 +110,34 @@ fun Route.configureInstanceRoutes(repository: StrapiInstanceRepository) {
                     ConnectionTestResponse(connected = false, message = "Could not connect to Strapi instance")
                 )
             }
+        }
+
+        // Get instance by ID with sensitive data (password and apiKey) after admin password verification
+        post("/{id}/full") {
+            val id = call.parameters["id"]?.toIntOrNull()
+            if (id == null) {
+                call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+                return@post
+            }
+
+            val request = call.receive<AdminPasswordRequest>()
+            val configuredPassword = call.application.environment.config.property("application.adminPassword").getString()
+
+            if (request.password != configuredPassword) {
+                call.respond(
+                    HttpStatusCode.Unauthorized,
+                    AdminPasswordResponse(success = false, message = "Invalid admin password")
+                )
+                return@post
+            }
+
+            val instance = repository.getInstance(id)
+            if (instance == null) {
+                call.respond(HttpStatusCode.NotFound, "Instance not found")
+                return@post
+            }
+
+            call.respond(instance)
         }
     }
 }
