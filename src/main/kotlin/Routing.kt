@@ -39,7 +39,12 @@ fun Application.configureRouting() {
 
     routing {
         // API routes
-        configureInstanceRoutes(instanceRepository)
+        configureInstanceRoutes(
+            instanceRepository,
+            mergeRequestRepository,
+            mergeRequestSelectionsRepository,
+            mergeRequestDocumentMappingRepository
+        )
         configureMergeRequestRoutes(mergeRequestService)
 
 

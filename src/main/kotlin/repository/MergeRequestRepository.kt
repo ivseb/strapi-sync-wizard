@@ -9,11 +9,30 @@ import it.sebi.tables.MergeRequestsTable
 import org.jetbrains.exposed.v1.core.ResultRow
 import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.core.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.or
 import org.jetbrains.exposed.v1.jdbc.*
 import java.time.OffsetDateTime
 
 class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepository) {
 
+    /**
+     * Find all merge requests where the instance is either the source or target
+     */
+    suspend fun findMergeRequestsForInstance(instanceId: Int): List<MergeRequest> = dbQuery {
+        MergeRequestsTable.selectAll()
+            .where { (MergeRequestsTable.sourceInstanceId eq instanceId) or (MergeRequestsTable.targetInstanceId eq instanceId) }
+            .map { it.toMergeRequest() }
+    }
+
+    /**
+     * Delete all merge requests where the instance is either the source or target
+     */
+    suspend fun deleteMergeRequestsForInstance(instanceId: Int): Int = dbQuery {
+        MergeRequestsTable.deleteWhere { 
+            (MergeRequestsTable.sourceInstanceId eq instanceId) or (MergeRequestsTable.targetInstanceId eq instanceId) 
+        }
+    }
 
     suspend fun getAllMergeRequests(): List<MergeRequest> = dbQuery {
         MergeRequestsTable.selectAll()

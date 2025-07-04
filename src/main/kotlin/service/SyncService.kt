@@ -1832,7 +1832,9 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                     val data = relationData["data"]
                     if (data is JsonArray) {
                         data.mapNotNull { item ->
-                            if (item is JsonObject && item.containsKey("id")) {
+                            if (item is JsonObject && item.containsKey("documentId")) {
+                                item["documentId"]?.toString()?.trim('"')
+                            } else if (item is JsonObject && item.containsKey("id")) {
                                 item["id"]?.toString()?.trim('"')
                             } else null
                         }
@@ -1841,7 +1843,9 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
                 relationData is JsonArray -> {
                     relationData.mapNotNull { item ->
-                        if (item is JsonObject && item.containsKey("id")) {
+                        if (item is JsonObject && item.containsKey("documentId")) {
+                            item["documentId"]?.toString()?.trim('"')
+                        } else if (item is JsonObject && item.containsKey("id")) {
                             item["id"]?.toString()?.trim('"')
                         } else null
                     }

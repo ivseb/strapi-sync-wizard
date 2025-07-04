@@ -7,6 +7,9 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import it.sebi.models.StrapiInstanceDTO
+import it.sebi.repository.MergeRequestDocumentMappingRepository
+import it.sebi.repository.MergeRequestRepository
+import it.sebi.repository.MergeRequestSelectionsRepository
 import it.sebi.repository.StrapiInstanceRepository
 import kotlinx.serialization.Serializable
 
@@ -19,7 +22,12 @@ data class AdminPasswordRequest(val password: String)
 @Serializable
 data class AdminPasswordResponse(val success: Boolean, val message: String)
 
-fun Route.configureInstanceRoutes(repository: StrapiInstanceRepository) {
+fun Route.configureInstanceRoutes(
+    repository: StrapiInstanceRepository,
+    mergeRequestRepository: MergeRequestRepository? = null,
+    mergeRequestSelectionsRepository: MergeRequestSelectionsRepository? = null,
+    mergeRequestDocumentMappingRepository: MergeRequestDocumentMappingRepository? = null
+) {
     route("/api/instances") {
         // Get all instances (secure, without sensitive data)
         get {
@@ -77,7 +85,26 @@ fun Route.configureInstanceRoutes(repository: StrapiInstanceRepository) {
                 return@delete
             }
 
-            val deleted = repository.deleteInstance(id)
+            val deleted = if (mergeRequestRepository != null && 
+                             mergeRequestSelectionsRepository != null && 
+                             mergeRequestDocumentMappingRepository != null) {
+                // Use cascade delete if all repositories are provided
+                try {
+                    repository.deleteInstanceCascade(
+                        id,
+                        mergeRequestRepository,
+                        mergeRequestSelectionsRepository,
+                        mergeRequestDocumentMappingRepository
+                    )
+                } catch (e: Exception) {
+                    application.log.error("Error during cascade delete", e)
+                    call.respond(HttpStatusCode.InternalServerError, "Error deleting instance: ${e.message}")
+                    return@delete
+                }
+            } else {
+                // Fall back to simple delete if any repository is missing
+                repository.deleteInstance(id)
+            }
 
             if (deleted) {
                 call.respond(HttpStatusCode.OK, "Instance deleted")

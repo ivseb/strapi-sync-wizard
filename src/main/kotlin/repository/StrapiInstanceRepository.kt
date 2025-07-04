@@ -86,6 +86,36 @@ class StrapiInstanceRepository {
         StrapiInstancesTable.deleteWhere { StrapiInstancesTable.id eq id } > 0
     }
 
+    /**
+     * Delete an instance and all related entities (cascade delete)
+     * This method should be used instead of deleteInstance when you want to ensure
+     * all related entities are deleted as well.
+     */
+    suspend fun deleteInstanceCascade(
+        id: Int,
+        mergeRequestRepository: MergeRequestRepository,
+        mergeRequestSelectionsRepository: MergeRequestSelectionsRepository,
+        mergeRequestDocumentMappingRepository: MergeRequestDocumentMappingRepository
+    ): Boolean = dbQuery {
+        // First, delete all related merge request selections
+        // We need to find all merge requests related to this instance
+        val mergeRequests = mergeRequestRepository.findMergeRequestsForInstance(id)
+
+        // Delete selections for each merge request
+        mergeRequests.forEach { mergeRequest ->
+            mergeRequestSelectionsRepository.deleteSelectionsForMergeRequest(mergeRequest.id)
+        }
+
+        // Delete all document mappings related to this instance
+        mergeRequestDocumentMappingRepository.deleteMappingsForInstance(id)
+
+        // Delete all merge requests related to this instance
+        mergeRequestRepository.deleteMergeRequestsForInstance(id)
+
+        // Finally, delete the instance itself
+        StrapiInstancesTable.deleteWhere { StrapiInstancesTable.id eq id } > 0
+    }
+
     suspend fun testConnection(url: String, apiKey: String, username: String, password: String): Boolean =
         withContext(Dispatchers.IO) {
             try {

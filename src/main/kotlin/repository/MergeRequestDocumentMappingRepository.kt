@@ -15,6 +15,16 @@ import java.time.OffsetDateTime
 
 class MergeRequestDocumentMappingRepository {
 
+    /**
+     * Delete all mappings where the instance is either the source or target
+     */
+    suspend fun deleteMappingsForInstance(instanceId: Int): Int = dbQuery {
+        MergeRequestDocumentMappingTable.deleteWhere {
+            (MergeRequestDocumentMappingTable.sourceStrapiId eq instanceId) or
+                    (MergeRequestDocumentMappingTable.targetStrapiId eq instanceId)
+        }
+    }
+
     suspend fun getFilesMappingsForInstances(
         sourceStrapiInstanceId: Int, targetStrapiInstanceId: Int,
         sourceDocumentId: List<String>,

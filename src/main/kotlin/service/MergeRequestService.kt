@@ -1191,8 +1191,18 @@ class MergeRequestService(
     ) {
         val mergeRequestSelectionsRepository = MergeRequestSelectionsRepository()
         // Group selections by direction
-        val toCreate = selections.filter { idMappings[contentType]?.get(it.documentId) == null }
-        val toUpdate = selections.filter { idMappings[contentType]?.get(it.documentId) != null }
+        val toCreate = selections.filter {
+            listOf(
+                Direction.TO_CREATE,
+                Direction.TO_UPDATE
+            ).contains(it.direction) && idMappings[contentType]?.get(it.documentId) == null
+        }
+        val toUpdate = selections.filter {
+            listOf(
+                Direction.TO_CREATE,
+                Direction.TO_UPDATE
+            ).contains(it.direction) && idMappings[contentType]?.get(it.documentId) != null
+        }
         val toDelete = selections.filter { it.direction == Direction.TO_DELETE }
 
         // Process entries to create
@@ -1486,7 +1496,7 @@ class MergeRequestService(
                         updates[key] = buildJsonObject {
                             put("set", JsonArray(relatedItems.map { it }))
                         }
-                    } else if (relatedItems.isNotEmpty()  && hasDocumentId) {
+                    } else if (relatedItems.isNotEmpty() && hasDocumentId) {
                         updates[key] = JsonArray(relatedItems.map { it })
                     } else if (value.jsonArray.isNotEmpty()) {
                         // Process array elements recursively
