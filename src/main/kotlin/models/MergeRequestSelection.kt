@@ -26,7 +26,9 @@ data class MergeRequestSelection(
     val syncFailureResponse: String? = null,
     @Contextual
     val syncDate: OffsetDateTime? = null
-)
+
+){
+}
 
 
 

@@ -8,6 +8,7 @@ import it.sebi.models.SelectionStatusInfo
 import it.sebi.models.STRAPI_FILE_CONTENT_TYPE_NAME
 import it.sebi.tables.MergeRequestSelectionsTable
 import org.jetbrains.exposed.v1.core.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.v1.core.SqlExpressionBuilder.inList
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.insert
@@ -161,9 +162,9 @@ class MergeRequestSelectionsRepository {
                     (MergeRequestSelectionsTable.documentId eq documentId) and
                     (MergeRequestSelectionsTable.direction eq direction)
                 }
-                .singleOrNull()
+                .toList().map { it[MergeRequestSelectionsTable.id].value }
 
-            if (existingSelection == null) {
+            if (existingSelection.isEmpty()) {
                 // Add the selection
                 MergeRequestSelectionsTable.insert {
                     it[MergeRequestSelectionsTable.mergeRequestId] = mergeRequestId
@@ -171,6 +172,8 @@ class MergeRequestSelectionsRepository {
                     it[MergeRequestSelectionsTable.documentId] = documentId
                     it[MergeRequestSelectionsTable.direction] = direction
                 }
+            } else if(existingSelection.size > 1) {
+                MergeRequestSelectionsTable.deleteWhere { MergeRequestSelectionsTable.id inList  existingSelection.drop(1) }
             }
             true
         } else {

@@ -595,7 +595,7 @@ class StrapiClient(
         }.body()
     }
 
-    suspend fun deleteContentEntry(contentType: String, id: String, kind: String = "collectionType"): JsonObject {
+    suspend fun deleteContentEntry(contentType: String, id: String, kind: String = "collectionType"): Boolean {
         val url = if (kind == "singleType") {
             "$baseUrl/api/$contentType"
         } else {
@@ -606,7 +606,7 @@ class StrapiClient(
             headers {
                 append(HttpHeaders.Authorization, "Bearer $apiKey")
             }
-        }.body()
+        }.status.isSuccess()
     }
 
 

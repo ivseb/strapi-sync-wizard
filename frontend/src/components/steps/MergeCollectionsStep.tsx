@@ -283,17 +283,17 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
 
         // Find added and removed entries
         const addedEntries = selection.filter(entry => {
-            const entryId = type === 'create' ? entry.metadata?.documentId : entry.source?.id;
+            const entryId = entry.metadata?.documentId
             return !currentSelections.some(e => {
-                const currentId = type === 'create' ? e.metadata?.documentId : e.source?.id;
+                const currentId = e.metadata?.documentId
                 return currentId === entryId;
             });
         });
 
         const removedEntries = currentSelections.filter(entry => {
-            const entryId = type === 'create' ? entry.metadata?.documentId : entry.source?.id;
+            const entryId =  entry.metadata?.documentId
             return !selection.some(e => {
-                const newId = type === 'create' ? e.metadata?.documentId : e.source?.id;
+                const newId =  e.metadata?.documentId
                 return newId === entryId;
             });
         });
@@ -322,7 +322,7 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
         try {
             // Process added entries
             for (const entry of addedEntries) {
-                const entryId = type === 'create' ? entry.metadata?.documentId : entry.source?.id;
+                const entryId = entry.metadata?.documentId
                 if (entryId) {
                     let success = false;
 
@@ -361,7 +361,7 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
 
             // Process removed entries
             for (const entry of removedEntries) {
-                const entryId = type === 'create' ? entry.metadata?.documentId : entry.source?.id;
+                const entryId = entry.metadata?.documentId
                 if (entryId) {
                     let success = false;
 

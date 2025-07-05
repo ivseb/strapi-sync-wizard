@@ -1363,9 +1363,9 @@ class MergeRequestService(
                 comparisonResult.onlyInTarget.find { it.metadata.documentId == selection.documentId } ?: continue
 
             try {
-                targetClient.deleteContentEntry(
+                val success = targetClient.deleteContentEntry(
                     contentTypeSchema.queryName,
-                    targetEntry.metadata.id.toString(),
+                    targetEntry.metadata.documentId,
                     "collectionType"
                 )
 
@@ -1379,7 +1379,7 @@ class MergeRequestService(
                 // Update sync status to success
                 mergeRequestSelectionsRepository.updateSyncStatus(
                     selection.id,
-                    true,
+                    success,
                     null
                 )
             } catch (e: Exception) {
