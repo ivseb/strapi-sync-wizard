@@ -261,47 +261,96 @@ class MergeRequestService(
      * @param contentComparison The content comparison data
      * @param contentType The content type of the entry
      * @param documentId The document ID of the entry
+     * @param visited Set of already visited nodes to prevent infinite loops
+     * @param recursive Whether to recursively traverse the dependency tree
      * @return List of relationships for the entry
      */
     private fun findRelationshipsForEntry(
         contentComparison: ContentTypeComparisonResultMapWithRelationships?,
         contentType: String,
-        documentId: String
+        documentId: String,
+        visited: MutableSet<Pair<String, String>> = mutableSetOf(),
+        recursive: Boolean = true
     ): List<EntryRelationship> {
         if (contentComparison == null) return emptyList()
 
-        // Check in single types
+        // Create a node identifier for the current entry
+        val currentNode = Pair(contentType, documentId)
+
+        // If we've already visited this node, return empty list to prevent infinite loops
+        if (visited.contains(currentNode)) {
+            return emptyList()
+        }
+
+        // Mark this node as visited
+        visited.add(currentNode)
+
+        // Result list to collect all relationships
+        val result = mutableListOf<EntryRelationship>()
+
+        // Direct relationships from single types
         contentComparison.singleTypes[contentType]?.let { singleType ->
-            if (singleType.relationships.isNotEmpty()) {
-                return singleType.relationships.filter {
-                    it.sourceContentType == contentType && it.sourceDocumentId == documentId
+            val directRelationships = singleType.relationships.filter {
+                it.sourceContentType == contentType && it.sourceDocumentId == documentId
+            }
+            result.addAll(directRelationships)
+
+            // If recursive, process each related entry
+            if (recursive) {
+                directRelationships.forEach { relationship ->
+                    // Only process non-file relationships to avoid unnecessary recursion
+                    if (relationship.targetContentType != STRAPI_FILE_CONTENT_TYPE_NAME) {
+                        val childRelationships = findRelationshipsForEntry(
+                            contentComparison,
+                            relationship.targetContentType,
+                            relationship.targetDocumentId,
+                            visited,
+                            true
+                        )
+                        result.addAll(childRelationships)
+                    }
                 }
             }
         }
 
-        // Check in collection types
+        // Direct relationships from collection types
         contentComparison.collectionTypes[contentType]?.let { collectionType ->
             collectionType.relationships[documentId]?.let { relationships ->
-                return relationships.filter {
+                val directRelationships = relationships.filter {
                     it.sourceContentType == contentType && it.sourceDocumentId == documentId
+                }
+                result.addAll(directRelationships)
+
+                // If recursive, process each related entry
+                if (recursive) {
+                    directRelationships.forEach { relationship ->
+                        // Only process non-file relationships to avoid unnecessary recursion
+                        if (relationship.targetContentType != STRAPI_FILE_CONTENT_TYPE_NAME) {
+                            val childRelationships = findRelationshipsForEntry(
+                                contentComparison,
+                                relationship.targetContentType,
+                                relationship.targetDocumentId,
+                                visited,
+                                true
+                            )
+                            result.addAll(childRelationships)
+                        }
+                    }
                 }
             }
         }
 
-        // Check for relationships with files
-        // For single types
+        // Check for relationships with files in single types
         contentComparison.singleTypes.values.forEach { singleType ->
             val fileRelationships = singleType.relationships.filter {
                 it.sourceContentType == contentType &&
                         it.sourceDocumentId == documentId &&
                         it.targetContentType == STRAPI_FILE_CONTENT_TYPE_NAME
             }
-            if (fileRelationships.isNotEmpty()) {
-                return fileRelationships
-            }
+            result.addAll(fileRelationships)
         }
 
-        // For collection types
+        // Check for relationships with files in collection types
         contentComparison.collectionTypes.values.forEach { collectionType ->
             collectionType.relationships.values.forEach { relationships ->
                 val fileRelationships = relationships.filter {
@@ -309,13 +358,11 @@ class MergeRequestService(
                             it.sourceDocumentId == documentId &&
                             it.targetContentType == STRAPI_FILE_CONTENT_TYPE_NAME
                 }
-                if (fileRelationships.isNotEmpty()) {
-                    return fileRelationships
-                }
+                result.addAll(fileRelationships)
             }
         }
 
-        return emptyList()
+        return result
     }
 
 

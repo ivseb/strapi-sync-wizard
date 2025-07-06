@@ -496,8 +496,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                 result.onlyInSource != null -> ContentTypeComparisonResultKind.ONLY_IN_SOURCE
                 result.onlyInTarget != null -> ContentTypeComparisonResultKind.ONLY_IN_TARGET
                 result.different != null -> ContentTypeComparisonResultKind.DIFFERENT
-                result.identical != null -> ContentTypeComparisonResultKind.IDENTICAL
-                else -> continue
+                else -> ContentTypeComparisonResultKind.IDENTICAL
             }
             singleTypeStatusMap[documentId] = MappingStatusRef(k, status)
         }
@@ -541,6 +540,9 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
         // Analyze relationships between entries
         for (contentType in contentTypes) {
+            if(contentType.uid == "api::contatti-page.contatti-page"){
+                println("heere")
+            }
 
             val entries = contentTypeEntries[contentType.uid] ?: continue
 
