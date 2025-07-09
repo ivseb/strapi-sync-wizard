@@ -631,7 +631,13 @@ class StrapiClient(
             "sizeInBytes",
             "__component",
             "createdBy",
-            "updatedBy"
+            "updatedBy",
+            "pathId",
+            "isUrlSigned",
+            "width",
+            "height",
+            "localizations",
+            "folderPath"
         )
 
         return when (element) {

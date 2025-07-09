@@ -251,7 +251,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         val sourceClient = mergeRequest.sourceInstance.client()
         val targetClient = mergeRequest.targetInstance.client()
 
-        val mappings = mergeRequestDocumentMappingRepository.getFilesAllMappingsForInstances(
+        val mappings: List<MergeRequestDocumentMapping> = mergeRequestDocumentMappingRepository.getFilesAllMappingsForInstances(
             mergeRequest.sourceInstance.id,
             mergeRequest.targetInstance.id,
         )
@@ -340,13 +340,12 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
         for (contentType in collectionTypes) {
             val comparisonResult = compareContentTypes(
-                sourceClient,
-                targetClient,
+                mappings,
                 mergeRequest.sourceInstance,
                 mergeRequest.targetInstance,
                 contentType,
                 sourceEntriesCache,
-                targetEntriesCache
+                targetEntriesCache,
             )
 
             collectionTypeComparisonResults[contentType.uid] = comparisonResult
@@ -1475,8 +1474,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
      * @param targetEntriesCache Optional cache of target entries to avoid repeated API calls
      */
     private suspend fun compareContentTypes(
-        sourceClient: StrapiClient,
-        targetClient: StrapiClient,
+        mappings: List<MergeRequestDocumentMapping>,
         sourceInstance: StrapiInstance,
         targetInstance: StrapiInstance,
         contentType: StrapiContentType,
@@ -1487,22 +1485,22 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         val sourceEntries = sourceEntriesCache?.get(contentType.uid) ?: listOf()
         val targetEntries = targetEntriesCache?.get(contentType.uid) ?: listOf()
 
+        val collectionContentTypeMappings = mappings.filter { it.contentType == contentType.uid && it.sourceDocumentId != null }
+
         val sourceIds = sourceEntries.map { it.hash }
         val targetIds = targetEntries.map { it.hash }
-        val sourceSlugs = sourceEntries.mapNotNull { it.obj.metadata.slug }
-        val targetSlugs = targetEntries.mapNotNull { it.obj.metadata.slug }
 
 
         val onlyInSource = sourceEntries.filter {
-            it.hash !in targetIds && it.obj.metadata.slug !in targetSlugs
+            it.hash !in targetIds && collectionContentTypeMappings.none { map -> map.sourceDocumentId == it.obj.metadata.documentId }
         }
 
         val onlyInTarget = targetEntries.filter {
-            it.hash !in sourceIds && it.obj.metadata.slug !in sourceSlugs
+            it.hash !in sourceIds  && collectionContentTypeMappings.none { map -> map.targetDocumentId == it.obj.metadata.documentId }
         }
 
         val inBoth = sourceEntries.filter {
-            it.hash in targetIds || it.obj.metadata.slug in targetSlugs
+            it.hash in targetIds ||  collectionContentTypeMappings.any { map -> map.sourceDocumentId == it.obj.metadata.documentId }
         }
 
         val different = mutableListOf<DifferentEntry>()
@@ -1510,7 +1508,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
         for (sourceEntry in inBoth) {
             val targetEntry = targetEntries.find {
-                it.hash == sourceEntry.hash || (it.obj.metadata.slug != null && it.obj.metadata.slug == sourceEntry.obj.metadata.slug)
+                it.hash == sourceEntry.hash  || collectionContentTypeMappings.any { map -> map.sourceDocumentId ==sourceEntry.obj.metadata.documentId && map.targetDocumentId == it.obj.metadata.documentId }
             } ?: continue
 
             val mapping = mergeRequestDocumentMappingRepository.getFilesMappingForInstances(
