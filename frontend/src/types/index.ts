@@ -51,8 +51,8 @@ export interface FormData {
     name: string;
     url: string;
     username: string;
-    password: string;
-    apiKey: string;
+    password: string;  // Can be empty when editing (id is present)
+    apiKey: string;    // Can be empty when editing (id is present)
 }
 
 // Enums for content type kinds and comparison results

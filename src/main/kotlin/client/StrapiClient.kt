@@ -447,8 +447,7 @@ class StrapiClient(
 
     suspend fun getContentEntries(
         contentType: StrapiContentType,
-        mappings: List<MergeRequestDocumentMapping>?
-    ): List<EntryElement> {
+    ): List<JsonObject> {
         val baseUrl = "$baseUrl/content-manager/${contentType.schema.kebabCaseKind}/${contentType.uid}?locate=it"
         val token = getLoginToken().token
 
@@ -469,14 +468,15 @@ class StrapiClient(
 
             val dataElement = response["data"] ?: response["results"]
 
-            val entries = when {
-                dataElement == null -> emptyList()
-                dataElement is JsonNull -> emptyList()
-                dataElement is JsonObject -> listOf(dataElement)
-                else -> if (dataElement is JsonObject) listOf(dataElement) else dataElement.jsonArray.map { it.jsonObject }
+            val entries = when (dataElement) {
+                null -> emptyList()
+                is JsonNull -> emptyList()
+                is JsonObject -> listOf(dataElement)
+                else -> dataElement.jsonArray.map { it.jsonObject }
             }
 
-            return processEntries(entries, mappings)
+            return entries
+//            return processEntries(entries, mappings)
         }
 
         // For CollectionType, handle pagination
@@ -518,10 +518,11 @@ class StrapiClient(
             currentPage++
         } while (currentPage <= pageCount)
 
-        return processEntries(allEntries, mappings)
+        return allEntries
+
     }
 
-    private fun processEntries(
+    fun processEntries(
         entries: List<JsonObject>,
         mappings: List<MergeRequestDocumentMapping>?
     ): List<EntryElement> {
@@ -541,7 +542,7 @@ class StrapiClient(
             val content = StrapiContent(StrapiContentMetadata(id, documentId), entry, cleanupStrapiJson.jsonObject)
 
 
-            EntryElement(content, cleanupStrapiJson.jsonObject.generateHash(fieldsToIgnore = listOf("documentId")))
+            EntryElement(content, cleanupStrapiJson.jsonObject.generateHash(fieldsToIgnore = listOf("documentId","localizations")))
         }
     }
 

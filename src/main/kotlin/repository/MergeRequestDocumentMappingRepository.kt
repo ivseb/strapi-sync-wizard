@@ -56,7 +56,7 @@ class MergeRequestDocumentMappingRepository {
     }
 
 
-    suspend fun getFilesAllMappingsForInstances(
+    suspend fun getAllMappings(
         sourceStrapiInstanceId: Int, targetStrapiInstanceId: Int,
     ): List<MergeRequestDocumentMapping> = dbQuery {
         MergeRequestDocumentMappingTable.selectAll()

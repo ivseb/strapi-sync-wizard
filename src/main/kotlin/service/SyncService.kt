@@ -6,6 +6,7 @@ import it.sebi.models.*
 import it.sebi.repository.MergeRequestDocumentMappingRepository
 import it.sebi.utils.calculateMD5Hash
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.*
 import java.time.OffsetDateTime
@@ -251,7 +252,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         val sourceClient = mergeRequest.sourceInstance.client()
         val targetClient = mergeRequest.targetInstance.client()
 
-        val mappings = mergeRequestDocumentMappingRepository.getFilesAllMappingsForInstances(
+        val mappings = mergeRequestDocumentMappingRepository.getAllMappings(
             mergeRequest.sourceInstance.id,
             mergeRequest.targetInstance.id,
         )
@@ -275,19 +276,39 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                 sourceContentTypes.map { contentType ->
 
 
-                    val entries = sourceClient.getContentEntries(contentType, null)
-                    sourceEntriesCache[contentType.uid] = entries
+                    val entries = sourceClient.getContentEntries(contentType)
+
+                    contentType to entries
 
                 }
             }
             val targetDeferred = async {
                 sourceContentTypes.map { contentType ->
-                    val entries = targetClient.getContentEntries(contentType, mappings)
-                    targetEntriesCache[contentType.uid] = entries
+                    val entries = targetClient.getContentEntries(contentType)
+
+                    contentType to entries
+
                 }
             }
-            sourceDeferred.await()
-            targetDeferred.await()
+            val (sourceEntries ,targetEntries)= awaitAll( sourceDeferred,targetDeferred)
+
+//            val toDeleteSource: List<MergeRequestDocumentMapping> = sourceEntries.flatMap { (contentType, entries) ->
+//                val allIds = entries.mapNotNull { it["documentId"]?.jsonPrimitive?.content }
+//                mappings.filter { it.contentType == contentType.uid && !allIds.contains(it.sourceDocumentId) }
+//            }
+//            val toDeleteTarget = sourceEntries.flatMap { (contentType, entries) ->
+//                val allIds = entries.mapNotNull { it["documentId"]?.jsonPrimitive?.content }
+//                mappings.filter { it.contentType == contentType.uid && !allIds.contains(it.targetDocumentId) }
+//            }
+
+            sourceEntries.forEach { (contentType, entries) ->
+
+                sourceEntriesCache[contentType.uid] = sourceClient.processEntries(entries, null)
+            }
+
+            targetEntries.forEach { (contentType, entries) ->
+                targetEntriesCache[contentType.uid] = targetClient.processEntries(entries, mappings)
+            }
         }
 
 
@@ -540,7 +561,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
         // Analyze relationships between entries
         for (contentType in contentTypes) {
-            if(contentType.uid == "api::contatti-page.contatti-page"){
+            if (contentType.uid == "api::contatti-page.contatti-page") {
                 println("heere")
             }
 

@@ -36,7 +36,12 @@ const InstanceFormDialog: React.FC<InstanceFormDialogProps> = ({
       <Button 
         label={isEditing ? 'Update' : 'Save'} 
         icon="pi pi-check" 
-        disabled={!formData.name || !formData.url || !formData.username || !formData.password || !formData.apiKey}
+        disabled={
+          !formData.name || 
+          !formData.url || 
+          !formData.username || 
+          (!isEditing && (!formData.password || !formData.apiKey))
+        }
         onClick={onSubmit}
       />
     </div>
@@ -88,30 +93,34 @@ const InstanceFormDialog: React.FC<InstanceFormDialogProps> = ({
         </div>
 
         <div className="field mb-3">
-          <label htmlFor="password" className="block mb-2">Password</label>
+          <label htmlFor="password" className="block mb-2">
+            Password {isEditing && <span className="text-sm text-gray-500">(leave empty to keep current)</span>}
+          </label>
           <Password
             id="password"
             name="password"
             value={formData.password}
             onChange={onInputChange}
-            placeholder="Password for authentication"
+            placeholder={isEditing ? "Leave empty to keep current password" : "Password for authentication"}
             feedback={false}
             toggleMask
-            required
+            required={!isEditing}
           />
         </div>
 
         <div className="field mb-3">
-          <label htmlFor="apiKey" className="block mb-2">API Key</label>
+          <label htmlFor="apiKey" className="block mb-2">
+            API Key {isEditing && <span className="text-sm text-gray-500">(leave empty to keep current)</span>}
+          </label>
           <Password
             id="apiKey"
             name="apiKey"
             value={formData.apiKey}
             onChange={onInputChange}
-            placeholder="Your Strapi API Key"
+            placeholder={isEditing ? "Leave empty to keep current API key" : "Your Strapi API Key"}
             feedback={false}
             toggleMask
-            required
+            required={!isEditing}
           />
         </div>
 
@@ -121,7 +130,18 @@ const InstanceFormDialog: React.FC<InstanceFormDialogProps> = ({
             icon={testingConnection ? "pi pi-spin pi-spinner" : "pi pi-sync"}
             className="p-button-info w-full"
             onClick={onTestConnection}
-            disabled={testingConnection || !formData.url || !formData.username || !formData.password || !formData.apiKey}
+            disabled={
+              testingConnection || 
+              !formData.url || 
+              !formData.username || 
+              !formData.password || 
+              !formData.apiKey
+            }
+            tooltip={
+              isEditing && (!formData.password || !formData.apiKey) 
+                ? "Please enter password and API key to test connection" 
+                : undefined
+            }
           />
         </div>
 

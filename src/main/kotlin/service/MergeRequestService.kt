@@ -851,7 +851,7 @@ class MergeRequestService(
             mutableMapOf<String, MutableMap<String, ContentMapping>>() // contentType -> sourceDocumentId -> targetDocumentId
 
         // Get existing mappings from the database
-        val existingMappings = mergeRequestDocumentMappingRepository.getFilesAllMappingsForInstances(
+        val existingMappings = mergeRequestDocumentMappingRepository.getAllMappings(
             mergeRequest.sourceInstance.id,
             mergeRequest.targetInstance.id,
         )
