@@ -362,7 +362,7 @@ class MergeRequestService(
             }
         }
 
-        return result
+        return result.distinctBy { it.sourceDocumentId+ it.targetDocumentId+it.sourceContentType+it.targetContentType }
     }
 
 

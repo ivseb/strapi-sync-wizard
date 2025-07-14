@@ -283,17 +283,17 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
 
         // Find added and removed entries
         const addedEntries = selection.filter(entry => {
-            const entryId = entry.metadata?.documentId
+            const entryId = entry.metadata?.documentId || entry.source?.metadata?.documentId
             return !currentSelections.some(e => {
-                const currentId = e.metadata?.documentId
+                const currentId = e.metadata?.documentId || entry.source?.metadata?.documentId
                 return currentId === entryId;
             });
         });
 
         const removedEntries = currentSelections.filter(entry => {
-            const entryId =  entry.metadata?.documentId
+            const entryId =  entry.metadata?.documentId || entry.source?.metadata?.documentId
             return !selection.some(e => {
-                const newId =  e.metadata?.documentId
+                const newId =  e.metadata?.documentId || entry.source?.metadata?.documentId
                 return newId === entryId;
             });
         });
@@ -322,7 +322,7 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
         try {
             // Process added entries
             for (const entry of addedEntries) {
-                const entryId = entry.metadata?.documentId
+                const entryId = entry.metadata?.documentId || entry.source?.metadata?.documentId
                 if (entryId) {
                     let success = false;
 
@@ -361,7 +361,7 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
 
             // Process removed entries
             for (const entry of removedEntries) {
-                const entryId = entry.metadata?.documentId
+                const entryId = entry.metadata?.documentId || entry.source?.metadata?.documentId
                 if (entryId) {
                     let success = false;
 
@@ -752,7 +752,7 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
                                             if (allEntries.length === 0) return;
 
                                             // Collect all document IDs
-                                            const documentIds = allEntries.map(entry => entry.metadata?.documentId).filter(Boolean) as string[];
+                                            const documentIds = allEntries.map(entry => entry.metadata?.documentId ).filter(Boolean) as string[];
                                             if (documentIds.length === 0) return;
 
                                             // Set loading state
@@ -971,7 +971,7 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
                                             if (allEntries.length === 0) return;
 
                                             // Collect all document IDs
-                                            const documentIds = allEntries.map(entry => entry.metadata?.documentId).filter(Boolean) as string[];
+                                            const documentIds = allEntries.map(entry => entry.metadata?.documentId ).filter(Boolean) as string[];
                                             if (documentIds.length === 0) return;
 
                                             // Make the bulk API call

@@ -15,6 +15,7 @@ import it.sebi.JsonParser
 import it.sebi.models.*
 import it.sebi.utils.calculateMD5Hash
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -448,13 +449,16 @@ class StrapiClient(
     suspend fun getContentEntries(
         contentType: StrapiContentType,
     ): List<JsonObject> {
-        val baseUrl = "$baseUrl/content-manager/${contentType.schema.kebabCaseKind}/${contentType.uid}?locate=it"
+        if(contentType.uid == "api::section-card-assistance.section-card-assistance"){
+            println("here")
+        }
+        val baseUrl = "$baseUrl/content-manager/${contentType.schema.kebabCaseKind}/${contentType.uid}"
         val token = getLoginToken().token
 
         // For SingleType, we don't need pagination
         if (contentType.schema.kind == StrapiContentTypeKind.SingleType) {
             val response: JsonObject = try {
-                selector.getClientForUrl(baseUrl).get(baseUrl) {
+                selector.getClientForUrl(baseUrl).get(baseUrl+"?locate=it") {
                     headers {
                         append(HttpHeaders.Authorization, "Bearer ${token}")
                     }
@@ -485,7 +489,7 @@ class StrapiClient(
         val pageSize = 100 // Use a larger page size to reduce the number of API calls
 
         do {
-            val url = "$baseUrl&page=$currentPage&pageSize=$pageSize"
+            val url = "$baseUrl?locate=it&page=$currentPage&pageSize=$pageSize"
 
             val response: JsonObject = try {
                 selector.getClientForUrl(url).get(url) {
@@ -511,14 +515,35 @@ class StrapiClient(
             allEntries.addAll(results)
 
             // Get pagination information
-            val pageCount = response["pagination"]?.jsonObject?.let { 
-                pagination -> pagination["pageCount"]?.jsonPrimitive?.int 
+            val pageCount = response["pagination"]?.jsonObject?.let {
+                pagination -> pagination["pageCount"]?.jsonPrimitive?.int
             } ?: 0
 
             currentPage++
         } while (currentPage <= pageCount)
 
-        return allEntries
+        val detailAllEntries = allEntries.mapNotNull { entry ->
+            entry["documentId"]?.jsonPrimitive?.content?.let { docId ->
+                val detailUrl = "$baseUrl/$docId?status=published&locale=it"
+                val detailResponse : JsonObject = try {
+                    selector.getClientForUrl(detailUrl).get(detailUrl) {
+                        headers {
+                            append(HttpHeaders.Authorization, "Bearer ${token}")
+                        }
+                    }.body()
+                } catch (e: io.ktor.client.plugins.ClientRequestException) {
+                    if (e.response.status == HttpStatusCode.NotFound) {
+                         null
+                    }
+                    throw e
+                }
+                detailResponse["data"]?.jsonObject
+
+            }
+
+        }
+
+        return detailAllEntries
 
     }
 

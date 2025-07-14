@@ -252,13 +252,14 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         val sourceClient = mergeRequest.sourceInstance.client()
         val targetClient = mergeRequest.targetInstance.client()
 
-        val mappings = mergeRequestDocumentMappingRepository.getAllMappings(
+        var updatedMappings =  mergeRequestDocumentMappingRepository.getAllMappings(
             mergeRequest.sourceInstance.id,
             mergeRequest.targetInstance.id,
         )
 
+        // Create a mutable copy of mappings that we can update
 
-        var sourceContentTypes =
+        val sourceContentTypes =
             contentTypes.filter { it.uid.startsWith("api::") || it.uid == STRAPI_FILE_CONTENT_TYPE_NAME }
 
 
@@ -292,14 +293,25 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
             }
             val (sourceEntries ,targetEntries)= awaitAll( sourceDeferred,targetDeferred)
 
-//            val toDeleteSource: List<MergeRequestDocumentMapping> = sourceEntries.flatMap { (contentType, entries) ->
-//                val allIds = entries.mapNotNull { it["documentId"]?.jsonPrimitive?.content }
-//                mappings.filter { it.contentType == contentType.uid && !allIds.contains(it.sourceDocumentId) }
-//            }
-//            val toDeleteTarget = sourceEntries.flatMap { (contentType, entries) ->
-//                val allIds = entries.mapNotNull { it["documentId"]?.jsonPrimitive?.content }
-//                mappings.filter { it.contentType == contentType.uid && !allIds.contains(it.targetDocumentId) }
-//            }
+            val toDeleteSource: List<MergeRequestDocumentMapping> = sourceEntries.flatMap { (contentType, entries) ->
+                val allIds = entries.mapNotNull { it["documentId"]?.jsonPrimitive?.content }
+                updatedMappings.filter { it.contentType == contentType.uid && !allIds.contains(it.sourceDocumentId) }
+            }
+            val toDeleteTarget = sourceEntries.flatMap { (contentType, entries) ->
+                val allIds = entries.mapNotNull { it["documentId"]?.jsonPrimitive?.content }
+                updatedMappings.filter { it.contentType == contentType.uid && !allIds.contains(it.targetDocumentId) }
+            }
+
+            // Delete mappings that are in toDeleteSource or toDeleteTarget
+            val toDelete = (toDeleteSource + toDeleteTarget).distinctBy { it.id }
+            toDelete.forEach { mapping ->
+                mergeRequestDocumentMappingRepository.deleteMapping(mapping.id)
+            }
+
+            // Update mappings variable by removing deleted records
+            updatedMappings = updatedMappings.filter { mapping ->
+                !toDelete.any { it.id == mapping.id }
+            }
 
             sourceEntries.forEach { (contentType, entries) ->
 
@@ -307,14 +319,14 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
             }
 
             targetEntries.forEach { (contentType, entries) ->
-                targetEntriesCache[contentType.uid] = targetClient.processEntries(entries, mappings)
+                targetEntriesCache[contentType.uid] = targetClient.processEntries(entries, updatedMappings)
             }
         }
 
 
         // First handle files using the proper upload API
         val files =
-            compareFiles(mappings, mergeRequest.sourceInstance, mergeRequest.targetInstance, sourceClient, targetClient)
+            compareFiles(updatedMappings, mergeRequest.sourceInstance, mergeRequest.targetInstance, sourceClient, targetClient)
 
         val (singleTypes, collectionTypes) = sourceContentTypes.partition { it.schema.kind == StrapiContentTypeKind.SingleType }
 
@@ -361,7 +373,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
         for (contentType in collectionTypes) {
             val comparisonResult = compareContentTypes(
-                mappings,
+                updatedMappings,
                 mergeRequest.sourceInstance,
                 mergeRequest.targetInstance,
                 contentType,
@@ -560,7 +572,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
         // Analyze relationships between entries
         for (contentType in contentTypes) {
-            if(contentType.uid == "api::contatti-page.contatti-page"){
+            if(contentType.uid == "api::section-card-assistance.section-card-assistance"){
                 println("heere")
             }
 
@@ -1732,6 +1744,9 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
         // First pass: identify all relationships
         for (contentType in contentTypes) {
+            if(contentType.uid == "api::section-card-assistance.section-card-assistance"){
+                println("here")
+            }
 
             for ((fieldName, attribute) in contentType.schema.attributes) {
                 if (attribute.type == "relation" && attribute.target != null) {
