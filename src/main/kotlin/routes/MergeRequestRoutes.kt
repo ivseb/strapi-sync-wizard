@@ -116,8 +116,22 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
                 call.respond(HttpStatusCode.NotFound, e.message ?: "Merge request not found")
             } catch (e: IllegalStateException) {
                 call.respond(HttpStatusCode.BadRequest, e.message ?: "Invalid state for comparison")
+            } catch (e: java.net.SocketException) {
+                // Handle connection reset errors specifically
+                val logger = org.slf4j.LoggerFactory.getLogger("MergeRequestRoutes")
+                logger.error("Network error during content comparison for merge request $id", e)
+                call.respond(
+                    HttpStatusCode.InternalServerError, 
+                    "Network error during content comparison: ${e.message}. This may be due to resource constraints. Try again later."
+                )
             } catch (e: Exception) {
-                throw e
+                // Log the error with more details
+                val logger = org.slf4j.LoggerFactory.getLogger("MergeRequestRoutes")
+                logger.error("Error during content comparison for merge request $id", e)
+                call.respond(
+                    HttpStatusCode.InternalServerError, 
+                    "Error during content comparison: ${e.message}"
+                )
             }
         }
 

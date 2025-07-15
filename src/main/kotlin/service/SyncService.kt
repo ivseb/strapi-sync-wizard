@@ -273,22 +273,27 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
         // Fetch all entries for each content type once in parallel
         coroutineScope {
-            val sourceDeferred = async {
+            val logger = org.slf4j.LoggerFactory.getLogger(this@SyncService.javaClass)
+            val sourceDeferred = async(kotlinx.coroutines.Dispatchers.IO) {
                 sourceContentTypes.map { contentType ->
-
-
-                    val entries = sourceClient.getContentEntries(contentType)
-
-                    contentType to entries
-
+                    try {
+                        val entries = sourceClient.getContentEntries(contentType)
+                        contentType to entries
+                    } catch (e: Exception) {
+                        logger.error("Error fetching entries from source for content type ${contentType.uid}", e)
+                        throw e
+                    }
                 }
             }
-            val targetDeferred = async {
+            val targetDeferred = async(kotlinx.coroutines.Dispatchers.IO) {
                 sourceContentTypes.map { contentType ->
-                    val entries = targetClient.getContentEntries(contentType)
-
-                    contentType to entries
-
+                    try {
+                        val entries = targetClient.getContentEntries(contentType)
+                        contentType to entries
+                    } catch (e: Exception) {
+                        logger.error("Error fetching entries from target for content type ${contentType.uid}", e)
+                        throw e
+                    }
                 }
             }
             val (sourceEntries ,targetEntries)= awaitAll( sourceDeferred,targetDeferred)
@@ -313,20 +318,56 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                 !toDelete.any { it.id == mapping.id }
             }
 
-            sourceEntries.forEach { (contentType, entries) ->
-
-                sourceEntriesCache[contentType.uid] = sourceClient.processEntries(entries, null)
+            // Process entries with Dispatchers.IO to avoid blocking the event loop
+            val sourceProcessingDeferred = sourceEntries.map { (contentType, entries) ->
+                async(kotlinx.coroutines.Dispatchers.IO) {
+                    try {
+                        val processed = sourceClient.processEntries(entries, null)
+                        contentType.uid to processed
+                    } catch (e: Exception) {
+                        logger.error("Error processing source entries for content type ${contentType.uid}", e)
+                        throw e
+                    }
+                }
             }
 
-            targetEntries.forEach { (contentType, entries) ->
-                targetEntriesCache[contentType.uid] = targetClient.processEntries(entries, updatedMappings)
+            val targetProcessingDeferred = targetEntries.map { (contentType, entries) ->
+                async(kotlinx.coroutines.Dispatchers.IO) {
+                    try {
+                        val processed = targetClient.processEntries(entries, updatedMappings)
+                        contentType.uid to processed
+                    } catch (e: Exception) {
+                        logger.error("Error processing target entries for content type ${contentType.uid}", e)
+                        throw e
+                    }
+                }
+            }
+
+            // Await all processing to complete
+            val sourceProcessedEntries = sourceProcessingDeferred.awaitAll()
+            val targetProcessedEntries = targetProcessingDeferred.awaitAll()
+
+            // Update the caches with processed entries
+            sourceProcessedEntries.forEach { (uid, entries) ->
+                sourceEntriesCache[uid] = entries
+            }
+
+            targetProcessedEntries.forEach { (uid, entries) ->
+                targetEntriesCache[uid] = entries
             }
         }
 
 
-        // First handle files using the proper upload API
-        val files =
-            compareFiles(updatedMappings, mergeRequest.sourceInstance, mergeRequest.targetInstance, sourceClient, targetClient)
+        // First handle files using the proper upload API with Dispatchers.IO
+        val logger = org.slf4j.LoggerFactory.getLogger(this@SyncService.javaClass)
+        val files = try {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                compareFiles(updatedMappings, mergeRequest.sourceInstance, mergeRequest.targetInstance, sourceClient, targetClient)
+            }
+        } catch (e: Exception) {
+            logger.error("Error comparing files between source and target instances", e)
+            throw e
+        }
 
         val (singleTypes, collectionTypes) = sourceContentTypes.partition { it.schema.kind == StrapiContentTypeKind.SingleType }
 
@@ -334,23 +375,39 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         val singleResultsWithRelationships = mutableMapOf<String, ContentTypeComparisonResultWithRelationships>()
         val singleTypeComparisonResults = mutableMapOf<String, ContentTypeComparisonResult>()
 
-        for (contentType in singleTypes) {
-            val comparisonResult = compareContentType(
-                mergeRequest.sourceInstance,
-                mergeRequest.targetInstance,
-                contentType,
-                sourceEntriesCache,
-                targetEntriesCache
-            )
+        // Process single types with Dispatchers.IO to avoid blocking the event loop
+        val singleTypeResults = kotlinx.coroutines.coroutineScope {
+            singleTypes.map { contentType ->
+                async(kotlinx.coroutines.Dispatchers.IO) {
+                    try {
+                        val comparisonResult = compareContentType(
+                            mergeRequest.sourceInstance,
+                            mergeRequest.targetInstance,
+                            contentType,
+                            sourceEntriesCache,
+                            targetEntriesCache
+                        )
 
+                        // Determine dependencies including transitive dependencies through components
+                        val dependsOn = calculateAllDependencies(contentType.uid, contentTypeRelationships)
+                            .distinct()
+
+                        val dependedOnBy = calculateAllDependedOnBy(contentType.uid, contentTypeRelationships)
+                            .distinct()
+
+                        Triple(contentType, comparisonResult, Pair(dependsOn, dependedOnBy))
+                    } catch (e: Exception) {
+                        logger.error("Error comparing single content type ${contentType.uid}", e)
+                        throw e
+                    }
+                }
+            }.awaitAll()
+        }
+
+        // Process results
+        for ((contentType, comparisonResult, dependencies) in singleTypeResults) {
             singleTypeComparisonResults[contentType.uid] = comparisonResult
-
-            // Determine dependencies including transitive dependencies through components
-            val dependsOn = calculateAllDependencies(contentType.uid, contentTypeRelationships)
-                .distinct()
-
-            val dependedOnBy = calculateAllDependedOnBy(contentType.uid, contentTypeRelationships)
-                .distinct()
+            val (dependsOn, dependedOnBy) = dependencies
 
             // We'll add relationships later
             singleResultsWithRelationships[contentType.uid] = ContentTypeComparisonResultWithRelationships(
@@ -371,24 +428,40 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         val collectionResultsWithRelationships = mutableMapOf<String, ContentTypesComparisonResultWithRelationships>()
         val collectionTypeComparisonResults = mutableMapOf<String, ContentTypesComparisonResult>()
 
-        for (contentType in collectionTypes) {
-            val comparisonResult = compareContentTypes(
-                updatedMappings,
-                mergeRequest.sourceInstance,
-                mergeRequest.targetInstance,
-                contentType,
-                sourceEntriesCache,
-                targetEntriesCache,
-            )
+        // Process collection types with Dispatchers.IO to avoid blocking the event loop
+        val collectionTypeResults = kotlinx.coroutines.coroutineScope {
+            collectionTypes.map { contentType ->
+                async(kotlinx.coroutines.Dispatchers.IO) {
+                    try {
+                        val comparisonResult = compareContentTypes(
+                            updatedMappings,
+                            mergeRequest.sourceInstance,
+                            mergeRequest.targetInstance,
+                            contentType,
+                            sourceEntriesCache,
+                            targetEntriesCache
+                        )
 
+                        // Determine dependencies including transitive dependencies through components
+                        val dependsOn = calculateAllDependencies(contentType.uid, contentTypeRelationships)
+                            .distinct()
+
+                        val dependedOnBy = calculateAllDependedOnBy(contentType.uid, contentTypeRelationships)
+                            .distinct()
+
+                        Triple(contentType, comparisonResult, Pair(dependsOn, dependedOnBy))
+                    } catch (e: Exception) {
+                        logger.error("Error comparing collection content type ${contentType.uid}", e)
+                        throw e
+                    }
+                }
+            }.awaitAll()
+        }
+
+        // Process results
+        for ((contentType, comparisonResult, dependencies) in collectionTypeResults) {
             collectionTypeComparisonResults[contentType.uid] = comparisonResult
-
-            // Determine dependencies including transitive dependencies through components
-            val dependsOn = calculateAllDependencies(contentType.uid, contentTypeRelationships)
-                .distinct()
-
-            val dependedOnBy = calculateAllDependedOnBy(contentType.uid, contentTypeRelationships)
-                .distinct()
+            val (dependsOn, dependedOnBy) = dependencies
 
             // We'll add relationships later
             collectionResultsWithRelationships[contentType.uid] = ContentTypesComparisonResultWithRelationships(

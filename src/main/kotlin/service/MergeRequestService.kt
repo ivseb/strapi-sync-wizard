@@ -12,8 +12,11 @@ import it.sebi.repository.MergeRequestDocumentMappingRepository
 import it.sebi.repository.MergeRequestRepository
 import it.sebi.repository.MergeRequestSelectionsRepository
 import it.sebi.utils.calculateMD5Hash
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
+import org.slf4j.LoggerFactory
 import java.io.File
 import java.time.OffsetDateTime
 
@@ -31,10 +34,25 @@ class MergeRequestService(
     private val dataFolder = applicationConfig.property("application.dataFolder").getString()
 
     init {
-        // Create data folder if it doesn't exist
-        val folder = File(dataFolder)
-        if (!folder.exists()) {
-            folder.mkdirs()
+        // Initialize data folder asynchronously
+        kotlinx.coroutines.runBlocking {
+            initializeDataFolder()
+        }
+    }
+
+    private suspend fun initializeDataFolder() {
+        withContext(Dispatchers.IO) {
+            try {
+                // Create data folder if it doesn't exist
+                val folder = File(dataFolder)
+                if (!folder.exists()) {
+                    folder.mkdirs()
+                }
+            } catch (e: Exception) {
+                logger.error("Error initializing data folder: ${e.message}", e)
+                // We don't rethrow here as this is initialization code
+                // and we don't want to prevent the service from starting
+            }
         }
     }
 
@@ -111,10 +129,17 @@ class MergeRequestService(
         // Note: Document mappings are associated with Strapi instances, not directly with merge requests
         // They are shared across merge requests, so we don't delete them here
 
-        // Delete any files stored on disk for this merge request
-        val mergeRequestFolder = File(dataFolder, "merge_request_$id")
-        if (mergeRequestFolder.exists()) {
-            mergeRequestFolder.deleteRecursively()
+        // Delete any files stored on disk for this merge request using IO dispatcher
+        withContext(Dispatchers.IO) {
+            try {
+                val mergeRequestFolder = File(dataFolder, "merge_request_$id")
+                if (mergeRequestFolder.exists()) {
+                    mergeRequestFolder.deleteRecursively()
+                }
+            } catch (e: Exception) {
+                logger.error("Error deleting merge request folder for merge request $id: ${e.message}", e)
+                // Continue with deleting the merge request from the database even if file deletion fails
+            }
         }
 
         // Finally, delete the merge request itself
@@ -369,74 +394,115 @@ class MergeRequestService(
     /**
      * Get the file path for storing schema compatibility results for a merge request
      */
-    private fun getSchemaCompatibilityFilePath(id: Int): String {
-        val mergeRequestFolder = File(dataFolder, "merge_request_$id")
-        if (!mergeRequestFolder.exists()) {
-            mergeRequestFolder.mkdirs()
+    private suspend fun getSchemaCompatibilityFilePath(id: Int): String {
+        return withContext(Dispatchers.IO) {
+            val mergeRequestFolder = File(dataFolder, "merge_request_$id")
+            if (!mergeRequestFolder.exists()) {
+                try {
+                    mergeRequestFolder.mkdirs()
+                } catch (e: Exception) {
+                    logger.error("Error creating directory for merge request $id: ${e.message}", e)
+                    throw e
+                }
+            }
+            File(mergeRequestFolder, "schema_compatibility.json").absolutePath
         }
-        return File(mergeRequestFolder, "schema_compatibility.json").absolutePath
     }
 
 
-    private fun getSchemaCompatibilityFile(id: Int): SchemaCompatibilityResult? {
-        val schemaFilePath = getSchemaCompatibilityFilePath(id)
-        val schemaFile = File(schemaFilePath)
+    private val logger = LoggerFactory.getLogger(this::class.java)
 
-        // Check if file exists and force is false
-        if (schemaFile.exists()) {
-            try {
-                // Read the file and deserialize
-                val fileContent = schemaFile.readText()
-                val fileStorage = JsonParser.decodeFromString<SchemaCompatibilityResult>(fileContent)
-                return fileStorage
-            } catch (e: Exception) {
-                // If there's an error reading the file, log it and continue with a new check
-                println("Error reading schema compatibility file: ${e.message}")
-                // Continue with a new check
+    private suspend fun getSchemaCompatibilityFile(id: Int): SchemaCompatibilityResult? {
+        return withContext(Dispatchers.IO) {
+            val schemaFilePath = getSchemaCompatibilityFilePath(id)
+            val schemaFile = File(schemaFilePath)
 
+            // Check if file exists
+            if (schemaFile.exists()) {
+                try {
+                    // Read the file and deserialize
+                    val fileContent = schemaFile.readText()
+                    val fileStorage = JsonParser.decodeFromString<SchemaCompatibilityResult>(fileContent)
+                    fileStorage
+                } catch (e: Exception) {
+                    // If there's an error reading the file, log it and continue with a new check
+                    logger.error("Error reading schema compatibility file for merge request $id: ${e.message}", e)
+                    // Continue with a new check
+                    null
+                }
+            } else {
+                null
             }
         }
-        return null
     }
 
-    private fun saveSchemaCompatibilityFile(id: Int, schemaResult: SchemaCompatibilityResult) {
-        val schemaFilePath = getSchemaCompatibilityFilePath(id)
-        val schemaResultFile = File(schemaFilePath)
-        val jsonContent = JsonParser.encodeToString(schemaResult)
-        schemaResultFile.writeText(jsonContent)
+    private suspend fun saveSchemaCompatibilityFile(id: Int, schemaResult: SchemaCompatibilityResult) {
+        withContext(Dispatchers.IO) {
+            try {
+                val schemaFilePath = getSchemaCompatibilityFilePath(id)
+                val schemaResultFile = File(schemaFilePath)
+                val jsonContent = JsonParser.encodeToString(schemaResult)
+                schemaResultFile.writeText(jsonContent)
+            } catch (e: Exception) {
+                logger.error("Error saving schema compatibility file for merge request $id: ${e.message}", e)
+                throw e
+            }
+        }
     }
 
 
     /**
      * Get the file path for storing content comparison results for a merge request
      */
-    private fun getContentComparisonFilePath(id: Int): String {
-        val mergeRequestFolder = File(dataFolder, "merge_request_$id")
-        if (!mergeRequestFolder.exists()) {
-            mergeRequestFolder.mkdirs()
+    private suspend fun getContentComparisonFilePath(id: Int): String {
+        return withContext(Dispatchers.IO) {
+            val mergeRequestFolder = File(dataFolder, "merge_request_$id")
+            if (!mergeRequestFolder.exists()) {
+                try {
+                    mergeRequestFolder.mkdirs()
+                } catch (e: Exception) {
+                    logger.error("Error creating directory for merge request $id: ${e.message}", e)
+                    throw e
+                }
+            }
+            File(mergeRequestFolder, "content_comparison.json").absolutePath
         }
-        return File(mergeRequestFolder, "content_comparison.json").absolutePath
     }
 
-    private fun getContentComparisonFile(id: Int): ContentTypeComparisonResultMapWithRelationships? {
-        val schemaFilePath = getContentComparisonFilePath(id)
-        val schemaFile = File(schemaFilePath)
+    private suspend fun getContentComparisonFile(id: Int): ContentTypeComparisonResultMapWithRelationships? {
+        return withContext(Dispatchers.IO) {
+            val schemaFilePath = getContentComparisonFilePath(id)
+            val schemaFile = File(schemaFilePath)
 
-        if (schemaFile.exists()) {
-            // Read the file and deserialize
-            val fileContent = schemaFile.readText()
-            val fileStorage = JsonParser.decodeFromString<ContentTypeComparisonResultMapWithRelationships>(fileContent)
-            return fileStorage
-
+            if (schemaFile.exists()) {
+                try {
+                    // Read the file and deserialize
+                    val fileContent = schemaFile.readText()
+                    val fileStorage = JsonParser.decodeFromString<ContentTypeComparisonResultMapWithRelationships>(fileContent)
+                    fileStorage
+                } catch (e: Exception) {
+                    // If there's an error reading the file, log it and continue with a new check
+                    logger.error("Error reading content comparison file for merge request $id: ${e.message}", e)
+                    null
+                }
+            } else {
+                null
+            }
         }
-        return null
     }
 
-    private fun saveContentComparisonFile(id: Int, contentComparison: ContentTypeComparisonResultMapWithRelationships) {
-        val schemaFilePath = getContentComparisonFilePath(id)
-        val schemaResultFile = File(schemaFilePath)
-        val jsonContent = JsonParser.encodeToString(contentComparison)
-        schemaResultFile.writeText(jsonContent)
+    private suspend fun saveContentComparisonFile(id: Int, contentComparison: ContentTypeComparisonResultMapWithRelationships) {
+        withContext(Dispatchers.IO) {
+            try {
+                val schemaFilePath = getContentComparisonFilePath(id)
+                val schemaResultFile = File(schemaFilePath)
+                val jsonContent = JsonParser.encodeToString(contentComparison)
+                schemaResultFile.writeText(jsonContent)
+            } catch (e: Exception) {
+                logger.error("Error saving content comparison file for merge request $id: ${e.message}", e)
+                throw e
+            }
+        }
     }
 
 
