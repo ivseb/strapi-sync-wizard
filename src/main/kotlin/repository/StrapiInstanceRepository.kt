@@ -14,9 +14,11 @@ import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.update
+import org.slf4j.LoggerFactory
 import java.time.OffsetDateTime
 
 class StrapiInstanceRepository {
+    private val logger = LoggerFactory.getLogger(this::class.java)
 
     /**
      * Get all instances with sensitive data (password and apiKey)
@@ -125,8 +127,7 @@ class StrapiInstanceRepository {
                 client.getContentTypes()
                 true
             } catch (e: Exception) {
-                println("Error connecting to Strapi: ${e.message}")
-                println(e.stackTraceToString())
+                logger.error("Error connecting to Strapi: ${e.message}", e)
                 false
             }
         }

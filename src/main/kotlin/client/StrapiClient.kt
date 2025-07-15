@@ -4,6 +4,8 @@ import io.ktor.client.*
 import io.ktor.client.call.*
 import io.ktor.client.engine.*
 import io.ktor.client.engine.cio.*
+import io.ktor.client.plugins.HttpRequestRetry
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.plugins.logging.*
 import io.ktor.client.request.*
@@ -51,6 +53,7 @@ object StrapiClientTokenCache {
 fun StrapiInstance.client(): StrapiClient = StrapiClient(this)
 
 
+
 private fun buildClient(proxyConfig: ProxyConfig?): HttpClient = HttpClient(CIO) {
 
     install(ContentNegotiation) {
@@ -59,8 +62,27 @@ private fun buildClient(proxyConfig: ProxyConfig?): HttpClient = HttpClient(CIO)
     install(Logging) {
         level = LogLevel.INFO
     }
+    install(HttpTimeout) {
+        requestTimeoutMillis = 60000  // 60 secondi
+        connectTimeoutMillis = 15000  // 15 secondi
+        socketTimeoutMillis = 60000   // 60 secondi
+    }
+    install(HttpRequestRetry) {
+        retryOnServerErrors(maxRetries = 3)
+        retryOnException(maxRetries = 3, retryOnTimeout = true)
+        exponentialDelay(
+            base = 2.0,
+            maxDelayMs = 10000
+        )
+    }
+
+
     expectSuccess = true
     engine {
+        maxConnectionsCount = 50
+        dispatcher = Dispatchers.IO
+        pipelining = true
+
         proxy = proxyConfig
         https {
             trustManager = object : X509TrustManager {
@@ -79,7 +101,7 @@ private fun buildClient(proxyConfig: ProxyConfig?): HttpClient = HttpClient(CIO)
 
 class ClientSelector {
 
-    val log = LoggerFactory.getLogger(this::class.java)
+    private val logger = LoggerFactory.getLogger(this::class.java)
 
     private val clientNoProxy = buildClient(null)
     private val clientHttpsProxy: HttpClient?
@@ -88,19 +110,19 @@ class ClientSelector {
 
     init {
         val httpProxy = getenv("HTTP_PROXY")
-        log.info("HTTP_PROXY: $httpProxy")
+        logger.info("HTTP_PROXY: $httpProxy")
         val httpsProxy = getenv("HTTPS_PROXY")
-        log.info("HTTPS_PROXY: $httpsProxy")
+        logger.info("HTTPS_PROXY: $httpsProxy")
         noProxyList = getenv("NO_PROXY")?.let { noProxyString -> noProxyString.split(",").map { it.trim() } }
-        log.info("NO_PROXY: ${noProxyList?.joinToString(", ") { "\"$it\"" } ?: "null"}")
+        logger.info("NO_PROXY: ${noProxyList?.joinToString(", ") { "\"$it\"" } ?: "null"}")
         clientHttpProxy = if (httpProxy != null) {
-            log.info("Using HTTP proxy $httpProxy")
+            logger.info("Using HTTP proxy $httpProxy")
             buildClient(ProxyBuilder.http(httpProxy))
         } else {
             null
         }
         clientHttpsProxy = if (httpsProxy != null) {
-            log.info("Using HTTPS proxy $httpsProxy")
+            logger.info("Using HTTPS proxy $httpsProxy")
             buildClient(ProxyBuilder.http(httpsProxy))
         } else {
             null
@@ -108,7 +130,7 @@ class ClientSelector {
     }
 
     fun getClientForUrl(url: String): HttpClient {
-        log.info("Getting client for URL $url")
+        logger.info("Getting client for URL $url")
         val urlObj = try {
             java.net.URL(url)
         } catch (e: Exception) {
@@ -116,19 +138,19 @@ class ClientSelector {
         }
         val proxy by lazy {
             if (urlObj.protocol == "https") {
-                log.info("URL $urlObj matches https_proxy list, returning client with proxy ")
+                logger.info("URL $urlObj matches https_proxy list, returning client with proxy ")
                 clientHttpsProxy
             } else {
-                log.info("URL $urlObj matches http_proxy list, returning client with proxy ")
+                logger.info("URL $urlObj matches http_proxy list, returning client with proxy ")
                 clientHttpProxy
             }
         }
 
         return if (noProxyList?.any { urlObj.host.contains(it) } == true) {
-            log.info("URL $urlObj matches no_proxy list, returning client without proxy")
+            logger.info("URL $urlObj matches no_proxy list, returning client without proxy")
             clientNoProxy
         } else {
-            log.info("URL $urlObj does not match no_proxy list, returning client with proxy ")
+            logger.info("URL $urlObj does not match no_proxy list, returning client with proxy ")
             proxy ?: clientNoProxy
         }
     }
@@ -146,6 +168,7 @@ class StrapiClient(
 
     companion object {
         private val loginMutex = Mutex()
+        private val logger = LoggerFactory.getLogger(StrapiClient::class.java)
     }
 
     constructor(strapiInstance: StrapiInstance) : this(
@@ -432,7 +455,7 @@ class StrapiClient(
             if (nestedAttribute.type == "component") {
                 // Add parameter for this nested component
                 val nestedPath = "$parentPath[$nestedFieldName]"
-                println("[DEBUG_LOG] Adding nested parameter for $nestedPath")
+                logger.debug("Adding nested parameter for $nestedPath")
                 parameters.append("populate$nestedPath[populate]", "*")
 
                 // Recursively process nested component
@@ -450,7 +473,7 @@ class StrapiClient(
         contentType: StrapiContentType,
     ): List<JsonObject> {
         if(contentType.uid == "api::section-card-assistance.section-card-assistance"){
-            println("here")
+            logger.debug("Processing special content type: api::section-card-assistance.section-card-assistance")
         }
         val baseUrl = "$baseUrl/content-manager/${contentType.schema.kebabCaseKind}/${contentType.uid}"
         val token = getLoginToken().token
@@ -575,8 +598,8 @@ class StrapiClient(
     suspend fun createContentEntry(contentType: String, data: JsonObject, kind: StrapiContentTypeKind): JsonObject {
         val url = "$baseUrl/api/$contentType"
 
-        println("[DEBUG_LOG] Creating content entry for $contentType with kind $kind")
-        println("[DEBUG_LOG] Data: $data")
+        logger.debug("Creating content entry for $contentType with kind $kind")
+        logger.trace("Content entry data: {}", data)
 
         val response = selector.getClientForUrl(url).request(url) {
             method = if (kind == StrapiContentTypeKind.SingleType) HttpMethod.Put else HttpMethod.Post
@@ -589,7 +612,7 @@ class StrapiClient(
             })
         }.body<JsonObject>()
 
-        println("[DEBUG_LOG] Response: $response")
+        logger.trace("Content entry response: {}", response)
         return response
     }
 
@@ -605,9 +628,9 @@ class StrapiClient(
             "$baseUrl/api/$contentType/$id"
         }
 
-        println("[DEBUG_LOG] Updating content entry for $contentType with kind $kind")
-        println("[DEBUG_LOG] URL: $url")
-        println("[DEBUG_LOG] Data: $data")
+        logger.debug("Updating content entry for $contentType with kind $kind")
+        logger.debug("Update URL: $url")
+        logger.trace("Update data: {}", data)
 
 
         return selector.getClientForUrl(url).put(url) {

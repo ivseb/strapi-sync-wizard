@@ -66,6 +66,7 @@ private fun hikari(log: Logger): HikariDataSource {
 
     return HikariDataSource(config)
 }
+val dbDispatcher = Dispatchers.IO.limitedParallelism(10)
 
 suspend fun <T> dbQuery(block: suspend () -> T): T =
-    newSuspendedTransaction(Dispatchers.IO) { block() }
+    newSuspendedTransaction(dbDispatcher) { block() }

@@ -6,6 +6,9 @@ import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import it.sebi.models.*
 import it.sebi.service.MergeRequestService
+import org.slf4j.LoggerFactory
+
+private val logger = LoggerFactory.getLogger("it.sebi.routes.MergeRequestRoutes")
 
 fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) {
     route("/api/merge-requests") {
@@ -118,7 +121,6 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
                 call.respond(HttpStatusCode.BadRequest, e.message ?: "Invalid state for comparison")
             } catch (e: java.net.SocketException) {
                 // Handle connection reset errors specifically
-                val logger = org.slf4j.LoggerFactory.getLogger("MergeRequestRoutes")
                 logger.error("Network error during content comparison for merge request $id", e)
                 call.respond(
                     HttpStatusCode.InternalServerError, 
@@ -126,7 +128,6 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
                 )
             } catch (e: Exception) {
                 // Log the error with more details
-                val logger = org.slf4j.LoggerFactory.getLogger("MergeRequestRoutes")
                 logger.error("Error during content comparison for merge request $id", e)
                 call.respond(
                     HttpStatusCode.InternalServerError, 

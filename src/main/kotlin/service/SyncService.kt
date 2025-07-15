@@ -9,10 +9,12 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.*
+import org.slf4j.LoggerFactory
 import java.time.OffsetDateTime
 
 
 class SyncService(private val mergeRequestDocumentMappingRepository: MergeRequestDocumentMappingRepository) {
+    private val logger = LoggerFactory.getLogger(this::class.java)
 
     /**
      * Check if two Strapi instances have compatible schemas
@@ -22,6 +24,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         sourceInstance: StrapiInstance,
         targetInstance: StrapiInstance
     ): SchemaCompatibilityResult {
+        logger.info("Starting schema compatibility check between source instance '${sourceInstance.name}' and target instance '${targetInstance.name}'")
         val sourceClient = sourceInstance.client()
         val targetClient = targetInstance.client()
 
@@ -224,7 +227,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                 incompatibleContentTypes.isEmpty() && missingComponentsInTarget.isEmpty() &&
                 missingComponentsInSource.isEmpty() && incompatibleComponents.isEmpty()
 
-        return SchemaCompatibilityResult(
+        val result = SchemaCompatibilityResult(
             isCompatible = isCompatible,
             missingInTarget = missingInTarget,
             missingInSource = missingInSource,
@@ -237,6 +240,20 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
             sourceComponents = sourceComponents,
             targetComponents = targetComponents
         )
+
+        if (isCompatible) {
+            logger.info("Schema compatibility check completed successfully. Schemas are compatible.")
+        } else {
+            logger.warn("Schema compatibility check completed with incompatibilities: " +
+                    "${missingInTarget.size} content types missing in target, " +
+                    "${missingInSource.size} content types missing in source, " +
+                    "${incompatibleContentTypes.size} incompatible content types, " +
+                    "${missingComponentsInTarget.size} components missing in target, " +
+                    "${missingComponentsInSource.size} components missing in source, " +
+                    "${incompatibleComponents.size} incompatible components")
+        }
+
+        return result
     }
 
 
@@ -249,6 +266,9 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         contentTypes: List<StrapiContentType>,
         components: List<StrapiComponent>
     ): ContentTypeComparisonResultMapWithRelationships {
+        logger.info("Starting content comparison for merge request ${mergeRequest.id} between source instance '${mergeRequest.sourceInstance.name}' and target instance '${mergeRequest.targetInstance.name}'")
+        logger.debug("Content comparison includes ${contentTypes.size} content types and ${components.size} components")
+
         val sourceClient = mergeRequest.sourceInstance.client()
         val targetClient = mergeRequest.targetInstance.client()
 
@@ -264,7 +284,9 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
 
 
         // Build content type relationships
+        logger.debug("Building content type relationships for ${sourceContentTypes.size} content types")
         val contentTypeRelationships = buildContentTypeRelationships(sourceContentTypes, components)
+        logger.debug("Built ${contentTypeRelationships.size} content type relationships")
 
 
         // Cache for content entries to avoid repeated API calls
@@ -272,8 +294,8 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         val targetEntriesCache = mutableMapOf<String, List<EntryElement>>()
 
         // Fetch all entries for each content type once in parallel
+        logger.debug("Fetching entries for ${sourceContentTypes.size} content types from source and target instances")
         coroutineScope {
-            val logger = org.slf4j.LoggerFactory.getLogger(this@SyncService.javaClass)
             val sourceDeferred = async(kotlinx.coroutines.Dispatchers.IO) {
                 sourceContentTypes.map { contentType ->
                     try {
@@ -355,11 +377,13 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
             targetProcessedEntries.forEach { (uid, entries) ->
                 targetEntriesCache[uid] = entries
             }
+
+            logger.debug("Completed fetching and processing entries from source and target instances")
         }
 
 
         // First handle files using the proper upload API with Dispatchers.IO
-        val logger = org.slf4j.LoggerFactory.getLogger(this@SyncService.javaClass)
+        logger.debug("Starting file comparison between source and target instances")
         val files = try {
             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 compareFiles(updatedMappings, mergeRequest.sourceInstance, mergeRequest.targetInstance, sourceClient, targetClient)
@@ -368,14 +392,17 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
             logger.error("Error comparing files between source and target instances", e)
             throw e
         }
+        logger.debug("Completed file comparison: ${files.onlyInSource.size} files only in source, ${files.onlyInTarget.size} files only in target, ${files.different.size} different files, ${files.identical.size} identical files")
 
         val (singleTypes, collectionTypes) = sourceContentTypes.partition { it.schema.kind == StrapiContentTypeKind.SingleType }
+        logger.debug("Content types partitioned: ${singleTypes.size} single types and ${collectionTypes.size} collection types")
 
         // Process single types with comparison information
         val singleResultsWithRelationships = mutableMapOf<String, ContentTypeComparisonResultWithRelationships>()
         val singleTypeComparisonResults = mutableMapOf<String, ContentTypeComparisonResult>()
 
         // Process single types with Dispatchers.IO to avoid blocking the event loop
+        logger.debug("Starting comparison of ${singleTypes.size} single content types")
         val singleTypeResults = kotlinx.coroutines.coroutineScope {
             singleTypes.map { contentType ->
                 async(kotlinx.coroutines.Dispatchers.IO) {
@@ -405,6 +432,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         }
 
         // Process results
+        logger.debug("Completed comparison of ${singleTypeResults.size} single content types")
         for ((contentType, comparisonResult, dependencies) in singleTypeResults) {
             singleTypeComparisonResults[contentType.uid] = comparisonResult
             val (dependsOn, dependedOnBy) = dependencies
@@ -429,6 +457,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         val collectionTypeComparisonResults = mutableMapOf<String, ContentTypesComparisonResult>()
 
         // Process collection types with Dispatchers.IO to avoid blocking the event loop
+        logger.debug("Starting comparison of ${collectionTypes.size} collection content types")
         val collectionTypeResults = kotlinx.coroutines.coroutineScope {
             collectionTypes.map { contentType ->
                 async(kotlinx.coroutines.Dispatchers.IO) {
@@ -459,6 +488,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         }
 
         // Process results
+        logger.debug("Completed comparison of ${collectionTypeResults.size} collection content types")
         for ((contentType, comparisonResult, dependencies) in collectionTypeResults) {
             collectionTypeComparisonResults[contentType.uid] = comparisonResult
             val (dependsOn, dependedOnBy) = dependencies
@@ -478,6 +508,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         }
 
         // Now analyze entry relationships with comparison status information
+        logger.debug("Starting analysis of entry relationships")
         val entryRelationships = analyzeEntryRelationshipsWithComparisonStatus(
             sourceContentTypes,
             components,
@@ -488,6 +519,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
             collectionTypeComparisonResults,
             files
         )
+        logger.debug("Completed analysis of entry relationships: found relationships for ${entryRelationships.size} content types")
 
         // Update single types with relationship information
         for (contentType in singleTypes) {
@@ -539,12 +571,19 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
             }
         }
 
-        return ContentTypeComparisonResultMapWithRelationships(
+        val result = ContentTypeComparisonResultMapWithRelationships(
             files = files,
             singleTypes = singleResultsWithRelationships,
             collectionTypes = collectionResultsWithRelationships,
             contentTypeRelationships = contentTypeRelationships
         )
+
+        logger.info("Completed content comparison for merge request ${mergeRequest.id}: " +
+                "${singleResultsWithRelationships.size} single types, " +
+                "${collectionResultsWithRelationships.size} collection types, " +
+                "${files.onlyInSource.size + files.onlyInTarget.size + files.different.size + files.identical.size} files")
+
+        return result
     }
 
     /**
@@ -1491,9 +1530,16 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         sourceClient: StrapiClient,
         targetClient: StrapiClient
     ): ContentTypeFileComparisonResult {
+        logger.debug("Starting file comparison between source instance '${sourceInstance.name}' and target instance '${targetInstance.name}'")
+
+        logger.debug("Fetching files from source instance")
         val sourceFiles = sourceClient.getFiles()
+        logger.debug("Fetched ${sourceFiles.size} files from source instance")
         val sourceDocumentIds = sourceFiles.map { it.metadata.documentId }
+
+        logger.debug("Fetching files from target instance")
         val targetFiles = targetClient.getFiles()
+        logger.debug("Fetched ${targetFiles.size} files from target instance")
         val targetDocumentIds = targetFiles.map { it.metadata.documentId }
 
 
@@ -1563,14 +1609,17 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                 identical.add(sourceFile)
         }
 
-        return ContentTypeFileComparisonResult(
-
+        val result = ContentTypeFileComparisonResult(
             onlyInSource = onlyInSource,
             onlyInTarget = onlyInTarget,
             different = different,
             identical = identical,
             contentTypeExists = true,
         )
+
+        logger.debug("Completed file comparison: ${onlyInSource.size} files only in source, ${onlyInTarget.size} files only in target, ${different.size} different files, ${identical.size} identical files")
+
+        return result
     }
 
 
@@ -1587,6 +1636,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         sourceEntriesCache: Map<String, List<EntryElement>>? = null,
         targetEntriesCache: Map<String, List<EntryElement>>? = null
     ): ContentTypesComparisonResult {
+        logger.debug("Starting comparison of collection content type '${contentType.uid}' between source instance '${sourceInstance.name}' and target instance '${targetInstance.name}'")
         // Use cached entries if available, otherwise fetch them
         val sourceEntries = sourceEntriesCache?.get(contentType.uid) ?: listOf()
         val targetEntries = targetEntriesCache?.get(contentType.uid) ?: listOf()
@@ -1640,7 +1690,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
             }
         }
 
-        return ContentTypesComparisonResult(
+        val result = ContentTypesComparisonResult(
             contentType = contentType.uid,
             onlyInSource = onlyInSource.map { it.obj },
             onlyInTarget = onlyInTarget.map { it.obj },
@@ -1648,6 +1698,14 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
             identical = identical,
             kind = contentType.schema.kind
         )
+
+        logger.debug("Completed comparison of collection content type '${contentType.uid}': " +
+                "${onlyInSource.size} entries only in source, " +
+                "${onlyInTarget.size} entries only in target, " +
+                "${different.size} different entries, " +
+                "${identical.size} identical entries")
+
+        return result
     }
 
     /**
@@ -1662,6 +1720,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         sourceEntriesCache: Map<String, List<EntryElement>>? = null,
         targetEntriesCache: Map<String, List<EntryElement>>? = null
     ): ContentTypeComparisonResult {
+        logger.debug("Starting comparison of single content type '${contentType.uid}' between source instance '${sourceInstance.name}' and target instance '${targetInstance.name}'")
         // Use cached entries if available, otherwise fetch them
         val sourceEntry = sourceEntriesCache?.get(contentType.uid)?.firstOrNull()
         val targetEntry = targetEntriesCache?.get(contentType.uid)?.firstOrNull()
@@ -1697,7 +1756,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
             }
         }
 
-        return ContentTypeComparisonResult(
+        val result = ContentTypeComparisonResult(
             contentType = contentType.uid,
             onlyInSource = onlyInSource?.obj,
             onlyInTarget = onlyInTarget?.obj,
@@ -1711,6 +1770,14 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
                 else -> ContentTypeComparisonResultKind.IDENTICAL
             }
         )
+
+        logger.debug("Completed comparison of single content type '${contentType.uid}': " +
+                "only in source: ${onlyInSource != null}, " +
+                "only in target: ${onlyInTarget != null}, " +
+                "different: ${different != null}, " +
+                "identical: ${identical != null}")
+
+        return result
     }
 
 
@@ -1811,6 +1878,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
         contentTypes: List<StrapiContentType>,
         components: List<StrapiComponent>
     ): List<ContentRelationship> {
+        logger.debug("Building content type relationships for ${contentTypes.size} content types and ${components.size} components")
         val relationships = mutableListOf<ContentRelationship>()
         val contentTypeByUid: Map<String, StrapiContentType> = contentTypes.associateBy { it.uid }
         val componentByUid = components.associateBy { it.uid }
@@ -1902,6 +1970,7 @@ class SyncService(private val mergeRequestDocumentMappingRepository: MergeReques
             )
         }
 
+        logger.debug("Completed building content type relationships: built ${updatedRelationships.size} relationships (${updatedRelationships.count { it.isBidirectional }} bidirectional)")
         return updatedRelationships
     }
 

@@ -1176,7 +1176,7 @@ class MergeRequestService(
                         null
                     )
                 } catch (e: Exception) {
-                    println("Error creating single type $contentTypeUid: ${e.message}")
+                    logger.error("Error creating single type $contentTypeUid: ${e.message}", e)
 
                     // Update sync status to failure
                     mergeRequestSelectionsRepository.updateSyncStatus(
