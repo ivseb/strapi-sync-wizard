@@ -576,7 +576,7 @@ class StrapiClient(
         mappings: List<MergeRequestDocumentMapping>?
     ): List<EntryElement> {
 
-        return entries.map { entry ->
+        return entries.filterNot { it.isEmpty() }.map { entry ->
             val id = entry["id"]?.jsonPrimitive?.content?.toInt()
             val documentId = entry["documentId"]?.jsonPrimitive?.content ?: error("document id is missing on entry ${kotlinx.serialization.json.Json.encodeToString(entry)}")
             val mappedEntry = mappings?.let { mappings ->
