@@ -35,7 +35,7 @@ data class ComponentResponse(
 
 @Serializable
 data class StrapiContentMetadata(
-    val id: Int,
+    val id: Int?,
     val documentId: String,
     val slug:String? = null,
 )

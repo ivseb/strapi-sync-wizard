@@ -13,6 +13,7 @@ import io.ktor.client.request.forms.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
+import io.swagger.v3.core.util.Json
 import it.sebi.JsonParser
 import it.sebi.models.*
 import it.sebi.utils.calculateMD5Hash
@@ -576,8 +577,8 @@ class StrapiClient(
     ): List<EntryElement> {
 
         return entries.map { entry ->
-            val id = entry["id"]!!.jsonPrimitive.content.toInt()
-            val documentId = entry["documentId"]!!.jsonPrimitive.content
+            val id = entry["id"]?.jsonPrimitive?.content?.toInt()
+            val documentId = entry["documentId"]?.jsonPrimitive?.content ?: error("document id is missing on entry ${kotlinx.serialization.json.Json.encodeToString(entry)}")
             val mappedEntry = mappings?.let { mappings ->
                 var base = entry.toString()
                 mappings.forEach { mapping ->
