@@ -7,13 +7,12 @@ import it.sebi.models.StrapiInstanceDTO
 import it.sebi.models.StrapiInstanceSecure
 import it.sebi.tables.StrapiInstancesTable
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.singleOrNull
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.withContext
-import org.jetbrains.exposed.v1.core.ResultRow
-import org.jetbrains.exposed.v1.core.SqlExpressionBuilder.eq
-import org.jetbrains.exposed.v1.jdbc.deleteWhere
-import org.jetbrains.exposed.v1.jdbc.insert
-import org.jetbrains.exposed.v1.jdbc.selectAll
-import org.jetbrains.exposed.v1.jdbc.update
+import org.jetbrains.exposed.v1.core.*
+import org.jetbrains.exposed.v1.jdbc.*
 import org.slf4j.LoggerFactory
 import java.time.OffsetDateTime
 
@@ -26,7 +25,7 @@ class StrapiInstanceRepository {
      */
     suspend fun getAllInstances(): List<StrapiInstance> = dbQuery {
         StrapiInstancesTable.selectAll()
-            .map { it.toStrapiInstance() }
+            .map { it.toStrapiInstance() }.toList()
     }
 
     /**
@@ -35,7 +34,7 @@ class StrapiInstanceRepository {
      */
     suspend fun getAllInstancesSecure(): List<StrapiInstanceSecure> = dbQuery {
         StrapiInstancesTable.selectAll()
-            .map { it.toStrapiInstanceSecure() }
+            .map { it.toStrapiInstanceSecure() }.toList()
     }
 
     /**
@@ -65,6 +64,14 @@ class StrapiInstanceRepository {
             it[username] = instance.username
             it[password] = instance.password
             it[apiKey] = instance.apiKey
+            // DB connection optional fields
+            it[dbHost] = instance.dbHost
+            it[dbPort] = instance.dbPort
+            it[dbName] = instance.dbName
+            it[dbSchema] = instance.dbSchema
+            it[dbUser] = instance.dbUser
+            it[dbPassword] = instance.dbPassword
+            it[dbSslMode] = instance.dbSslMode
         }
 
         insertStatement.resultedValues?.singleOrNull()?.toStrapiInstance()
@@ -80,6 +87,14 @@ class StrapiInstanceRepository {
                 it[password] = instance.password
             if (instance.apiKey.trim().isNotEmpty())
                 it[apiKey] = instance.apiKey
+            // DB connection optional fields: update if provided (including empty can mean null?)
+            it[dbHost] = instance.dbHost
+            it[dbPort] = instance.dbPort
+            it[dbName] = instance.dbName
+            it[dbSchema] = instance.dbSchema
+            it[dbUser] = instance.dbUser
+            it[dbPassword] = instance.dbPassword
+            it[dbSslMode] = instance.dbSslMode
             it[updatedAt] = OffsetDateTime.now()
         } > 0
     }
@@ -97,7 +112,6 @@ class StrapiInstanceRepository {
         id: Int,
         mergeRequestRepository: MergeRequestRepository,
         mergeRequestSelectionsRepository: MergeRequestSelectionsRepository,
-        mergeRequestDocumentMappingRepository: MergeRequestDocumentMappingRepository
     ): Boolean = dbQuery {
         // First, delete all related merge request selections
         // We need to find all merge requests related to this instance
@@ -108,8 +122,6 @@ class StrapiInstanceRepository {
             mergeRequestSelectionsRepository.deleteSelectionsForMergeRequest(mergeRequest.id)
         }
 
-        // Delete all document mappings related to this instance
-        mergeRequestDocumentMappingRepository.deleteMappingsForInstance(id)
 
         // Delete all merge requests related to this instance
         mergeRequestRepository.deleteMergeRequestsForInstance(id)
@@ -139,6 +151,13 @@ class StrapiInstanceRepository {
         username = this[StrapiInstancesTable.username],
         password = this[StrapiInstancesTable.password],
         apiKey = this[StrapiInstancesTable.apiKey],
+        dbHost = this[StrapiInstancesTable.dbHost],
+        dbPort = this[StrapiInstancesTable.dbPort],
+        dbName = this[StrapiInstancesTable.dbName],
+        dbSchema = this[StrapiInstancesTable.dbSchema],
+        dbUser = this[StrapiInstancesTable.dbUser],
+        dbPassword = this[StrapiInstancesTable.dbPassword],
+        dbSslMode = this[StrapiInstancesTable.dbSslMode],
         createdAt = this[StrapiInstancesTable.createdAt],
         updatedAt = this[StrapiInstancesTable.updatedAt]
     )
@@ -151,6 +170,12 @@ class StrapiInstanceRepository {
         name = this[StrapiInstancesTable.name],
         url = this[StrapiInstancesTable.url],
         username = this[StrapiInstancesTable.username],
+        dbHost = this[StrapiInstancesTable.dbHost],
+        dbPort = this[StrapiInstancesTable.dbPort],
+        dbName = this[StrapiInstancesTable.dbName],
+        dbSchema = this[StrapiInstancesTable.dbSchema],
+        dbUser = this[StrapiInstancesTable.dbUser],
+        dbSslMode = this[StrapiInstancesTable.dbSslMode],
         createdAt = this[StrapiInstancesTable.createdAt],
         updatedAt = this[StrapiInstancesTable.updatedAt]
     )

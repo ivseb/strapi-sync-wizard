@@ -72,6 +72,34 @@ const InstanceDetailsDialog: React.FC<InstanceDetailsDialogProps> = ({
               <label className="font-bold">API Key</label>
               <InputText value={fullInstanceData.apiKey} readOnly className="w-full" />
             </div>
+            <div className="p-col-12 p-md-6 mb-2">
+              <label className="font-bold">DB Host</label>
+              <div>{fullInstanceData.dbHost ?? '-'}</div>
+            </div>
+            <div className="p-col-12 p-md-6 mb-2">
+              <label className="font-bold">DB Port</label>
+              <div>{fullInstanceData.dbPort ?? '-'}</div>
+            </div>
+            <div className="p-col-12 p-md-6 mb-2">
+              <label className="font-bold">DB Name</label>
+              <div>{fullInstanceData.dbName ?? '-'}</div>
+            </div>
+            <div className="p-col-12 p-md-6 mb-2">
+              <label className="font-bold">DB Schema</label>
+              <div>{fullInstanceData.dbSchema ?? '-'}</div>
+            </div>
+            <div className="p-col-12 p-md-6 mb-2">
+              <label className="font-bold">DB User</label>
+              <div>{fullInstanceData.dbUser ?? '-'}</div>
+            </div>
+            <div className="p-col-12 p-md-6 mb-2">
+              <label className="font-bold">DB SSL Mode</label>
+              <div>{fullInstanceData.dbSslMode ?? '-'}</div>
+            </div>
+            <div className="p-col-12 mb-2">
+              <label className="font-bold">DB Password</label>
+              <InputText value={fullInstanceData.dbPassword ?? ''} readOnly className="w-full" />
+            </div>
           </div>
         </div>
       );

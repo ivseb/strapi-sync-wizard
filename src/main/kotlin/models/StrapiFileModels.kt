@@ -3,7 +3,6 @@ package it.sebi.models
 import kotlinx.serialization.Contextual
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
-import java.time.LocalDateTime
 import java.time.OffsetDateTime
 
 
@@ -45,8 +44,12 @@ data class StrapiImageMetadata(
     val previewUrl: String?,
     val provider: String,
     val folderPath: String,
+    val folder: String?,
     val locale: String?,
     @Contextual val updatedAt: OffsetDateTime,
+    // Computed fields (downloaded file):
+    val calculatedHash: String? = null,
+    val calculatedSizeBytes: Long? = null,
 )
 
 @Serializable

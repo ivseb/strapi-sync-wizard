@@ -2,6 +2,8 @@ package it.sebi.models
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlin.uuid.ExperimentalUuidApi
+import kotlin.uuid.Uuid
 
 /**
  * Result of schema compatibility check
@@ -19,18 +21,6 @@ data class SchemaCompatibilityResult(
     val incompatibleComponents: List<ComponentIncompatibility> = listOf(),
     val sourceComponents: List<StrapiComponent> = listOf(),
     val targetComponents: List<StrapiComponent> = listOf(),
-)
-
-
-@Serializable
-data class SchemaCompatibilityResultDTO(
-    val isCompatible: Boolean,
-    val missingInTarget: List<StrapiContentType>,
-    val missingInSource: List<StrapiContentType>,
-    val incompatibleContentTypes: List<ContentTypeIncompatibility>,
-    val missingComponentsInTarget: List<StrapiComponent> = listOf(),
-    val missingComponentsInSource: List<StrapiComponent> = listOf(),
-    val incompatibleComponents: List<ComponentIncompatibility> = listOf()
 )
 
 /**
@@ -78,60 +68,55 @@ enum class ContentTypeComparisonResultKind {
     IDENTICAL
 }
 
-@Serializable
-data class ContentTypeComparisonResult(
-    val contentType: String,
-    val onlyInSource: StrapiContent?,
-    val onlyInTarget: StrapiContent?,
-    val different: DifferentEntry?,
-    val identical: StrapiContent?,
-    val kind: StrapiContentTypeKind,
-    val compareKind: ContentTypeComparisonResultKind
-)
-
-
-/**
- * Result of content type comparison
- */
-@Serializable
-data class ContentTypesComparisonResult(
-    val contentType: String,
-    val onlyInSource: List<StrapiContent>,
-    val onlyInTarget: List<StrapiContent>,
-    val different: List<DifferentEntry>,
-    val identical: List<StrapiContent>,
-    val kind: StrapiContentTypeKind
-)
-
 
 @Serializable
 data class ContentTypeFileComparisonResult(
-    val onlyInSource: List<StrapiImage>,
-    val onlyInTarget: List<StrapiImage>,
-    val different: List<DifferentFile>,
-    val identical: List<StrapiImage>,
-    val contentTypeExists: Boolean
-)
+    val sourceImage: StrapiImage?,
+    val targetImage: StrapiImage?,
+    val compareState: ContentTypeComparisonResultKind
+) {
+    @OptIn(ExperimentalUuidApi::class)
+    val id = sourceImage?.metadata?.documentId ?: targetImage?.metadata?.documentId ?: Uuid.random().toString()
 
+    fun toContentTypeComparisonResultWithRelationships(): ContentTypeComparisonResultWithRelationships {
+        return ContentTypeComparisonResultWithRelationships(
+            id = id,
+            tableName = "files",
+            contentType = "files",
+            sourceContent = sourceImage?.let { (metadata, rawData) ->
+                StrapiContent(
+                    metadata = StrapiContentMetadata(
+                        id = metadata.id,
+                        documentId = metadata.documentId,
+                        uniqueKey = metadata.documentId,
+                        locale = metadata.locale
+                    ),
+                    rawData = rawData,
+                    cleanData = rawData,
+                    links = listOf()
+                )
+            },
+            targetContent = targetImage?.let { (metadata, rawData) ->
+                StrapiContent(
+                    metadata = StrapiContentMetadata(
+                        id = metadata.id,
+                        documentId = metadata.documentId,
+                        uniqueKey = metadata.documentId,
+                        locale = metadata.locale
+                    ),
+                    rawData = rawData,
+                    cleanData = rawData,
+                    links = listOf()
+                )
+            },
+            compareState = compareState,
+            kind = StrapiContentTypeKind.Files,
+        )
+    }
 
-/**
- * Represents a pair of entries that are different between source and target
- */
-@Serializable
-data class DifferentEntry(
-    val source: StrapiContent,
-    val target: StrapiContent
-)
-
-/**
- * Represents a pair of entries that are different between source and target
- */
-@Serializable
-data class DifferentFile(
-    val source: StrapiImage,
-    val target: StrapiImage
-)
-
+    @Transient
+    val asContent = toContentTypeComparisonResultWithRelationships()
+}
 
 
 /**
@@ -179,55 +164,28 @@ data class EntryRelationship(
  */
 @Serializable
 data class ContentTypeComparisonResultWithRelationships(
+    val id: String,
+    val tableName: String,
     val contentType: String,
-    val onlyInSource: StrapiContent?,
-    val onlyInTarget: StrapiContent?,
-    val different: DifferentEntry?,
-    val identical: StrapiContent?,
+    val sourceContent: StrapiContent?,
+    val targetContent: StrapiContent?,
+    val compareState: ContentTypeComparisonResultKind,
     val kind: StrapiContentTypeKind,
-    val compareKind: ContentTypeComparisonResultKind,
-    val relationships: List<EntryRelationship> = emptyList(),
-    val dependsOn: List<String> = emptyList(),
-    val dependedOnBy: List<String> = emptyList()
 )
 
 /**
  * Enhanced comparison result with relationship information for collection types
  */
-@Serializable
-data class ContentTypesComparisonResultWithRelationships(
-    val contentType: String,
-    val onlyInSource: List<StrapiContent>,
-    val onlyInTarget: List<StrapiContent>,
-    val different: List<DifferentEntry>,
-    val identical: List<StrapiContent>,
-    val kind: StrapiContentTypeKind,
-    val relationships: Map<String, List<EntryRelationship>> = emptyMap(),
-    val dependsOn: List<String> = emptyList(),
-    val dependedOnBy: List<String> = emptyList()
-)
 
 /**
  * Enhanced comparison result map with relationship information
  */
 @Serializable
 data class ContentTypeComparisonResultMapWithRelationships(
-    val files: ContentTypeFileComparisonResult,
-    val singleTypes: Map<String, ContentTypeComparisonResultWithRelationships>,
-    val collectionTypes: Map<String, ContentTypesComparisonResultWithRelationships>,
+    val files: List<ContentTypeFileComparisonResult> = listOf(),
+    val singleTypes: Map<String, ContentTypeComparisonResultWithRelationships> = emptyMap(),
+    val collectionTypes: Map<String, List<ContentTypeComparisonResultWithRelationships>> = emptyMap(),
     val contentTypeRelationships: List<ContentRelationship> = emptyList()
-)
-
-/**
- * Selected entries for a content type
- */
-@Serializable
-data class SelectedContentTypeEntries(
-    val contentType: String,
-    val entriesToCreate: List<String> = emptyList(),
-    val entriesToUpdate: List<String> = emptyList(),
-    val entriesToDelete: List<String> = emptyList(),
-    val requiredDependencies: List<SelectedContentTypeDependency> = emptyList()
 )
 
 
@@ -246,9 +204,9 @@ data class SelectedContentTypeDependency(
  */
 @Serializable
 data class MergeRequestData(
-    val files: ContentTypeFileComparisonResult,
+    val files: List<ContentTypeFileComparisonResult>,
     val singleTypes: Map<String, ContentTypeComparisonResultWithRelationships>,
-    val collectionTypes: Map<String, ContentTypesComparisonResultWithRelationships>,
+    val collectionTypes: Map<String, List<ContentTypeComparisonResultWithRelationships>>,
     val contentTypeRelationships: List<ContentRelationship> = emptyList(),
     val selections: List<MergeRequestSelectionDTO> = emptyList()
 )

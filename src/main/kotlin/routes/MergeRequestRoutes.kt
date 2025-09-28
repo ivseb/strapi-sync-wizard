@@ -110,9 +110,20 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
             val id = call.parameters["id"]?.toIntOrNull()
                 ?: return@post call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
 
-            val force = call.queryParameters["force"]?.toBooleanStrictOrNull() ?: false
+            val modeParam = call.queryParameters["mode"]?.lowercase()
+            val mode = when (modeParam) {
+                "full" -> it.sebi.service.CompareMode.Full
+                "cache" -> it.sebi.service.CompareMode.Cache
+                "compare" -> it.sebi.service.CompareMode.Compare
+                null -> {
+                    // Backward compatibility with old 'force' flag
+                    val force = call.queryParameters["force"]?.toBooleanStrictOrNull() ?: false
+                    if (force) it.sebi.service.CompareMode.Full else it.sebi.service.CompareMode.Compare
+                }
+                else -> it.sebi.service.CompareMode.Compare
+            }
             try {
-                mergeRequestService.compareContent(id, force)
+                mergeRequestService.compareContent(id, mode)
                 call.respond(HttpStatusCode.OK)
             } catch (e: IllegalArgumentException) {
                 e.printStackTrace()
@@ -136,46 +147,79 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
             }
         }
 
-        // Get all merge request data after compare
-        get("/{id}/all-data") {
+        // Manual mappings upsert (bulk)
+        post("/{id}/mappings") {
             val id = call.parameters["id"]?.toIntOrNull()
-                ?: return@get call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
-
+                ?: return@post call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+            val req = call.receive<ManualMappingsRequestDTO>()
             try {
-                val allData = mergeRequestService.getAllMergeRequestData(id)
-                call.respond(allData)
+                val data = mergeRequestService.upsertManualMappings(id, req.items)
+                call.respond(HttpStatusCode.OK, ManualMappingsResponseDTO(success = true, data = data))
             } catch (e: IllegalArgumentException) {
-                call.respond(HttpStatusCode.NotFound, e.message ?: "Merge request not found")
+                call.respond(HttpStatusCode.NotFound, ManualMappingsResponseDTO(success = false, message = e.message ?: "Invalid request"))
             } catch (e: Exception) {
-                call.respond(HttpStatusCode.InternalServerError, e.message ?: "An error occurred")
+                logger.error("Error during manual mappings upsert for merge request $id", e)
+                call.respond(HttpStatusCode.InternalServerError, ManualMappingsResponseDTO(success = false, message = e.message ?: "Server error"))
             }
         }
 
-        // Endpoints for files, collection-content-types, and single-content-types have been removed
-        // All data is now provided by the /all-data endpoint
+        // Manual mappings list (optionally filtered by contentType UID)
+        get("/{id}/mappings") {
+            val id = call.parameters["id"]?.toIntOrNull()
+                ?: return@get call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+            val contentType = call.request.queryParameters["contentType"]
+            try {
+                val res = mergeRequestService.getManualMappingsList(id, contentType)
+                call.respond(HttpStatusCode.OK, res)
+            } catch (e: IllegalArgumentException) {
+                call.respond(HttpStatusCode.NotFound, ManualMappingsListResponseDTO(success = false, message = e.message ?: "Invalid request"))
+            } catch (e: Exception) {
+                logger.error("Error fetching manual mappings for merge request $id", e)
+                call.respond(HttpStatusCode.InternalServerError, ManualMappingsListResponseDTO(success = false, message = e.message ?: "Server error"))
+            }
+        }
+
+        // Delete a single manual mapping by id
+        delete("/{id}/mappings/{mappingId}") {
+            val id = call.parameters["id"]?.toIntOrNull()
+                ?: return@delete call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+            val mappingId = call.parameters["mappingId"]?.toIntOrNull()
+                ?: return@delete call.respond(HttpStatusCode.BadRequest, "Invalid mapping ID format")
+            try {
+                val data = mergeRequestService.deleteManualMapping(id, mappingId)
+                call.respond(HttpStatusCode.OK, ManualMappingsResponseDTO(success = true, data = data))
+            } catch (e: IllegalArgumentException) {
+                call.respond(HttpStatusCode.NotFound, ManualMappingsResponseDTO(success = false, message = e.message ?: "Invalid request"))
+            } catch (e: Exception) {
+                logger.error("Error deleting manual mapping $mappingId for merge request $id", e)
+                call.respond(HttpStatusCode.InternalServerError, ManualMappingsResponseDTO(success = false, message = e.message ?: "Server error"))
+            }
+        }
 
 
-        // Update a single selection
+
+
+
+        // Unified selection endpoint: supports single, list, and all via ids/all flag
         post("/{id}/selection") {
             val id = call.parameters["id"]?.toIntOrNull()
                 ?: return@post call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
 
-            // Get selection data from request body using the new DTO
-            val selectionData = call.receive<SingleSelectionDTO>()
+            val selectionData = call.receive<UnifiedSelectionDTO>()
 
-            val direction = try {
-                Direction.valueOf(selectionData.direction)
-            } catch (e: IllegalArgumentException) {
-                return@post call.respond(HttpStatusCode.BadRequest, "Invalid direction")
+            if(selectionData.tableName == null && selectionData.selectAllKind == null) {
+                call.respond(HttpStatusCode.BadRequest, "Table name must be provided if not selecting all")
+                return@post
+            }
+            if(selectionData.selectAllKind != null && selectionData.ids != null) {
+                call.respond(HttpStatusCode.BadRequest, "Cannot provide both ids and all")
+                return@post
             }
 
             try {
-                val response = mergeRequestService.updateSingleSelection(
+                val response = mergeRequestService.processUnifiedSelection(
                     id,
-                    selectionData.contentType,
-                    selectionData.documentId,
-                    direction,
-                    selectionData.isSelected
+                    selectionData
                 )
                 call.respond(HttpStatusCode.OK, response)
             } catch (e: IllegalArgumentException) {
@@ -186,43 +230,7 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
             } catch (e: Exception) {
                 call.respond(
                     HttpStatusCode.InternalServerError,
-                    MergeResponse(success = false, message = e.message ?: "An error occurred")
-                )
-            }
-        }
-
-        // Update all selections for a specific content type and direction
-        post("/{id}/bulk-selection") {
-            val id = call.parameters["id"]?.toIntOrNull()
-                ?: return@post call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
-
-            // Get bulk selection data from request body
-            val bulkSelectionData = call.receive<BulkSelectionDTO>()
-
-            val direction = try {
-                Direction.valueOf(bulkSelectionData.direction)
-            } catch (e: IllegalArgumentException) {
-                return@post call.respond(HttpStatusCode.BadRequest, "Invalid direction")
-            }
-
-            try {
-                val response = mergeRequestService.updateAllSelections(
-                    id,
-                    bulkSelectionData.contentType,
-                    direction,
-                    bulkSelectionData.documentIds,
-                    bulkSelectionData.isSelected
-                )
-                call.respond(HttpStatusCode.OK, response)
-            } catch (e: IllegalArgumentException) {
-                call.respond(
-                    HttpStatusCode.NotFound,
-                    MergeResponse(success = false, message = e.message ?: "Merge request not found")
-                )
-            } catch (e: Exception) {
-                call.respond(
-                    HttpStatusCode.InternalServerError,
-                    MergeResponse(success = false, message = e.message ?: "An error occurred")
+                    MergeResponse(success = false, message = e.message ?: ("An error occurred: " + e.message))
                 )
             }
         }
@@ -248,6 +256,26 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
             }
         }
 
+        // Sync plan (order preview)
+        get("/{id}/sync-plan") {
+            val id = call.parameters["id"]?.toIntOrNull()
+                ?: return@get call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+            try {
+                val plan = mergeRequestService.getSyncPlan(id)
+                call.respond(HttpStatusCode.OK, plan)
+            } catch (e: IllegalArgumentException) {
+                call.respond(
+                    HttpStatusCode.NotFound,
+                    MergeResponse(success = false, message = e.message ?: "Merge request not found")
+                )
+            } catch (e: Exception) {
+                logger.error("Error computing sync plan for merge request $id", e)
+                call.respond(
+                    HttpStatusCode.InternalServerError,
+                    MergeResponse(success = false, message = e.message ?: "An error occurred while computing sync plan")
+                )
+            }
+        }
 
         // Complete merge request
         post("/{id}/complete") {

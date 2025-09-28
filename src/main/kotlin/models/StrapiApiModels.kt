@@ -37,7 +37,19 @@ data class ComponentResponse(
 data class StrapiContentMetadata(
     val id: Int?,
     val documentId: String,
-    val slug:String? = null,
+    val uniqueKey: String,
+    val locale: String?
+)
+
+@Serializable
+data class StrapiLinkRef(
+    val field: String,
+    val sourceId: Int,
+    val targetTable: String,
+    val targetId: Int?,
+    val order: Double? = null,
+    val id: Int? = null,
+    val lnkTable: String? = null
 )
 
 @Serializable
@@ -45,13 +57,8 @@ data class StrapiContent(
     val metadata: StrapiContentMetadata,
     val rawData: JsonObject,
     val cleanData: JsonObject,
+    val links: List<StrapiLinkRef> = emptyList(),
 )
-
-/**
- * Represents an entry element in Strapi
- */
-@Serializable
-data class EntryElement(val obj: StrapiContent, val hash: String)
 
 
 /**

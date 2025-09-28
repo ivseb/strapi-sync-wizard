@@ -8,6 +8,7 @@ import io.ktor.client.plugins.HttpRequestRetry
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.plugins.logging.*
+import io.ktor.client.plugins.*
 import io.ktor.client.request.*
 import io.ktor.client.request.forms.*
 import io.ktor.client.statement.*
@@ -17,6 +18,7 @@ import io.swagger.v3.core.util.Json
 import it.sebi.JsonParser
 import it.sebi.models.*
 import it.sebi.utils.calculateMD5Hash
+import it.sebi.utils.ErrorHttpLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.sync.Mutex
@@ -28,7 +30,9 @@ import java.io.File
 import java.lang.System.getenv
 import java.security.MessageDigest
 import java.security.cert.X509Certificate
+import java.sql.DriverManager
 import javax.net.ssl.X509TrustManager
+import kotlin.use
 
 object StrapiClientTokenCache {
     private val cache = mutableMapOf<String, Pair<StrapiLoginData, Long>>()
@@ -53,6 +57,21 @@ object StrapiClientTokenCache {
 
 fun StrapiInstance.client(): StrapiClient = StrapiClient(this)
 
+//fun StrapiInstance.getDbConnection() = run {
+//    val host = this.dbHost?.takeIf { it.isNotBlank() }
+//    val port = this.dbPort ?: 5432
+//    val db = this.dbName?.takeIf { it.isNotBlank() }
+//    val user = this.dbUser?.takeIf { it.isNotBlank() }
+//    val pass = this.dbPassword?.takeIf { it.isNotBlank() }
+//    val sslmode = this.dbSslMode?.takeIf { it.isNotBlank() } ?: "prefer"
+//    require(host != null && db != null && user != null && pass != null) { "Missing DB connection data for instance '${this.name}'." }
+//    val url = "jdbc:postgresql://$host:$port/$db?sslmode=$sslmode"
+//    val schema = (this.dbSchema?.takeIf { it.isNotBlank() } ?: "public").replace("\"", "")
+//    val conn = DriverManager.getConnection(url, user, pass)
+//    conn.createStatement().use { it.execute("SET search_path TO \"$schema\"") }
+//    conn
+//}
+
 
 
 private fun buildClient(proxyConfig: ProxyConfig?): HttpClient = HttpClient(CIO) {
@@ -61,7 +80,7 @@ private fun buildClient(proxyConfig: ProxyConfig?): HttpClient = HttpClient(CIO)
         json(JsonParser)
     }
     install(Logging) {
-        level = LogLevel.INFO
+        level = LogLevel.ALL
     }
     install(HttpTimeout) {
         requestTimeoutMillis = 60000  // 60 secondi
@@ -184,6 +203,51 @@ class StrapiClient(
 
     val selector = ClientSelector()
 
+    // Context for error logging during merge operations
+    var role: String = "unknown" // "source" or "target"
+    var currentMergeRequestId: Int? = null
+    var dataRootFolder: String? = null
+
+    private suspend fun logHttpFailure(
+        callType: String,
+        method: String,
+        url: String,
+        authHeader: String?,
+        requestHeaders: Map<String, String> = emptyMap(),
+        requestBody: String? = null,
+        resp: HttpResponse? = null,
+        error: Throwable? = null
+    ) {
+        val mrId = currentMergeRequestId
+        val dataRoot = dataRootFolder
+        if (mrId == null || dataRoot.isNullOrBlank()) return
+        val statusStr = try {
+            resp?.let { "${it.status.value} ${it.status.description}" }
+        } catch (_: Exception) { null }
+        val respHeaders: Map<String, String>? = try {
+            resp?.headers?.entries()?.associate { it.key to it.value.joinToString(",") }
+        } catch (_: Exception) { null }
+        val respBody: String? = try {
+            resp?.bodyAsText()
+        } catch (_: Exception) { null }
+        val errMsg = error?.localizedMessage
+        ErrorHttpLogger.writeHttpError(
+            dataRootFolder = dataRoot,
+            mergeRequestId = mrId,
+            role = role,
+            callType = callType,
+            method = method,
+            url = url,
+            authHeader = authHeader,
+            requestHeaders = requestHeaders,
+            requestBody = requestBody,
+            responseStatus = statusStr,
+            responseHeaders = respHeaders,
+            responseBody = respBody,
+            errorMessage = errMsg
+        )
+    }
+
 
     suspend fun getLoginToken(): StrapiLoginData = loginMutex.withLock {
         val now = System.currentTimeMillis()
@@ -196,18 +260,45 @@ class StrapiClient(
         }
 
         val url = "$baseUrl/admin/login"
-        val response = selector.getClientForUrl(url).post(url) {
-
-            setBody(buildJsonObject {
+        logger.info("Getting login token for client $username $password from $url")
+        try {
+            val bodyStr = buildJsonObject {
                 put("email", username)
                 put("password", password)
-            })
-            headers {
-                append(HttpHeaders.ContentType, "application/json")
-            }
-        }.body<StrapiLoginResponse>()
-        StrapiClientTokenCache.setCacheForClient(clientHash, response.data, now)
-        return response.data
+            }.toString()
+            val response = selector.getClientForUrl(url).post(url) {
+                setBody(bodyStr)
+                headers {
+                    append(HttpHeaders.ContentType, "application/json")
+                }
+            }.body<StrapiLoginResponse>()
+            StrapiClientTokenCache.setCacheForClient(clientHash, response.data, now)
+            return response.data
+        } catch (e: ClientRequestException) {
+            logHttpFailure(
+                callType = "admin_login",
+                method = "POST",
+                url = url,
+                authHeader = null,
+                requestHeaders = mapOf("Content-Type" to "application/json"),
+                requestBody = "{\"email\":\"$username\",\"password\":\"$password\"}",
+                resp = e.response,
+                error = e
+            )
+            throw e
+        } catch (e: ServerResponseException) {
+            logHttpFailure(
+                callType = "admin_login",
+                method = "POST",
+                url = url,
+                authHeader = null,
+                requestHeaders = mapOf("Content-Type" to "application/json"),
+                requestBody = "{\"email\":\"$username\",\"password\":\"$password\"}",
+                resp = e.response,
+                error = e
+            )
+            throw e
+        }
     }
 
     suspend fun getContentTypes(): List<StrapiContentType> {
@@ -242,14 +333,34 @@ class StrapiClient(
 
         do {
             val url = "$baseUrl/upload/files"
-            val response: JsonObject = selector.getClientForUrl(url).get("$baseUrl/upload/files") {
-                headers {
-                    append(HttpHeaders.Authorization, "Bearer $token")
-                }
-                parameter("sort", "createdAt:DESC")
-                parameter("page", currentPage)
-                parameter("pageSize", 50)
-            }.body()
+            val response: JsonObject = try {
+                selector.getClientForUrl(url).get(url) {
+                    headers { append(HttpHeaders.Authorization, "Bearer $token") }
+                    parameter("sort", "createdAt:DESC")
+                    parameter("page", currentPage)
+                    parameter("pageSize", 50)
+                }.body()
+            } catch (e: ClientRequestException) {
+                logHttpFailure(
+                    callType = "get_files",
+                    method = "GET",
+                    url = url,
+                    authHeader = "Bearer $token",
+                    resp = e.response,
+                    error = e
+                )
+                throw e
+            } catch (e: ServerResponseException) {
+                logHttpFailure(
+                    callType = "get_files",
+                    method = "GET",
+                    url = url,
+                    authHeader = "Bearer $token",
+                    resp = e.response,
+                    error = e
+                )
+                throw e
+            }
 
             val strapiImages = response["results"]?.jsonArray?.map { imageRaw ->
                 val strapiImageMetadata: StrapiImageMetadata = JsonParser.decodeFromJsonElement(imageRaw)
@@ -272,11 +383,31 @@ class StrapiClient(
 
         val token = getLoginToken().token
         val url = "$baseUrl/upload/folders"
-        val response: FolderResponse = selector.getClientForUrl(url).get(url) {
-            headers {
-                append(HttpHeaders.Authorization, "Bearer $token")
-            }
-        }.body()
+        val response: FolderResponse = try {
+            selector.getClientForUrl(url).get(url) {
+                headers { append(HttpHeaders.Authorization, "Bearer $token") }
+            }.body()
+        } catch (e: ClientRequestException) {
+            logHttpFailure(
+                callType = "get_folders",
+                method = "GET",
+                url = url,
+                authHeader = "Bearer $token",
+                resp = e.response,
+                error = e
+            )
+            throw e
+        } catch (e: ServerResponseException) {
+            logHttpFailure(
+                callType = "get_folders",
+                method = "GET",
+                url = url,
+                authHeader = "Bearer $token",
+                resp = e.response,
+                error = e
+            )
+            throw e
+        }
         val folders = response.data
         val folderByPathId = folders.associateBy { it.pathId }
 
@@ -311,20 +442,43 @@ class StrapiClient(
     suspend fun createFolder(name: String, parent: Int?): StrapiFolder {
         val token = getLoginToken().token
         val url = "$baseUrl/upload/folders"
-        val response = selector.getClientForUrl(url).post(url) {
-            headers {
-                append(HttpHeaders.Authorization, "Bearer $token")
-                append(HttpHeaders.ContentType, "application/json")
-            }
-            setBody(
-                JsonObject(
-                    mapOf(
-                        "name" to JsonPrimitive(name),
-                        "parent" to (parent?.let { JsonPrimitive(parent) } ?: JsonNull)
-                    )
-                )
+        val bodyObj = JsonObject(mapOf(
+            "name" to JsonPrimitive(name),
+            "parent" to (parent?.let { JsonPrimitive(parent) } ?: JsonNull)
+        ))
+        val response = try {
+            selector.getClientForUrl(url).post(url) {
+                headers {
+                    append(HttpHeaders.Authorization, "Bearer $token")
+                    append(HttpHeaders.ContentType, "application/json")
+                }
+                setBody(bodyObj)
+            }.body<JsonObject>()
+        } catch (e: ClientRequestException) {
+            logHttpFailure(
+                callType = "folder_create",
+                method = "POST",
+                url = url,
+                authHeader = "Bearer $token",
+                requestHeaders = mapOf("Content-Type" to "application/json"),
+                requestBody = bodyObj.toString(),
+                resp = e.response,
+                error = e
             )
-        }.body<JsonObject>()
+            throw e
+        } catch (e: ServerResponseException) {
+            logHttpFailure(
+                callType = "folder_create",
+                method = "POST",
+                url = url,
+                authHeader = "Bearer $token",
+                requestHeaders = mapOf("Content-Type" to "application/json"),
+                requestBody = bodyObj.toString(),
+                resp = e.response,
+                error = e
+            )
+            throw e
+        }
 
         // Extract the folder data from the response
         val folderData = response["data"]?.jsonObject ?: throw IllegalStateException("Failed to create folder")
@@ -344,17 +498,42 @@ class StrapiClient(
         }
         val url = strapiImage.metadata.url
 
-        val response = if (url.startsWith("http"))
-            selector.getClientForUrl(url).get(url)
-        else selector.getClientForUrl(strapiImage.downloadUrl(baseUrl)).get(strapiImage.downloadUrl(baseUrl)) {
-            headers {
-                append(HttpHeaders.Authorization, "Bearer $apiKey")
+        try {
+            val (finalUrl, resp) = if (url.startsWith("http")) {
+                val r = selector.getClientForUrl(url).get(url)
+                url to r
+            } else {
+                val u = strapiImage.downloadUrl(baseUrl)
+                val r = selector.getClientForUrl(u).get(u) {
+                    headers { append(HttpHeaders.Authorization, "Bearer $apiKey") }
+                }
+                u to r
             }
+            file.writeBytes(resp.bodyAsBytes())
+            return file
+        } catch (e: ClientRequestException) {
+            val dlUrl = if (url.startsWith("http")) url else strapiImage.downloadUrl(baseUrl)
+            logHttpFailure(
+                callType = "file_download",
+                method = "GET",
+                url = dlUrl,
+                authHeader = if (dlUrl.startsWith("http")) null else "Bearer $apiKey",
+                resp = e.response,
+                error = e
+            )
+            throw e
+        } catch (e: ServerResponseException) {
+            val dlUrl = if (url.startsWith("http")) url else strapiImage.downloadUrl(baseUrl)
+            logHttpFailure(
+                callType = "file_download",
+                method = "GET",
+                url = dlUrl,
+                authHeader = if (dlUrl.startsWith("http")) null else "Bearer $apiKey",
+                resp = e.response,
+                error = e
+            )
+            throw e
         }
-
-        file.writeBytes(response.bodyAsBytes())
-
-        return file
 
     }
 
@@ -379,22 +558,43 @@ class StrapiClient(
         val url = "$baseUrl/upload" + (id?.let { "?id=$it" } ?: "")
 
         // Esegui la richiesta
-        val response = selector.getClientForUrl(url).submitFormWithBinaryData(
-            url = url,
-            formData = formData {
-                append("files", file.readBytes(), Headers.build {
-                    append(HttpHeaders.ContentType, mimeType)
-                    append(HttpHeaders.ContentDisposition, "form-data; name=\"files\"; filename=\"$fileName\"")
-                })
-                append("fileInfo", fileInfo)
+        val response = try {
+            selector.getClientForUrl(url).submitFormWithBinaryData(
+                url = url,
+                formData = formData {
+                    append("files", file.readBytes(), Headers.build {
+                        append(HttpHeaders.ContentType, mimeType)
+                        append(HttpHeaders.ContentDisposition, "form-data; name=\"files\"; filename=\"$fileName\"")
+                    })
+                    append("fileInfo", fileInfo)
+                }
+            ) {
+                headers { append(HttpHeaders.Authorization, "Bearer $token") }
             }
-        ) {
-            headers {
-                append(
-                    HttpHeaders.Authorization,
-                    "Bearer $token"
-                )
-            }
+        } catch (e: ClientRequestException) {
+            logHttpFailure(
+                callType = "file_upload",
+                method = "POST",
+                url = url,
+                authHeader = "Bearer $token",
+                requestHeaders = mapOf("Content-Type" to "multipart/form-data"),
+                requestBody = "multipart form fields: files(binary:$fileName;$mimeType), fileInfo=$fileInfo",
+                resp = e.response,
+                error = e
+            )
+            throw e
+        } catch (e: ServerResponseException) {
+            logHttpFailure(
+                callType = "file_upload",
+                method = "POST",
+                url = url,
+                authHeader = "Bearer $token",
+                requestHeaders = mapOf("Content-Type" to "multipart/form-data"),
+                requestBody = "multipart form fields: files(binary:$fileName;$mimeType), fileInfo=$fileInfo",
+                resp = e.response,
+                error = e
+            )
+            throw e
         }
 
         // Gestisci la risposta qui
@@ -428,8 +628,26 @@ class StrapiClient(
             if (e.response.status == HttpStatusCode.NotFound) {
                 JsonObject(emptyMap())
             } else {
+                logHttpFailure(
+                    callType = "file_delete",
+                    method = "DELETE",
+                    url = "$baseUrl/api/upload/files/$fileId",
+                    authHeader = "Bearer $apiKey",
+                    resp = e.response,
+                    error = e
+                )
                 throw e
             }
+        } catch (e: ServerResponseException) {
+            logHttpFailure(
+                callType = "file_delete",
+                method = "DELETE",
+                url = "$baseUrl/api/upload/files/$fileId",
+                authHeader = "Bearer $apiKey",
+                resp = e.response,
+                error = e
+            )
+            throw e
         }
     }
 
@@ -470,151 +688,51 @@ class StrapiClient(
         }
     }
 
-    suspend fun getContentEntries(
-        contentType: StrapiContentType,
-    ): List<JsonObject> {
-        if(contentType.uid == "api::section-card-assistance.section-card-assistance"){
-            logger.debug("Processing special content type: api::section-card-assistance.section-card-assistance")
-        }
-        val baseUrl = "$baseUrl/content-manager/${contentType.schema.kebabCaseKind}/${contentType.uid}"
-        val token = getLoginToken().token
 
-        // For SingleType, we don't need pagination
-        if (contentType.schema.kind == StrapiContentTypeKind.SingleType) {
-            val response: JsonObject = try {
-                selector.getClientForUrl(baseUrl).get(baseUrl+"?locate=it") {
-                    headers {
-                        append(HttpHeaders.Authorization, "Bearer ${token}")
-                    }
-                }.body()
-            } catch (e: io.ktor.client.plugins.ClientRequestException) {
-                if (e.response.status == HttpStatusCode.NotFound) {
-                    return emptyList()
-                }
-                throw e
-            }
-
-            val dataElement = response["data"] ?: response["results"]
-
-            val entries = when (dataElement) {
-                null -> emptyList()
-                is JsonNull -> emptyList()
-                is JsonObject -> listOf(dataElement)
-                else -> dataElement.jsonArray.map { it.jsonObject }
-            }
-
-            return entries
-//            return processEntries(entries, mappings)
-        }
-
-        // For CollectionType, handle pagination
-        val allEntries = mutableListOf<JsonObject>()
-        var currentPage = 1
-        val pageSize = 100 // Use a larger page size to reduce the number of API calls
-
-        do {
-            val url = "$baseUrl?locate=it&page=$currentPage&pageSize=$pageSize"
-
-            val response: JsonObject = try {
-                selector.getClientForUrl(url).get(url) {
-                    headers {
-                        append(HttpHeaders.Authorization, "Bearer ${token}")
-                    }
-                }.body()
-            } catch (e: io.ktor.client.plugins.ClientRequestException) {
-                if (e.response.status == HttpStatusCode.NotFound) {
-                    return emptyList()
-                }
-                throw e
-            }
-
-            val resultsElement = response["results"]
-            val results = when {
-                resultsElement == null -> emptyList()
-                resultsElement is JsonNull -> emptyList()
-                resultsElement is JsonArray -> resultsElement.map { it.jsonObject }
-                else -> listOf(resultsElement.jsonObject)
-            }
-
-            allEntries.addAll(results)
-
-            // Get pagination information
-            val pageCount = response["pagination"]?.jsonObject?.let {
-                pagination -> pagination["pageCount"]?.jsonPrimitive?.int
-            } ?: 0
-
-            currentPage++
-        } while (currentPage <= pageCount)
-
-        val detailAllEntries = allEntries.mapNotNull { entry ->
-            entry["documentId"]?.jsonPrimitive?.content?.let { docId ->
-                val detailUrl = "$baseUrl/$docId?status=published&locale=it"
-                val detailResponse : JsonObject = try {
-                    selector.getClientForUrl(detailUrl).get(detailUrl) {
-                        headers {
-                            append(HttpHeaders.Authorization, "Bearer ${token}")
-                        }
-                    }.body()
-                } catch (e: io.ktor.client.plugins.ClientRequestException) {
-                    if (e.response.status == HttpStatusCode.NotFound) {
-                         null
-                    }
-                    throw e
-                }
-                detailResponse["data"]?.jsonObject
-
-            }
-
-        }
-
-        return detailAllEntries
-
-    }
-
-    fun processEntries(
-        entries: List<JsonObject>,
-        mappings: List<MergeRequestDocumentMapping>?
-    ): List<EntryElement> {
-
-        return entries.filterNot { it.isEmpty() }.map { entry ->
-            val id = entry["id"]?.jsonPrimitive?.content?.toInt()
-            val documentId = entry["documentId"]?.jsonPrimitive?.content ?: error("document id is missing on entry ${kotlinx.serialization.json.Json.encodeToString(entry)}")
-            val mappedEntry = mappings?.let { mappings ->
-                var base = entry.toString()
-                mappings.forEach { mapping ->
-                    if (mapping.targetDocumentId != null && mapping.sourceDocumentId != null)
-                        base = base.replace(mapping.targetDocumentId, mapping.sourceDocumentId)
-                }
-                JsonParser.decodeFromString<JsonObject>(base)
-            } ?: entry
-            val cleanupStrapiJson = cleanupStrapiJson(mappedEntry)
-            val content = StrapiContent(StrapiContentMetadata(id, documentId), entry, cleanupStrapiJson.jsonObject)
-
-
-            EntryElement(content, cleanupStrapiJson.jsonObject.generateHash(fieldsToIgnore = listOf("documentId","localizations")))
-        }
-    }
 
 
     suspend fun createContentEntry(contentType: String, data: JsonObject, kind: StrapiContentTypeKind): JsonObject {
         val url = "$baseUrl/api/$contentType"
 
-        logger.debug("Creating content entry for $contentType with kind $kind")
-        logger.trace("Content entry data: {}", data)
+        logger.info("Creating content entry for $contentType with kind $kind")
+        logger.info("Content entry data: {}", data)
 
-        val response = selector.getClientForUrl(url).request(url) {
-            method = if (kind == StrapiContentTypeKind.SingleType) HttpMethod.Put else HttpMethod.Post
-            headers {
-                append(HttpHeaders.Authorization, "Bearer $apiKey")
-                contentType(io.ktor.http.ContentType.Application.Json)
-            }
-            setBody(buildJsonObject {
-                put("data", data)
-            })
-        }.body<JsonObject>()
-
-        logger.trace("Content entry response: {}", response)
-        return response
+        val method = if (kind == StrapiContentTypeKind.SingleType) HttpMethod.Put else HttpMethod.Post
+        val bodyStr = buildJsonObject { put("data", data) }.toString()
+        return try {
+            selector.getClientForUrl(url).request(url) {
+                this.method = method
+                headers {
+                    append(HttpHeaders.Authorization, "Bearer $apiKey")
+                    contentType(io.ktor.http.ContentType.Application.Json)
+                }
+                setBody(bodyStr)
+            }.body<JsonObject>()
+        } catch (e: ClientRequestException) {
+            logHttpFailure(
+                callType = "content_create",
+                method = method.value,
+                url = url,
+                authHeader = "Bearer $apiKey",
+                requestHeaders = mapOf("Content-Type" to "application/json"),
+                requestBody = bodyStr,
+                resp = e.response,
+                error = e
+            )
+            throw e
+        } catch (e: ServerResponseException) {
+            logHttpFailure(
+                callType = "content_create",
+                method = method.value,
+                url = url,
+                authHeader = "Bearer $apiKey",
+                requestHeaders = mapOf("Content-Type" to "application/json"),
+                requestBody = bodyStr,
+                resp = e.response,
+                error = e
+            )
+            throw e
+        }
     }
 
     suspend fun updateContentEntry(
@@ -631,7 +749,7 @@ class StrapiClient(
 
         logger.debug("Updating content entry for $contentType with kind $kind")
         logger.debug("Update URL: $url")
-        logger.trace("Update data: {}", data)
+        logger.debug("Update data: {}", data)
 
 
         return selector.getClientForUrl(url).put(url) {
@@ -645,6 +763,61 @@ class StrapiClient(
         }.body()
     }
 
+    suspend fun upsertContentEntry(
+        contentType: String,
+        data: JsonObject,
+        kind: StrapiContentTypeKind,
+        targetDocumentId:String? = null
+    ): JsonObject {
+        val url = if (kind == StrapiContentTypeKind.SingleType) {
+            "$baseUrl/api/$contentType"
+        } else {
+            "$baseUrl/api/$contentType"+ (targetDocumentId?.let { "/$it" } ?: "")
+        }
+
+        logger.debug("Updating content entry for $contentType with kind $kind")
+        logger.debug("Update URL: $url")
+        logger.debug("Update data: {}", data)
+
+
+        val method = if (kind == StrapiContentTypeKind.SingleType || targetDocumentId != null) HttpMethod.Put else HttpMethod.Post
+        val bodyStr = buildJsonObject { put("data", data) }.toString()
+        return try {
+            selector.getClientForUrl(url).request(url) {
+                this.method = method
+                headers {
+                    append(HttpHeaders.Authorization, "Bearer $apiKey")
+                    contentType(io.ktor.http.ContentType.Application.Json)
+                }
+                setBody(bodyStr)
+            }.body()
+        } catch (e: ClientRequestException) {
+            logHttpFailure(
+                callType = "content_upsert",
+                method = method.value,
+                url = url,
+                authHeader = "Bearer $apiKey",
+                requestHeaders = mapOf("Content-Type" to "application/json"),
+                requestBody = bodyStr,
+                resp = e.response,
+                error = e
+            )
+            throw e
+        } catch (e: ServerResponseException) {
+            logHttpFailure(
+                callType = "content_upsert",
+                method = method.value,
+                url = url,
+                authHeader = "Bearer $apiKey",
+                requestHeaders = mapOf("Content-Type" to "application/json"),
+                requestBody = bodyStr,
+                resp = e.response,
+                error = e
+            )
+            throw e
+        }
+    }
+
     suspend fun deleteContentEntry(contentType: String, id: String, kind: String = "collectionType"): Boolean {
         val url = if (kind == "singleType") {
             "$baseUrl/api/$contentType"
@@ -652,11 +825,31 @@ class StrapiClient(
             "$baseUrl/api/$contentType/$id"
         }
 
-        return selector.getClientForUrl(url).delete(url) {
-            headers {
-                append(HttpHeaders.Authorization, "Bearer $apiKey")
-            }
-        }.status.isSuccess()
+        return try {
+            selector.getClientForUrl(url).delete(url) {
+                headers { append(HttpHeaders.Authorization, "Bearer $apiKey") }
+            }.status.isSuccess()
+        } catch (e: ClientRequestException) {
+            logHttpFailure(
+                callType = "content_delete",
+                method = "DELETE",
+                url = url,
+                authHeader = "Bearer $apiKey",
+                resp = e.response,
+                error = e
+            )
+            throw e
+        } catch (e: ServerResponseException) {
+            logHttpFailure(
+                callType = "content_delete",
+                method = "DELETE",
+                url = url,
+                authHeader = "Bearer $apiKey",
+                resp = e.response,
+                error = e
+            )
+            throw e
+        }
     }
 
 

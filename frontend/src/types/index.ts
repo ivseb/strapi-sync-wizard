@@ -42,8 +42,17 @@ export interface StrapiInstance {
     name: string;
     url: string;
     username: string;
-    password?: string; // Optional: only present when fetched from /{id}/full endpoint
-    apiKey?: string;   // Optional: only present when fetched from /{id}/full endpoint
+    // Optional DB connection metadata (secure list includes these except passwords)
+    dbHost?: string | null;
+    dbPort?: number | null;
+    dbName?: string | null;
+    dbSchema?: string | null;
+    dbUser?: string | null;
+    dbSslMode?: string | null;
+    // Sensitive fields present only when fetched from /{id}/full endpoint
+    password?: string; // Strapi admin password
+    apiKey?: string;   // Strapi API key
+    dbPassword?: string | null; // DB password (only in full endpoint)
 }
 
 export interface FormData {
@@ -53,12 +62,21 @@ export interface FormData {
     username: string;
     password: string;  // Can be empty when editing (id is present)
     apiKey: string;    // Can be empty when editing (id is present)
+    // DB connection fields
+    dbHost?: string;
+    dbPort?: number | null; // store as number for payload; null if empty
+    dbName?: string;
+    dbSchema?: string;
+    dbUser?: string;
+    dbPassword?: string; // optional; when editing leave empty to keep
+    dbSslMode?: string;
 }
 
 // Enums for content type kinds and comparison results
 export enum StrapiContentTypeKind {
     SingleType = "singleType",
-    CollectionType = "collectionType"
+    CollectionType = "collectionType",
+    Files = "files"
 }
 
 export enum ContentTypeComparisonResultKind {
@@ -83,7 +101,9 @@ export interface StrapiImageMetadata {
     previewUrl: string | null;
     provider: string;
     folderPath: string;
+    folder?: string;
     locale: string | null;
+    updatedAt: string;
 }
 
 export interface StrapiImage {
@@ -92,14 +112,25 @@ export interface StrapiImage {
 }
 
 export interface StrapiContentMetadata {
-    id: number;
+    id: number | null;
     documentId: string;
+    locale?: string | null;
+}
+
+export interface StrapiLinkRef {
+    field: string;
+    targetTable: string;
+    targetId: number | null;
+    order?: number | null;
+    id?: number | null;
+    lnkTable?: string | null;
 }
 
 export interface StrapiContent {
     metadata: StrapiContentMetadata;
     rawData: JsonObject;
     cleanData: JsonObject;
+    links: StrapiLinkRef[];
 }
 
 export interface DifferentFile {
@@ -108,11 +139,10 @@ export interface DifferentFile {
 }
 
 export interface ContentTypeFileComparisonResult {
-    onlyInSource: StrapiImage[];
-    onlyInTarget: StrapiImage[];
-    different: DifferentFile[];
-    identical: StrapiImage[];
-    contentTypeExists: boolean;
+    id: string;
+    sourceImage: StrapiImage | null;
+    targetImage: StrapiImage | null;
+    compareState: ContentTypeComparisonResultKind;
 }
 
 // Content type comparison and relationship types
@@ -129,6 +159,7 @@ export interface EntryRelationship {
     targetDocumentId: string;
     targetField?: string;
     relationType: string;
+    compareStatus: ContentTypeComparisonResultKind | null;
 }
 
 export interface ContentRelationship {
@@ -141,58 +172,52 @@ export interface ContentRelationship {
 }
 
 export interface ContentTypeComparisonResultWithRelationships {
-    contentType: string;
-    onlyInSource: StrapiContent | null;
-    onlyInTarget: StrapiContent | null;
-    different: DifferentEntry | null;
-    identical: StrapiContent | null;
+    id: string; // unique id used for selection
+    tableName: string;
+    contentType: string; // UID
+    sourceContent?: StrapiContent | null;
+    targetContent?: StrapiContent | null;
+    compareState: ContentTypeComparisonResultKind;
     kind: StrapiContentTypeKind;
-    compareKind: ContentTypeComparisonResultKind;
-    relationships: EntryRelationship[];
-    dependsOn: string[];
-    dependedOnBy: string[];
 }
 
-export interface ContentTypesComparisonResultWithRelationships {
-    contentType: string;
-    onlyInSource: StrapiContent[];
-    onlyInTarget: StrapiContent[];
-    different: DifferentEntry[];
-    identical: StrapiContent[];
-    kind: StrapiContentTypeKind;
-    relationships: Record<string, EntryRelationship[]>;
-    dependsOn: string[];
-    dependedOnBy: string[];
-}
 
-export interface SelectionStatusInfo {
+export type Direction = 'TO_CREATE' | 'TO_UPDATE' | 'TO_DELETE';
+
+export interface MergeRequestSelection {
+    id: number;
+    mergeRequestId: number;
+    tableName: string;
     documentId: string;
-    syncSuccess: boolean | null;
-    syncFailureResponse: string | null;
-    syncDate: string | null;
+    direction: Direction;
+    createdAt: string;
+    syncSuccess?: boolean | null;
+    syncFailureResponse?: string | null;
+    syncDate?: string | null;
 }
 
 export interface MergeRequestSelectionDTO {
-    contentType: string;
-    entriesToCreate: string[];
-    entriesToUpdate: string[];
-    entriesToDelete: string[];
-    createStatus?: SelectionStatusInfo[];
-    updateStatus?: SelectionStatusInfo[];
-    deleteStatus?: SelectionStatusInfo[];
+    tableName: string;
+    selections: MergeRequestSelection[];
 }
 
 export interface SelectedContentTypeDependency {
     contentType: string;
     documentId: string;
-    relationshipPath?: EntryRelationship[];
+    relationshipPath: EntryRelationship[];
+}
+
+export interface ManualMappingsResponseDTO {
+    success: boolean;
+    data?: MergeRequestData;
+    message?: string
 }
 
 // Main data structure for merge requests
 export interface MergeRequestData {
-    files: ContentTypeFileComparisonResult;
+    files: ContentTypeFileComparisonResult[];
     singleTypes: Record<string, ContentTypeComparisonResultWithRelationships>;
-    collectionTypes: Record<string, ContentTypesComparisonResultWithRelationships>;
+    collectionTypes: Record<string, ContentTypeComparisonResultWithRelationships[]>;
     contentTypeRelationships: ContentRelationship[];
     selections: MergeRequestSelectionDTO[];
 }
@@ -210,4 +235,42 @@ export interface MergeRequestDetail {
         updatedAt: string;
     };
     mergeRequestData?: MergeRequestData;
+}
+
+// Sync plan DTOs
+export interface SyncPlanItemDTO {
+    tableName: string;
+    documentId: string;
+    direction: Direction;
+}
+
+export interface MissingDependencyDTO {
+    fromTable: string;
+    fromDocumentId: string;
+    linkField: string;
+    linkTargetTable: string;
+    reason: string;
+}
+
+export interface CircularDependencyEdgeDTO {
+    fromTable: string;
+    fromDocumentId: string;
+    toTable: string;
+    toDocumentId: string;
+    viaField: string;
+}
+
+export interface DependencyEdgeDTO {
+    fromTable: string;
+    fromDocumentId: string;
+    toTable: string;
+    toDocumentId: string;
+    viaField: string;
+}
+
+export interface SyncPlanDTO {
+    batches: SyncPlanItemDTO[][];
+    missingDependencies: MissingDependencyDTO[];
+    circularEdges: CircularDependencyEdgeDTO[];
+    edges: DependencyEdgeDTO[];
 }

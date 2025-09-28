@@ -11,7 +11,13 @@ import {Stepper} from 'primereact/stepper';
 import {StepperPanel} from 'primereact/stepperpanel';
 
 // Import types
-import {MergeRequestDetail} from '../types';
+import {
+    ContentTypeComparisonResultKind,
+    ContentTypeComparisonResultWithRelationships,
+    MergeRequestData,
+    MergeRequestDetail,
+    StrapiContentTypeKind
+} from '../types';
 
 // Step Components
 import SchemaCompatibilityStep from './steps/SchemaCompatibilityStep';
@@ -22,6 +28,7 @@ import MergeCollectionsStep from './steps/MergeCollectionsStep';
 import CompleteMergeStep from './steps/CompleteMergeStep';
 
 const MergeRequestDetails: React.FC = () => {
+    console.log('Rendering MergeRequestDetails');
     const {id} = useParams<{ id: string }>();
     const navigate = useNavigate();
     const toast = useRef<Toast>(null);
@@ -32,12 +39,21 @@ const MergeRequestDetails: React.FC = () => {
     const [activeStep, setActiveStep] = useState<number>(0);
     const [checkingSchema, setCheckingSchema] = useState<boolean>(false);
     const [comparingContent, setComparingContent] = useState<boolean>(false);
-    const [mergingSingles, setMergingSingles] = useState<boolean>(false);
     const [mergingCollections, setMergingCollections] = useState<boolean>(false);
     const [completing, setCompleting] = useState<boolean>(false);
 
     // Create a ref for the stepper
     const stepperRef = useRef<any>(null);
+
+    const updateMergeData = (data?: MergeRequestData) => {
+        if (!data || !mergeRequestDetail) return
+        const mergeRequestDetailNew = {
+            ...mergeRequestDetail,
+            mergeRequestData: data
+        }
+        setMergeRequestDetail(mergeRequestDetailNew)
+
+    }
 
 
     // No need for a separate function to fetch merge data as it's now included in the main API response
@@ -51,30 +67,23 @@ const MergeRequestDetails: React.FC = () => {
                 const response = await axios.get(`/api/merge-requests/${id}`);
                 setMergeRequestDetail(response.data);
 
-                // Set active step based on status
+                // Set active step based on status (after extracting schema and comparison steps)
                 let stepIndex = 0;
                 switch (response.data.mergeRequest.status) {
-                    case 'SCHEMA_CHECKED':
-                        stepIndex = 0;
-                        break;
-                    case 'COMPARED':
                     case 'MERGED_FILES':
+                        stepIndex = 1;
+                        break;
                     case 'MERGED_SINGLES':
+                        stepIndex = 2;
+                        break;
                     case 'MERGED_COLLECTIONS':
-                        // Set the appropriate step index
-                        if (response.data.mergeRequest.status === 'COMPARED') {
-                            stepIndex = 1;
-                        } else if (response.data.mergeRequest.status === 'MERGED_FILES') {
-                            stepIndex = 2;
-                        } else if (response.data.mergeRequest.status === 'MERGED_SINGLES') {
-                            stepIndex = 3;
-                        } else {
-                            stepIndex = 4;
-                        }
-                        break;
+                    case 'IN_PROGRESS':
+                    case 'FAILED':
                     case 'COMPLETED':
-                        stepIndex = 5;
+                        stepIndex = 2;
                         break;
+                    default:
+                        stepIndex = 0; // CREATED, SCHEMA_CHECKED, COMPARED
                 }
 
                 setActiveStep(stepIndex);
@@ -120,12 +129,9 @@ const MergeRequestDetails: React.FC = () => {
                 life: 5000
             });
 
-            // Move to the next step if compatible
+            // After check, keep the wizard on the first merge step
             if (isCompatible) {
-                setActiveStep(1);
-                if (stepperRef.current) {
-                    stepperRef.current.nextCallback();
-                }
+                setActiveStep(0);
             }
         } catch (err: any) {
             console.error('Error checking schema compatibility:', err);
@@ -147,8 +153,8 @@ const MergeRequestDetails: React.FC = () => {
         try {
             setComparingContent(true);
 
-            // Call the compare endpoint - it no longer returns data
-            await axios.post(`/api/merge-requests/${id}/compare?force=true`);
+            // Call the compare endpoint with new mode parameter (Full recompute)
+            await axios.post(`/api/merge-requests/${id}/compare?mode=full`);
 
             // Fetch the updated merge request details
             const updatedMergeRequest = await axios.get(`/api/merge-requests/${id}`);
@@ -162,11 +168,8 @@ const MergeRequestDetails: React.FC = () => {
                 life: 5000
             });
 
-            // Move to the next step
-            setActiveStep(2);
-            if (stepperRef.current) {
-                stepperRef.current.nextCallback();
-            }
+            // After comparison, start from the first merge step
+            setActiveStep(0);
         } catch (err: any) {
             console.error('Error comparing content:', err);
             toast.current?.show({
@@ -190,22 +193,19 @@ const MergeRequestDetails: React.FC = () => {
             // Determine the new status based on the next step
             let newStatus = mergeRequestDetail.mergeRequest.status;
 
-            if (nextStep === 3 && mergeRequestDetail.mergeRequest.status === 'COMPARED') {
+            if (nextStep === 1 && mergeRequestDetail.mergeRequest.status === 'COMPARED') {
                 newStatus = 'MERGED_FILES';
                 await updateMergeRequestStatus(newStatus);
-            } else if (nextStep === 4 && mergeRequestDetail.mergeRequest.status === 'MERGED_FILES') {
+            } else if (nextStep === 2 && mergeRequestDetail.mergeRequest.status === 'MERGED_FILES') {
                 newStatus = 'MERGED_SINGLES';
                 await updateMergeRequestStatus(newStatus);
-            } else if (nextStep === 5 && mergeRequestDetail.mergeRequest.status === 'MERGED_SINGLES') {
+            } else if (nextStep === 3 && mergeRequestDetail.mergeRequest.status === 'MERGED_SINGLES') {
                 newStatus = 'MERGED_COLLECTIONS';
                 await updateMergeRequestStatus(newStatus);
             }
         }
 
         setActiveStep(nextStep);
-        if (stepperRef.current) {
-            stepperRef.current.nextCallback();
-        }
     };
 
     // Update merge request status
@@ -239,15 +239,17 @@ const MergeRequestDetails: React.FC = () => {
         }
     };
 
-    // Function to update a single selection
-    const updateSingleSelection = async (contentType: string, documentId: string, direction: string, isSelected: boolean) => {
+
+    // Function to update selections for a list or all (unified API)
+    const updateAllSelections = async (kind: StrapiContentTypeKind, isSelected: boolean, tableName?: string, documentIds?: string[], selectAllKind?: ContentTypeComparisonResultKind) => {
         if (!id) return false;
 
         try {
             await axios.post(`/api/merge-requests/${id}/selection`, {
-                contentType,
-                documentId,
-                direction,
+                kind,
+                tableName,
+                ids: documentIds,
+                selectAllKind: selectAllKind,
                 isSelected
             });
 
@@ -257,36 +259,7 @@ const MergeRequestDetails: React.FC = () => {
 
             return true;
         } catch (err: any) {
-            console.error('Error updating selection:', err);
-            toast.current?.show({
-                severity: 'error',
-                summary: 'Error',
-                detail: err.response?.data?.message || 'Failed to update selection',
-                life: 3000
-            });
-            return false;
-        }
-    };
-
-    // Function to update all selections for a specific content type and direction
-    const updateAllSelections = async (contentType: string, direction: string, documentIds: string[], isSelected: boolean) => {
-        if (!id) return false;
-
-        try {
-            await axios.post(`/api/merge-requests/${id}/bulk-selection`, {
-                contentType,
-                direction,
-                documentIds,
-                isSelected
-            });
-
-            // Fetch the updated merge request details
-            const updatedMergeRequest = await axios.get(`/api/merge-requests/${id}`);
-            setMergeRequestDetail(updatedMergeRequest.data);
-
-            return true;
-        } catch (err: any) {
-            console.error('Error updating bulk selections:', err);
+            console.error('Error updating selections:', err);
             toast.current?.show({
                 severity: 'error',
                 summary: 'Error',
@@ -302,7 +275,6 @@ const MergeRequestDetails: React.FC = () => {
         if (!id) return;
 
         try {
-            setMergingSingles(true);
 
             // Update the merge request status
             const success = await updateMergeRequestStatus('MERGED_SINGLES');
@@ -317,7 +289,7 @@ const MergeRequestDetails: React.FC = () => {
                 });
 
                 // Validate and proceed to next step
-                await proceedToNextStep(4);
+                await proceedToNextStep(2);
             }
         } catch (err: any) {
             console.error('Error in single types step:', err);
@@ -328,7 +300,6 @@ const MergeRequestDetails: React.FC = () => {
                 life: 5000
             });
         } finally {
-            setMergingSingles(false);
         }
     };
 
@@ -443,9 +414,17 @@ const MergeRequestDetails: React.FC = () => {
         );
     }
 
+    const status = mergeRequestDetail.mergeRequest.status;
+    const isLocked = ['IN_PROGRESS', 'COMPLETED', 'FAILED'].includes(status);
+
     return (
         <div className="container py-4">
             <Toast ref={toast}/>
+
+            {/* derive lock flag */}
+            {(() => {
+                return null;
+            })()}
 
             {/* Header */}
             <Card className="mb-4">
@@ -490,326 +469,277 @@ const MergeRequestDetails: React.FC = () => {
                 </div>
             </Card>
 
+            {/* Pre-steps Actions */}
+            {!isLocked && (
+                <Card className="mb-4">
+                    <div className="p-3">
+                        <div className="grid">
+                            <div className="col-12 md:col-6">
+                                <Card className="h-full">
+                                    <div className="flex align-items-center justify-content-between mb-3">
+                                        <h3 className="m-0">1. Schema Compatibility</h3>
+                                        <Tag
+                                            value={mergeRequestDetail.mergeRequest.status !== 'CREATED' ? 'Checked' : 'Pending'}
+                                            severity={mergeRequestDetail.mergeRequest.status !== 'CREATED' ? 'success' : 'warning'}
+                                        />
+                                    </div>
+                                    <SchemaCompatibilityStep
+                                        schemaCompatible={mergeRequestDetail.mergeRequest.status === 'SCHEMA_CHECKED' || mergeRequestDetail.mergeRequest.status === 'COMPARED' || mergeRequestDetail.mergeRequest.status === 'MERGED_FILES' || mergeRequestDetail.mergeRequest.status === 'MERGED_SINGLES' || mergeRequestDetail.mergeRequest.status === 'MERGED_COLLECTIONS' || mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
+                                        checkingSchema={checkingSchema}
+                                        checkSchemaCompatibility={checkSchemaCompatibility}
+                                    />
+                                </Card>
+                            </div>
+                            <div className="col-12 md:col-6">
+                                <Card className="h-full">
+                                    <div className="flex align-items-center justify-content-between mb-3">
+                                        <h3 className="m-0">2. Content Comparison</h3>
+                                        <Tag
+                                            value={(mergeRequestDetail.mergeRequest.status === 'COMPARED' || mergeRequestDetail.mergeRequest.status === 'MERGED_FILES' || mergeRequestDetail.mergeRequest.status === 'MERGED_SINGLES' || mergeRequestDetail.mergeRequest.status === 'MERGED_COLLECTIONS' || mergeRequestDetail.mergeRequest.status === 'COMPLETED') ? 'Done' : (mergeRequestDetail.mergeRequest.status !== 'CREATED' ? 'Ready' : 'Locked')}
+                                            severity={(mergeRequestDetail.mergeRequest.status === 'COMPARED' || mergeRequestDetail.mergeRequest.status === 'MERGED_FILES' || mergeRequestDetail.mergeRequest.status === 'MERGED_SINGLES' || mergeRequestDetail.mergeRequest.status === 'MERGED_COLLECTIONS' || mergeRequestDetail.mergeRequest.status === 'COMPLETED') ? 'success' : (mergeRequestDetail.mergeRequest.status !== 'CREATED' ? 'info' : 'warning')}
+                                        />
+                                    </div>
+                                    <ContentComparisonStep
+                                        comparingContent={comparingContent}
+                                        schemaCompatible={mergeRequestDetail.mergeRequest.status !== 'CREATED'}
+                                        compareContent={compareContent}
+                                        status={mergeRequestDetail.mergeRequest.status}
+                                    />
+                                </Card>
+                            </div>
+                        </div>
+                    </div>
+                </Card>
+            )}
+
             {/* Stepper */}
-            <Card>
-                <div className="p-3">
-                    <Stepper 
-                        ref={stepperRef} 
-                        style={{width: '100%'}} 
-                        orientation="vertical"
-                        activeStep={activeStep}
-                        linear={true}
-                        onChange={(event) => {
-                            // Access the step index from the event
-                            const index = (event as any).index;
-
-                            // Prevent navigation to steps after schema compatibility if schema check hasn't been performed
-                            if (index > 0 && mergeRequestDetail.mergeRequest.status === 'CREATED') {
-                                (event as any).preventDefault();
-                                toast.current?.show({
-                                    severity: 'warn',
-                                    summary: 'Schema Check Required',
-                                    detail: 'You must check schema compatibility before proceeding to the next steps.',
-                                    life: 3000
-                                });
-                                return;
-                            }
-
-                            // Prevent navigation to steps after content comparison if comparison hasn't been performed
-                            if (index > 1 && mergeRequestDetail.mergeRequest.status === 'SCHEMA_CHECKED') {
-                                (event as any).preventDefault();
-                                toast.current?.show({
-                                    severity: 'warn',
-                                    summary: 'Content Comparison Required',
-                                    detail: 'You must compare content before proceeding to the next steps.',
-                                    life: 3000
-                                });
-                                return;
-                            }
-
-                            // Prevent navigation to any step if merge is completed
-                            if (mergeRequestDetail.mergeRequest.status === 'COMPLETED' && index !== activeStep) {
-                                (event as any).preventDefault();
-                                toast.current?.show({
-                                    severity: 'info',
-                                    summary: 'Merge Completed',
-                                    detail: 'This merge request has been completed and cannot be modified.',
-                                    life: 3000
-                                });
-                                return;
-                            }
-
-                            // Allow navigation between merge steps (2-5)
-                            if (index >= 2 && index <= 5 && 
-                                (mergeRequestDetail.mergeRequest.status === 'COMPARED' || 
-                                 mergeRequestDetail.mergeRequest.status === 'MERGED_FILES' || 
-                                 mergeRequestDetail.mergeRequest.status === 'MERGED_SINGLES' || 
-                                 mergeRequestDetail.mergeRequest.status === 'MERGED_COLLECTIONS')) {
+            {(!isLocked && ['COMPARED', 'MERGED_FILES', 'MERGED_SINGLES', 'MERGED_COLLECTIONS'].includes(status)) && (
+                <Card>
+                    <div className="p-3">
+                        <Stepper
+                            ref={stepperRef}
+                            style={{width: '100%'}}
+                            orientation="vertical"
+                            activeStep={activeStep}
+                            linear={false}
+                            onChange={(event) => {
+                                const index = (event as any).index;
                                 setActiveStep(index);
-                                return;
-                            }
-                        }}>
-                        {/* Step 1: Schema Compatibility */}
-                        <StepperPanel header="Schema Compatibility">
-                            <SchemaCompatibilityStep
-                                schemaCompatible={mergeRequestDetail.mergeRequest.status === 'SCHEMA_CHECKED' || mergeRequestDetail.mergeRequest.status === 'COMPARED' || mergeRequestDetail.mergeRequest.status === 'MERGED_FILES' || mergeRequestDetail.mergeRequest.status === 'MERGED_SINGLES' || mergeRequestDetail.mergeRequest.status === 'MERGED_COLLECTIONS' || mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
-                                checkingSchema={checkingSchema}
-                                checkSchemaCompatibility={checkSchemaCompatibility}
-                            />
-                            <div className="flex py-4 justify-content-end">
-                                <Button
-                                    label="Next"
-                                    icon="pi pi-arrow-right"
-                                    iconPos="right"
-                                    disabled={mergeRequestDetail.mergeRequest.status === 'CREATED'}
-                                    onClick={() => stepperRef.current.nextCallback()}
-                                />
-                            </div>
-                        </StepperPanel>
+                            }}>
 
-                        {/* Step 2: Content Comparison */}
-                        <StepperPanel header="Content Comparison">
-                            <ContentComparisonStep
-                                comparingContent={comparingContent}
-                                schemaCompatible={mergeRequestDetail.mergeRequest.status !== 'CREATED'}
-                                compareContent={compareContent}
-                                status={mergeRequestDetail.mergeRequest.status}
-                            />
-                            <div className="flex py-4 gap-2 justify-content-between">
-                                <Button
-                                    label="Back"
-                                    severity="secondary"
-                                    icon="pi pi-arrow-left"
-                                    disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
-                                    onClick={() => {
-                                        if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
-                                            toast.current?.show({
-                                                severity: 'info',
-                                                summary: 'Merge Completed',
-                                                detail: 'This merge request has been completed and cannot be modified.',
-                                                life: 3000
-                                            });
-                                            return;
-                                        }
-                                        stepperRef.current.prevCallback();
-                                    }}
+                            {/* Step 3: Merge Files */}
+                            <StepperPanel header="Merge Files">
+                                <MergeFilesStep
+                                    mergeRequestId={mergeRequestDetail.mergeRequest.id}
+                                    filesData={mergeRequestDetail.mergeRequestData?.files}
+                                    loading={false}
+                                    updateAllSelections={updateAllSelections}
+                                    selections={mergeRequestDetail.mergeRequestData?.selections || []}
+                                    allMergeData={mergeRequestDetail.mergeRequestData!}
+                                    onSaved={updateMergeData}
                                 />
-                                <Button
-                                    label="Next"
-                                    icon="pi pi-arrow-right"
-                                    iconPos="right"
-                                    disabled={mergeRequestDetail.mergeRequest.status !== 'COMPARED' &&
-                                        mergeRequestDetail.mergeRequest.status !== 'MERGED_FILES' &&
-                                        mergeRequestDetail.mergeRequest.status !== 'MERGED_SINGLES' &&
-                                        mergeRequestDetail.mergeRequest.status !== 'MERGED_COLLECTIONS' &&
-                                        mergeRequestDetail.mergeRequest.status !== 'COMPLETED'}
-                                    onClick={() => {
-                                        if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
-                                            toast.current?.show({
-                                                severity: 'info',
-                                                summary: 'Merge Completed',
-                                                detail: 'This merge request has been completed and cannot be modified.',
-                                                life: 3000
-                                            });
-                                            return;
-                                        }
-                                        stepperRef.current.nextCallback();
-                                    }}
-                                />
-                            </div>
-                        </StepperPanel>
+                                <div className="flex py-4 gap-2 justify-content-between">
+                                    <Button
+                                        label="Back"
+                                        severity="secondary"
+                                        icon="pi pi-arrow-left"
+                                        disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
+                                        onClick={() => {
+                                            if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
+                                                toast.current?.show({
+                                                    severity: 'info',
+                                                    summary: 'Merge Completed',
+                                                    detail: 'This merge request has been completed and cannot be modified.',
+                                                    life: 3000
+                                                });
+                                                return;
+                                            }
+                                            stepperRef.current.prevCallback();
+                                        }}
+                                    />
+                                    <Button
+                                        label="Next"
+                                        icon="pi pi-arrow-right"
+                                        iconPos="right"
+                                        disabled={mergeRequestDetail.mergeRequest.status !== 'COMPARED' && mergeRequestDetail.mergeRequest.status !== 'MERGED_FILES' && mergeRequestDetail.mergeRequest.status !== 'MERGED_SINGLES' && mergeRequestDetail.mergeRequest.status !== 'MERGED_COLLECTIONS' && mergeRequestDetail.mergeRequest.status !== 'COMPLETED'}
+                                        onClick={() => {
+                                            if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
+                                                toast.current?.show({
+                                                    severity: 'info',
+                                                    summary: 'Merge Completed',
+                                                    detail: 'This merge request has been completed and cannot be modified.',
+                                                    life: 3000
+                                                });
+                                                return;
+                                            }
+                                            proceedToNextStep(1).catch(error => {
+                                                toast.current?.show({
+                                                    severity: 'error',
+                                                    summary: 'Error',
+                                                    detail: error,
+                                                    life: 3000
 
-                        {/* Step 3: Merge Files */}
-                        <StepperPanel header="Merge Files">
-                            <MergeFilesStep
-                                mergeRequestId={mergeRequestDetail.mergeRequest.id}
-                                filesData={mergeRequestDetail.mergeRequestData?.files}
-                                loading={false}
-                                updateSingleSelection={updateSingleSelection}
-                                updateAllSelections={updateAllSelections}
-                                selections={mergeRequestDetail.mergeRequestData?.selections}
-                            />
-                            <div className="flex py-4 gap-2 justify-content-between">
-                                <Button
-                                    label="Back"
-                                    severity="secondary"
-                                    icon="pi pi-arrow-left"
-                                    disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
-                                    onClick={() => {
-                                        if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
-                                            toast.current?.show({
-                                                severity: 'info',
-                                                summary: 'Merge Completed',
-                                                detail: 'This merge request has been completed and cannot be modified.',
-                                                life: 3000
-                                            });
-                                            return;
-                                        }
-                                        stepperRef.current.prevCallback();
-                                    }}
-                                />
-                                <Button
-                                    label="Next"
-                                    icon="pi pi-arrow-right"
-                                    iconPos="right"
-                                    disabled={mergeRequestDetail.mergeRequest.status !== 'COMPARED' && mergeRequestDetail.mergeRequest.status !== 'MERGED_FILES' && mergeRequestDetail.mergeRequest.status !== 'MERGED_SINGLES' && mergeRequestDetail.mergeRequest.status !== 'MERGED_COLLECTIONS' && mergeRequestDetail.mergeRequest.status !== 'COMPLETED'}
-                                    onClick={() => {
-                                        if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
-                                            toast.current?.show({
-                                                severity: 'info',
-                                                summary: 'Merge Completed',
-                                                detail: 'This merge request has been completed and cannot be modified.',
-                                                life: 3000
-                                            });
-                                            return;
-                                        }
-                                        proceedToNextStep(3);
-                                    }}
-                                />
-                            </div>
-                        </StepperPanel>
+                                                })
+                                            })
+                                        }}
+                                    />
+                                </div>
+                            </StepperPanel>
 
-                        {/* Step 4: Merge Single Types */}
-                        <StepperPanel header="Merge Single Types">
-                            <MergeSingleTypesStep
-                                status={mergeRequestDetail.mergeRequest.status}
-                                mergingSingles={mergingSingles}
-                                mergeSingleTypes={mergeSingleTypes}
-                                mergeRequestId={parseInt(id || '0')}
-                                singleTypesData={mergeRequestDetail.mergeRequestData?.singleTypes}
-                                selections={mergeRequestDetail.mergeRequestData?.selections}
-                                loading={false}
-                                allMergeData={mergeRequestDetail.mergeRequestData}
-                                updateSingleSelection={updateSingleSelection}
-                            />
-                            <div className="flex py-4 gap-2 justify-content-between">
-                                <Button
-                                    label="Back"
-                                    severity="secondary"
-                                    icon="pi pi-arrow-left"
-                                    disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
-                                    onClick={() => {
-                                        if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
-                                            toast.current?.show({
-                                                severity: 'info',
-                                                summary: 'Merge Completed',
-                                                detail: 'This merge request has been completed and cannot be modified.',
-                                                life: 3000
-                                            });
-                                            return;
-                                        }
-                                        stepperRef.current.prevCallback();
-                                    }}
-                                />
-                                <Button
-                                    label="Next"
-                                    icon="pi pi-arrow-right"
-                                    iconPos="right"
-                                    disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
-                                    onClick={() => {
-                                        if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
-                                            toast.current?.show({
-                                                severity: 'info',
-                                                summary: 'Merge Completed',
-                                                detail: 'This merge request has been completed and cannot be modified.',
-                                                life: 3000
-                                            });
-                                            return;
-                                        }
-                                        proceedToNextStep(4);
-                                    }}
-                                />
-                            </div>
-                        </StepperPanel>
+                            {/* Step 4: Merge Single Types */}
+                            <StepperPanel header="Merge Single Types">
+                                {(() => {
 
-                        {/* Step 5: Merge Collections */}
-                        <StepperPanel header="Merge Collections">
-                            <MergeCollectionsStep
-                                status={mergeRequestDetail.mergeRequest.status}
-                                mergingCollections={mergingCollections}
-                                mergeCollections={mergeCollections}
-                                mergeRequestId={parseInt(id || '0')}
-                                collectionTypesData={mergeRequestDetail.mergeRequestData?.collectionTypes}
-                                selections={mergeRequestDetail.mergeRequestData?.selections}
-                                contentTypeRelationships={mergeRequestDetail.mergeRequestData?.contentTypeRelationships}
-                                loading={false}
-                                allMergeData={mergeRequestDetail.mergeRequestData}
-                            />
-                            <div className="flex py-4 gap-2 justify-content-between">
-                                <Button
-                                    label="Back"
-                                    severity="secondary"
-                                    icon="pi pi-arrow-left"
-                                    disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
-                                    onClick={() => {
-                                        if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
-                                            toast.current?.show({
-                                                severity: 'info',
-                                                summary: 'Merge Completed',
-                                                detail: 'This merge request has been completed and cannot be modified.',
-                                                life: 3000
-                                            });
-                                            return;
-                                        }
-                                        stepperRef.current.prevCallback();
-                                    }}
-                                />
-                                <Button
-                                    label="Next"
-                                    icon="pi pi-arrow-right"
-                                    iconPos="right"
-                                    disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
-                                    onClick={() => {
-                                        if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
-                                            toast.current?.show({
-                                                severity: 'info',
-                                                summary: 'Merge Completed',
-                                                detail: 'This merge request has been completed and cannot be modified.',
-                                                life: 3000
-                                            });
-                                            return;
-                                        }
-                                        proceedToNextStep(5);
-                                    }}
-                                />
-                            </div>
-                        </StepperPanel>
+                                    const arrayTypes: Record<string, ContentTypeComparisonResultWithRelationships[]> = mergeRequestDetail.mergeRequestData?.singleTypes ? Object.entries(mergeRequestDetail.mergeRequestData?.singleTypes).reduce(
+                                        (acc, [key, value]) => {
+                                            acc[key] = [value];
+                                            return acc;
+                                        },
+                                        {} as Record<string, ContentTypeComparisonResultWithRelationships[]>
+                                    ) : {} as Record<string, ContentTypeComparisonResultWithRelationships[]>
 
-                        {/* Step 6: Complete */}
-                        <StepperPanel header="Complete">
-                            <CompleteMergeStep
-                                status={mergeRequestDetail.mergeRequest.status}
-                                completing={completing}
-                                completeMerge={completeMerge}
-                                selections={mergeRequestDetail.mergeRequestData?.selections}
-                                allMergeData={mergeRequestDetail.mergeRequestData}
-                            />
-                            { mergeRequestDetail.mergeRequest.status !== 'COMPLETED' &&
-                            <div className="flex py-4">
-                                <Button
-                                    label="Back"
-                                    severity="secondary"
-                                    icon="pi pi-arrow-left"
-                                    disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
-                                    onClick={() => {
-                                        if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
-                                            toast.current?.show({
-                                                severity: 'info',
-                                                summary: 'Merge Completed',
-                                                detail: 'This merge request has been completed and cannot be modified.',
-                                                life: 3000
-                                            });
-                                            return;
-                                        }
-                                        stepperRef.current.prevCallback();
-                                    }}
-                                />
-                            </div>
-                            }
-                        </StepperPanel>
-                    </Stepper>
-                </div>
-            </Card>
+                                    return <MergeSingleTypesStep
+                                        kind={StrapiContentTypeKind.SingleType}
+                                        status={mergeRequestDetail.mergeRequest.status}
+                                        mergeSingleTypes={mergeSingleTypes}
+                                        mergeRequestId={parseInt(id || '0')}
+                                        contentData={arrayTypes}
+                                        selections={mergeRequestDetail.mergeRequestData?.selections || []}
+                                        loading={false}
+                                        allMergeData={mergeRequestDetail.mergeRequestData!}
+                                        updateAllSelections={updateAllSelections}
+                                        onSaved={updateMergeData}
+                                    />
+                                })()}
+                                <div className="flex py-4 gap-2 justify-content-between">
+                                    <Button
+                                        label="Back"
+                                        severity="secondary"
+                                        icon="pi pi-arrow-left"
+                                        disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
+                                        onClick={() => {
+                                            if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
+                                                toast.current?.show({
+                                                    severity: 'info',
+                                                    summary: 'Merge Completed',
+                                                    detail: 'This merge request has been completed and cannot be modified.',
+                                                    life: 3000
+                                                });
+                                                return;
+                                            }
+                                            stepperRef.current.prevCallback();
+                                        }}
+                                    />
+                                    <Button
+                                        label="Next"
+                                        icon="pi pi-arrow-right"
+                                        iconPos="right"
+                                        disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
+                                        onClick={() => {
+                                            if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
+                                                toast.current?.show({
+                                                    severity: 'info',
+                                                    summary: 'Merge Completed',
+                                                    detail: 'This merge request has been completed and cannot be modified.',
+                                                    life: 3000
+                                                });
+                                                return;
+                                            }
+                                            proceedToNextStep(2).catch(error => {
+                                                toast.current?.show({
+                                                    severity: 'error',
+                                                    summary: 'Error',
+                                                    detail: error,
+                                                    life: 3000
+
+                                                })
+                                            })
+                                        }}
+                                    />
+                                </div>
+                            </StepperPanel>
+
+                            {/* Step 5: Merge Collections */}
+                            <StepperPanel header="Merge Collections">
+                                {mergeRequestDetail.mergeRequestData && (
+                                    <MergeCollectionsStep
+                                        status={mergeRequestDetail.mergeRequest.status}
+                                        mergingCollections={mergingCollections}
+                                        mergeCollections={mergeCollections}
+                                        mergeRequestId={parseInt(id || '0')}
+                                        collectionTypesData={mergeRequestDetail.mergeRequestData?.collectionTypes}
+                                        selections={mergeRequestDetail.mergeRequestData?.selections}
+                                        allMergeData={mergeRequestDetail.mergeRequestData!}
+                                        updateAllSelections={updateAllSelections}
+                                        onSaved={updateMergeData}
+                                    />
+                                )}
+                                <div className="flex py-4 gap-2 justify-content-between">
+                                    <Button
+                                        label="Back"
+                                        severity="secondary"
+                                        icon="pi pi-arrow-left"
+                                        disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
+                                        onClick={() => {
+                                            if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
+                                                toast.current?.show({
+                                                    severity: 'info',
+                                                    summary: 'Merge Completed',
+                                                    detail: 'This merge request has been completed and cannot be modified.',
+                                                    life: 3000
+                                                });
+                                                return;
+                                            }
+                                            stepperRef.current.prevCallback();
+                                        }}
+                                    />
+                                    <Button
+                                        label="Next"
+                                        icon="pi pi-arrow-right"
+                                        iconPos="right"
+                                        disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
+                                        onClick={() => {
+                                            if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
+                                                toast.current?.show({
+                                                    severity: 'info',
+                                                    summary: 'Merge Completed',
+                                                    detail: 'This merge request has been completed and cannot be modified.',
+                                                    life: 3000
+                                                });
+                                                return;
+                                            }
+                                            proceedToNextStep(2).catch(error => {
+                                                toast.current?.show({
+                                                    severity: 'error',
+                                                    summary: 'Error',
+                                                    detail: error,
+                                                    life: 3000
+
+                                                })
+                                            })
+                                        }}
+                                    />
+                                </div>
+                            </StepperPanel>
+
+                        </Stepper>
+                    </div>
+                </Card>
+            )}
+
+            {(['MERGED_COLLECTIONS', 'IN_PROGRESS', 'COMPLETED', 'FAILED'].includes(status)) && (
+                <Card className="mt-4">
+                    <div className="p-3">
+                        <CompleteMergeStep
+                            status={mergeRequestDetail.mergeRequest.status}
+                            completing={completing}
+                            completeMerge={completeMerge}
+                            selections={mergeRequestDetail.mergeRequestData?.selections}
+                            allMergeData={mergeRequestDetail.mergeRequestData}
+                        />
+                    </div>
+                </Card>
+            )}
         </div>
     );
 };

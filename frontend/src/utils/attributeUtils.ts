@@ -2,11 +2,13 @@
  * Utility functions for handling attributes in entries
  */
 
+import {StrapiContent} from "../types";
+
 /**
  * Extract representative attributes from an entry
  * This function is used by both MergeCollectionsStep and MergeSingleTypesStep
  */
-export const getRepresentativeAttributes = (entry: any, maxAttributes: number = 3): { key: string, value: string }[] => {
+export const getRepresentativeAttributes = (entry: StrapiContent, maxAttributes: number = 3): { key: string, value: string }[] => {
     if (!entry) return [];
 
     // If entry is a StrapiContent, use its rawData

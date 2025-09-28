@@ -53,7 +53,13 @@ enum class StrapiContentTypeKind(val value: String) {
     SingleType("singleType"),
 
     @SerialName("collectionType")
-    CollectionType("collectionType")
+    CollectionType("collectionType"),
+
+    @SerialName("files")
+    Files("files"),
+
+    @SerialName("component")
+    Component("files")
 }
 
 
@@ -81,6 +87,12 @@ data class Schema(
             pluralName
 
         }
+        StrapiContentTypeKind.Files -> {
+            "files"
+        }
+        StrapiContentTypeKind.Component -> {
+            "components"
+        }
     }
 
     val kebabCaseKind =  when (kind) {
@@ -89,7 +101,12 @@ data class Schema(
         }
         StrapiContentTypeKind.CollectionType -> {
             "collection-types"
-
+        }
+        StrapiContentTypeKind.Files -> {
+            "files"
+        }
+        StrapiContentTypeKind.Component -> {
+            "components"
         }
     }
 }

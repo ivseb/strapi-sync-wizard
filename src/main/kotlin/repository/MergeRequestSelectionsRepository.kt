@@ -4,17 +4,16 @@ import it.sebi.database.dbQuery
 import it.sebi.models.Direction
 import it.sebi.models.MergeRequestSelection
 import it.sebi.models.MergeRequestSelectionDTO
-import it.sebi.models.SelectionStatusInfo
-import it.sebi.models.STRAPI_FILE_CONTENT_TYPE_NAME
 import it.sebi.tables.MergeRequestSelectionsTable
-import org.jetbrains.exposed.v1.core.SqlExpressionBuilder.eq
-import org.jetbrains.exposed.v1.core.SqlExpressionBuilder.inList
 import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.inList
+import org.jetbrains.exposed.v1.jdbc.batchInsert
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
-import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.update
 import java.time.OffsetDateTime
+import org.jetbrains.exposed.v1.core.neq
 
 class MergeRequestSelectionsRepository {
 
@@ -27,7 +26,7 @@ class MergeRequestSelectionsRepository {
                 MergeRequestSelection(
                     id = it[MergeRequestSelectionsTable.id].value,
                     mergeRequestId = it[MergeRequestSelectionsTable.mergeRequestId].value,
-                    contentType = it[MergeRequestSelectionsTable.contentType],
+                    tableName = it[MergeRequestSelectionsTable.table],
                     documentId = it[MergeRequestSelectionsTable.documentId],
                     direction = it[MergeRequestSelectionsTable.direction],
                     createdAt = it[MergeRequestSelectionsTable.createdAt],
@@ -35,20 +34,20 @@ class MergeRequestSelectionsRepository {
                     syncFailureResponse = it[MergeRequestSelectionsTable.syncFailureResponse],
                     syncDate = it[MergeRequestSelectionsTable.syncDate]
                 )
-            }
+            }.toList()
     }
 
     /**
      * Get selections for a merge request grouped by content type
      */
-    suspend fun getSelectionsGroupedByContentType(mergeRequestId: Int): List<MergeRequestSelectionDTO> = dbQuery {
+    suspend fun getSelectionsGroupedByTableName(mergeRequestId: Int): List<MergeRequestSelectionDTO> = dbQuery {
         val selections = MergeRequestSelectionsTable.selectAll()
             .where { MergeRequestSelectionsTable.mergeRequestId eq mergeRequestId }
             .map {
                 MergeRequestSelection(
                     id = it[MergeRequestSelectionsTable.id].value,
                     mergeRequestId = it[MergeRequestSelectionsTable.mergeRequestId].value,
-                    contentType = it[MergeRequestSelectionsTable.contentType],
+                    tableName = it[MergeRequestSelectionsTable.table],
                     documentId = it[MergeRequestSelectionsTable.documentId],
                     direction = it[MergeRequestSelectionsTable.direction],
                     createdAt = it[MergeRequestSelectionsTable.createdAt],
@@ -56,46 +55,17 @@ class MergeRequestSelectionsRepository {
                     syncFailureResponse = it[MergeRequestSelectionsTable.syncFailureResponse],
                     syncDate = it[MergeRequestSelectionsTable.syncDate]
                 )
-            }
+            }.toList()
 
         // Group selections by content type
-        val groupedSelections = selections.groupBy { it.contentType }
+        val groupedSelections = selections.groupBy { it.tableName }
 
         // Convert to DTOs
         groupedSelections.map { (contentType, entries) ->
-            val createEntries = entries.filter { it.direction == Direction.TO_CREATE }
-            val updateEntries = entries.filter { it.direction == Direction.TO_UPDATE }
-            val deleteEntries = entries.filter { it.direction == Direction.TO_DELETE }
 
             MergeRequestSelectionDTO(
-                contentType = contentType,
-                entriesToCreate = createEntries.map { it.documentId },
-                entriesToUpdate = updateEntries.map { it.documentId },
-                entriesToDelete = deleteEntries.map { it.documentId },
-                createStatus = createEntries.map { 
-                    SelectionStatusInfo(
-                        documentId = it.documentId,
-                        syncSuccess = it.syncSuccess,
-                        syncFailureResponse = it.syncFailureResponse,
-                        syncDate = it.syncDate
-                    )
-                },
-                updateStatus = updateEntries.map { 
-                    SelectionStatusInfo(
-                        documentId = it.documentId,
-                        syncSuccess = it.syncSuccess,
-                        syncFailureResponse = it.syncFailureResponse,
-                        syncDate = it.syncDate
-                    )
-                },
-                deleteStatus = deleteEntries.map { 
-                    SelectionStatusInfo(
-                        documentId = it.documentId,
-                        syncSuccess = it.syncSuccess,
-                        syncFailureResponse = it.syncFailureResponse,
-                        syncDate = it.syncDate
-                    )
-                }
+                tableName = contentType,
+                selections =  entries,
             )
         }
     }
@@ -105,140 +75,9 @@ class MergeRequestSelectionsRepository {
      */
     suspend fun deleteSelectionsForMergeRequest(mergeRequestId: Int): Boolean = dbQuery {
         MergeRequestSelectionsTable.deleteWhere { MergeRequestSelectionsTable.mergeRequestId eq  mergeRequestId } > 0
-    } /**
-     * Delete all selections for a merge request
-     */
-    suspend fun deleteAllFiles(mergeRequestId: Int): Boolean = dbQuery {
-        MergeRequestSelectionsTable.deleteWhere { MergeRequestSelectionsTable.mergeRequestId eq mergeRequestId and (MergeRequestSelectionsTable.contentType eq STRAPI_FILE_CONTENT_TYPE_NAME) } > 0
-    }
-
-    /**
-     * Create a new selection
-     */
-    suspend fun createSelection(
-        mergeRequestId: Int,
-        contentType: String,
-        documentId: String,
-        direction: Direction
-    ): MergeRequestSelection = dbQuery {
-        val insertStatement = MergeRequestSelectionsTable.insert {
-            it[MergeRequestSelectionsTable.mergeRequestId] = mergeRequestId
-            it[MergeRequestSelectionsTable.contentType] = contentType
-            it[MergeRequestSelectionsTable.documentId] = documentId
-            it[MergeRequestSelectionsTable.direction] = direction
-        }
-
-        val resultRow = insertStatement.resultedValues?.singleOrNull()
-            ?: throw IllegalStateException("Insert failed")
-
-        MergeRequestSelection(
-            id = resultRow[MergeRequestSelectionsTable.id].value,
-            mergeRequestId = resultRow[MergeRequestSelectionsTable.mergeRequestId].value,
-            contentType = resultRow[MergeRequestSelectionsTable.contentType],
-            documentId = resultRow[MergeRequestSelectionsTable.documentId],
-            direction = resultRow[MergeRequestSelectionsTable.direction],
-            createdAt = resultRow[MergeRequestSelectionsTable.createdAt]
-        )
     }
 
 
-    /**
-     * Update a single selection for a merge request
-     * Adds or removes a selection based on the isSelected parameter
-     */
-    suspend fun updateSingleSelection(
-        mergeRequestId: Int,
-        contentType: String,
-        documentId: String,
-        direction: Direction,
-        isSelected: Boolean
-    ): Boolean = dbQuery {
-        if (isSelected) {
-            // Check if the selection already exists
-            val existingSelection = MergeRequestSelectionsTable.selectAll()
-                .where {
-                    (MergeRequestSelectionsTable.mergeRequestId eq mergeRequestId) and
-                    (MergeRequestSelectionsTable.contentType eq contentType) and
-                    (MergeRequestSelectionsTable.documentId eq documentId) and
-                    (MergeRequestSelectionsTable.direction eq direction)
-                }
-                .toList().map { it[MergeRequestSelectionsTable.id].value }
-
-            if (existingSelection.isEmpty()) {
-                // Add the selection
-                MergeRequestSelectionsTable.insert {
-                    it[MergeRequestSelectionsTable.mergeRequestId] = mergeRequestId
-                    it[MergeRequestSelectionsTable.contentType] = contentType
-                    it[MergeRequestSelectionsTable.documentId] = documentId
-                    it[MergeRequestSelectionsTable.direction] = direction
-                }
-            } else if(existingSelection.size > 1) {
-                MergeRequestSelectionsTable.deleteWhere { MergeRequestSelectionsTable.id inList  existingSelection.drop(1) }
-            }
-            true
-        } else {
-            // Remove the selection
-            val deleted = MergeRequestSelectionsTable.deleteWhere {
-                (MergeRequestSelectionsTable.mergeRequestId eq mergeRequestId) and
-                (MergeRequestSelectionsTable.contentType eq contentType) and
-                (MergeRequestSelectionsTable.documentId eq documentId) and
-                (MergeRequestSelectionsTable.direction eq direction)
-            } > 0
-            deleted
-        }
-    }
-
-    /**
-     * Update all selections for a specific content type and direction
-     * Adds or removes all selections based on the isSelected parameter
-     */
-    suspend fun updateAllSelections(
-        mergeRequestId: Int,
-        contentType: String,
-        direction: Direction,
-        documentIds: List<String>,
-        isSelected: Boolean
-    ): Boolean = dbQuery {
-        if (isSelected) {
-            // Add all selections that don't already exist
-            documentIds.forEach { documentId ->
-                // Check if the selection already exists
-                val existingSelection = MergeRequestSelectionsTable.selectAll()
-                    .where {
-                        (MergeRequestSelectionsTable.mergeRequestId eq mergeRequestId) and
-                        (MergeRequestSelectionsTable.contentType eq contentType) and
-                        (MergeRequestSelectionsTable.documentId eq documentId) and
-                        (MergeRequestSelectionsTable.direction eq direction)
-                    }
-                    .singleOrNull()
-
-                if (existingSelection == null) {
-                    // Add the selection
-                    MergeRequestSelectionsTable.insert {
-                        it[MergeRequestSelectionsTable.mergeRequestId] = mergeRequestId
-                        it[MergeRequestSelectionsTable.contentType] = contentType
-                        it[MergeRequestSelectionsTable.documentId] = documentId
-                        it[MergeRequestSelectionsTable.direction] = direction
-                    }
-                }
-            }
-            true
-        } else {
-            // Remove all selections for this content type and direction
-            // Since we can't use 'inList' directly, we'll delete each document ID individually
-            var anyDeleted = false
-            documentIds.forEach { documentId ->
-                val deleted = MergeRequestSelectionsTable.deleteWhere {
-                    (MergeRequestSelectionsTable.mergeRequestId eq mergeRequestId) and
-                    (MergeRequestSelectionsTable.contentType eq contentType) and
-                    (MergeRequestSelectionsTable.documentId eq documentId) and
-                    (MergeRequestSelectionsTable.direction eq direction)
-                } > 0
-                if (deleted) anyDeleted = true
-            }
-            anyDeleted
-        }
-    }
 
     /**
      * Update the sync status of a selection
@@ -247,11 +86,134 @@ class MergeRequestSelectionsRepository {
         id: Int,
         success: Boolean,
         failureResponse: String? = null
+    ): Boolean {
+        // Perform DB update and gather data needed for SSE update
+        data class RowData(
+            val mergeRequestId: Int,
+            val tableName: String,
+            val documentId: String,
+            val direction: Direction,
+            val totalItems: Int,
+            val processedItems: Int
+        )
+        val row: RowData? = dbQuery {
+            // Update row first
+            val updated = MergeRequestSelectionsTable.update({ MergeRequestSelectionsTable.id eq id }) {
+                it[syncSuccess] = success
+                it[syncFailureResponse] = failureResponse
+                it[syncDate] = OffsetDateTime.now()
+            } > 0
+
+            // If not updated, return null
+            if (!updated) return@dbQuery null
+
+            // Fetch the selection row data
+            val sel = MergeRequestSelectionsTable.selectAll()
+                .where { MergeRequestSelectionsTable.id eq id }
+                .single()
+
+            val mrId = sel[MergeRequestSelectionsTable.mergeRequestId].value
+            val tableName = sel[MergeRequestSelectionsTable.table]
+            val documentId = sel[MergeRequestSelectionsTable.documentId]
+            val direction = sel[MergeRequestSelectionsTable.direction]
+
+            // Compute counts
+            val totalItems = MergeRequestSelectionsTable.selectAll()
+                .where { MergeRequestSelectionsTable.mergeRequestId eq mrId }
+                .count().toInt()
+            val processedItems = MergeRequestSelectionsTable.selectAll()
+                .where { (MergeRequestSelectionsTable.mergeRequestId eq mrId) and (MergeRequestSelectionsTable.syncDate neq null) }
+                .count().toInt()
+
+            RowData(
+                mergeRequestId = mrId,
+                tableName = tableName,
+                documentId = documentId,
+                direction = direction,
+                totalItems = totalItems,
+                processedItems = processedItems
+            )
+        }
+
+        if (row != null) {
+            // Emit SSE progress update
+            try {
+                it.sebi.SyncProgressService.sendProgressUpdate(
+                    it.sebi.SyncProgressUpdate(
+                        mergeRequestId = row.mergeRequestId,
+                        totalItems = row.totalItems,
+                        processedItems = row.processedItems,
+                        currentItem = "${row.tableName}:${row.documentId}",
+                        currentItemType = row.tableName,
+                        currentOperation = row.direction.name,
+                        status = if (success) "SUCCESS" else "ERROR",
+                        message = failureResponse
+                    )
+                )
+            } catch (_: Exception) {
+                // Ignore SSE errors
+            }
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Bulk upsert (insert if not exists) and bulk delete of selections.
+     * This method minimizes queries by:
+     * - Fetching existing selections once
+     * - Inserting only missing rows
+     * - Deleting grouped by (contentType, direction) with documentId IN (...)
+     */
+    suspend fun bulkUpsertAndDelete(
+        mergeRequestId: Int,
+        upserts: List<Triple<String, String, Direction>>,
+        deletes: List<Triple<String, String, Direction>>
     ): Boolean = dbQuery {
-        MergeRequestSelectionsTable.update({ MergeRequestSelectionsTable.id eq id }) {
-            it[syncSuccess] = success
-            it[syncFailureResponse] = failureResponse
-            it[syncDate] = OffsetDateTime.now()
-        } > 0
+        val distinctUpserts = upserts.distinct()
+        val distinctDeletes = deletes.distinct()
+
+        // Load all existing keys for this MR once
+        val existingKeys: Set<Triple<String, String, Direction>> = MergeRequestSelectionsTable
+            .selectAll()
+            .where { MergeRequestSelectionsTable.mergeRequestId eq mergeRequestId }
+            .map {
+                Triple(
+                    it[MergeRequestSelectionsTable.table],
+                    it[MergeRequestSelectionsTable.documentId],
+                    it[MergeRequestSelectionsTable.direction]
+                )
+            }
+            .toSet()
+
+        // Compute missing inserts
+        val toInsert = distinctUpserts.filterNot { existingKeys.contains(it) }
+
+
+        MergeRequestSelectionsTable.batchInsert(toInsert) { (contentType, documentId, direction) ->
+            this[MergeRequestSelectionsTable.mergeRequestId] = mergeRequestId
+            this[MergeRequestSelectionsTable.table] = contentType
+            this[MergeRequestSelectionsTable.documentId] = documentId
+            this[MergeRequestSelectionsTable.direction] = direction
+        }
+
+        // Perform deletes grouping by (contentType, direction)
+        val deletesByGroup: Map<Pair<String, Direction>, List<String>> = distinctDeletes
+            .groupBy({ it.first to it.third }, { it.second })
+            .mapValues { (_, docs) -> docs.distinct() }
+
+
+        for ((key, docs) in deletesByGroup) {
+            val (contentType, direction) = key
+            if (docs.isEmpty()) continue
+            MergeRequestSelectionsTable.deleteWhere {
+                (MergeRequestSelectionsTable.mergeRequestId eq mergeRequestId) and
+                (MergeRequestSelectionsTable.table eq contentType) and
+                (MergeRequestSelectionsTable.direction eq direction) and
+                (MergeRequestSelectionsTable.documentId inList docs)
+            }
+        }
+
+        true
     }
 }

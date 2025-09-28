@@ -9,12 +9,11 @@ import {DataTable} from 'primereact/datatable';
 import {Column} from 'primereact/column';
 import {TabView, TabPanel} from 'primereact/tabview';
 import {Card} from 'primereact/card';
-import {MergeRequestSelectionDTO, MergeRequestData, SelectionStatusInfo} from '../../types';
+import {MergeRequestSelectionDTO, MergeRequestData, MergeRequestSelection, StrapiContent, SyncPlanDTO} from '../../types';
 import { getRepresentativeAttributes } from '../../utils/attributeUtils';
 import EditorDialog from '../common/EditorDialog';
+import SyncPlanGraph from './components/SyncPlanGraph';
 
-// Content type for files
-const STRAPI_FILE_CONTENT_TYPE_NAME = "plugin::upload.file";
 
 // Interface for sync progress updates from the WebSocket
 interface SyncProgressUpdate {
@@ -44,9 +43,9 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                                                                  allMergeData
                                                              }) => {
     // Count total items for each operation type
-    const totalToCreate = selections.reduce((sum, selection) => sum + selection.entriesToCreate.length, 0);
-    const totalToUpdate = selections.reduce((sum, selection) => sum + selection.entriesToUpdate.length, 0);
-    const totalToDelete = selections.reduce((sum, selection) => sum + selection.entriesToDelete.length, 0);
+    const totalToCreate = selections.reduce((sum, dto) => sum + ((dto.selections || []).filter(s => s.direction === 'TO_CREATE').length), 0);
+    const totalToUpdate = selections.reduce((sum, dto) => sum + ((dto.selections || []).filter(s => s.direction === 'TO_UPDATE').length), 0);
+    const totalToDelete = selections.reduce((sum, dto) => sum + ((dto.selections || []).filter(s => s.direction === 'TO_DELETE').length), 0);
     const totalItems = totalToCreate + totalToUpdate + totalToDelete;
 
     // State for editor modal
@@ -56,6 +55,7 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
     const [originalContent, setOriginalContent] = useState<any>(null);
     const [modifiedContent, setModifiedContent] = useState<any>(null);
     const [editorDialogHeader, setEditorDialogHeader] = useState<string>("View Content");
+    const [editorErrorMessage, setEditorErrorMessage] = useState<string | undefined>(undefined);
 
     // State for sync progress
     const [syncProgress, setSyncProgress] = useState<SyncProgressUpdate | null>(null);
@@ -70,6 +70,60 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
     // Reference for Toast component
     const toast = useRef<Toast>(null);
 
+    // Sync plan state
+    const [syncPlan, setSyncPlan] = useState<SyncPlanDTO | null>(null);
+    const [planLoading, setPlanLoading] = useState<boolean>(false);
+    const [planError, setPlanError] = useState<string | null>(null);
+
+    // Load sync plan to preview order before starting
+    const loadPlan = () => {
+        const urlParts = window.location.pathname.split('/');
+        const last = urlParts[urlParts.length - 1];
+        const mergeRequestId = parseInt(last, 10);
+        if (isNaN(mergeRequestId)) return;
+        setPlanLoading(true);
+        setPlanError(null);
+        fetch(`/api/merge-requests/${mergeRequestId}/sync-plan`)
+            .then(res => {
+                if (!res.ok) throw new Error(`Failed to load sync plan (HTTP ${res.status})`);
+                return res.json();
+            })
+            .then((data: SyncPlanDTO) => setSyncPlan(data))
+            .catch(err => setPlanError(err.message || 'Failed to load sync plan'))
+            .finally(() => setPlanLoading(false));
+    };
+
+    useEffect(() => {
+        loadPlan();
+        // re-load if selection counts change
+    }, [selections?.length]);
+
+    // Align initial node statuses with existing selection state when graph loads
+    useEffect(() => {
+        if (!syncPlan || syncInProgress) return;
+        // Build key set of plan items
+        const planKeys = new Set<string>();
+        (syncPlan.batches || []).forEach(batch => {
+            batch.forEach(it => {
+                planKeys.add(`${it.tableName}:${it.documentId}`);
+            });
+        });
+        const initial: Record<string, { status: string; message?: string }> = {};
+        (selections || []).forEach(dto => {
+            (dto.selections || []).forEach(sel => {
+                const key = `${dto.tableName}:${sel.documentId}`;
+                if (!planKeys.has(key)) return;
+                if (sel.syncSuccess === true) {
+                    initial[key] = { status: 'SUCCESS' };
+                } else if (sel.syncSuccess === false) {
+                    initial[key] = { status: 'ERROR', message: sel.syncFailureResponse || undefined };
+                }
+            });
+        });
+        // Merge with existing statuses without overriding live SSE updates
+        setSyncItemsStatus(prev => ({ ...initial, ...prev }));
+    }, [syncPlan, selections, syncInProgress]);
+
     // Effect to handle EventSource connection and cleanup
     useEffect(() => {
         return () => {
@@ -80,6 +134,8 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
             }
         };
     }, []);
+
+    const isDevelopment = window.location.hostname === 'localhost' && window.location.port === '3000';
 
     // Function to start the SSE connection for sync progress updates
     const startSyncProgressSSE = (mergeRequestId: number) => {
@@ -97,7 +153,9 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
         setSyncItemsStatus({});
 
         // Create new EventSource connection
-        const sseUrl = `/api/sync-progress/${mergeRequestId}`;
+        let sseUrl = `/api/sync-progress/${mergeRequestId}`;
+        if(isDevelopment)
+            sseUrl = `http://localhost:8080${sseUrl}`;
         const eventSource = new EventSource(sseUrl);
 
         // Handle connection open
@@ -110,24 +168,78 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
             console.log('SSE connected event received:', event);
         });
 
-        // Handle progress events
-        eventSource.addEventListener('progress', (event) => {
+        // Handle default message events (Ktor SSE sends unnamed events by default)
+        eventSource.onmessage = (event) => {
+            if (!event.data) return;
+            if (event.data === 'connected') return;
+            if (event.data === 'heartbeat') return;
+            console.log('SSE message received:', event);
             try {
+                debugger
                 const update: SyncProgressUpdate = JSON.parse(event.data);
-                console.log('Received sync progress update:', update);
+                console.log('Received sync progress update (message):', update);
 
                 // Update sync progress state
                 setSyncProgress(update);
 
-                // Update item status
+                // Update item status (use composite key table:documentId)
                 if (update.currentItem && update.currentItem !== 'Starting synchronization' && 
                     update.currentItem !== 'Processing content types' && 
                     update.currentItem !== 'Content types processed' &&
                     update.currentItem !== 'Synchronization completed' &&
                     update.currentItem !== 'Synchronization failed') {
+                    // Expect format "table:documentId"
+                    const parts = update.currentItem.split(':');
+                    const key = parts.length >= 2 ? `${parts[0]}:${parts.slice(1).join(':')}` : update.currentItem;
                     setSyncItemsStatus(prev => ({
                         ...prev,
-                        [update.currentItem]: {
+                        [key]: {
+                            status: update.status,
+                            message: update.message
+                        }
+                    }));
+                }
+
+                // Handle completion or failure
+                if (update.status === 'SUCCESS' && update.currentOperation === 'COMPLETED') {
+                    setSyncInProgress(false);
+                    setSyncCompleted(true);
+
+                    // Close EventSource connection
+                    eventSource.close();
+                } else if (update.status === 'ERROR') {
+                    setSyncInProgress(false);
+                    setSyncFailed(true);
+
+                    // Close EventSource connection
+                    eventSource.close();
+                }
+            } catch (error) {
+                console.error('Error parsing SSE message:', error);
+            }
+        };
+
+        // Backward compatibility: handle named 'progress' events if server uses them
+        eventSource.addEventListener('progress', (event) => {
+            try {
+                const update: SyncProgressUpdate = JSON.parse(event.data);
+                console.log('Received sync progress update (progress event):', update);
+
+                // Update sync progress state
+                setSyncProgress(update);
+
+                // Update item status (use composite key table:documentId)
+                if (update.currentItem && update.currentItem !== 'Starting synchronization' && 
+                    update.currentItem !== 'Processing content types' && 
+                    update.currentItem !== 'Content types processed' &&
+                    update.currentItem !== 'Synchronization completed' &&
+                    update.currentItem !== 'Synchronization failed') {
+                    // Expect format "table:documentId"
+                    const parts = update.currentItem.split(':');
+                    const key = parts.length >= 2 ? `${parts[0]}:${parts.slice(1).join(':')}` : update.currentItem;
+                    setSyncItemsStatus(prev => ({
+                        ...prev,
+                        [key]: {
                             status: update.status,
                             message: update.message
                         }
@@ -178,6 +290,7 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
             startSyncProgressSSE(mergeRequestId);
 
             // Call the original completeMerge function
+            //TODO: RESTORE
             completeMerge();
         } else {
             console.error('Could not determine merge request ID from URL');
@@ -197,23 +310,17 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
         if (!allMergeData) return null;
 
         // Handle file content type
-        if (contentType === STRAPI_FILE_CONTENT_TYPE_NAME) {
-            // Check in onlyInSource
-            const sourceFile = allMergeData.files.onlyInSource.find(file => 
-                file.metadata.documentId === documentId
-            );
+        if (contentType === 'files') {
+            // Check ONLY_IN_SOURCE
+            const sourceFile = allMergeData.files.find(f => f.compareState === 'ONLY_IN_SOURCE' && f.sourceImage?.metadata.documentId === documentId)?.sourceImage;
             if (sourceFile) return sourceFile;
 
-            // Check in different
-            const diffFile = allMergeData.files.different.find(file => 
-                file.source.metadata.documentId === documentId
-            );
-            if (diffFile) return diffFile.source;
+            // Check DIFFERENT
+            const diffEntry = allMergeData.files.find(f => f.compareState === 'DIFFERENT' && f.sourceImage?.metadata.documentId === documentId);
+            if (diffEntry?.sourceImage) return diffEntry.sourceImage;
 
-            // Check in onlyInTarget
-            const targetFile = allMergeData.files.onlyInTarget.find(file => 
-                file.metadata.documentId === documentId
-            );
+            // Check ONLY_IN_TARGET
+            const targetFile = allMergeData.files.find(f => f.compareState === 'ONLY_IN_TARGET' && f.targetImage?.metadata.documentId === documentId)?.targetImage;
             if (targetFile) return targetFile;
 
             return null;
@@ -223,45 +330,34 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
         if (allMergeData.singleTypes[contentType]) {
             const singleType = allMergeData.singleTypes[contentType];
 
-            // Check in onlyInSource
-            if (singleType.onlyInSource && singleType.onlyInSource.metadata.documentId === documentId) {
-                return singleType.onlyInSource;
+            if (singleType.sourceContent && singleType.sourceContent.metadata.documentId === documentId) {
+                return singleType.sourceContent.cleanData;
             }
-
-            // Check in different
-            if (singleType.different && singleType.different.source.metadata.documentId === documentId) {
-                return singleType.different.source;
+            if (singleType.targetContent && singleType.targetContent.metadata.documentId === documentId) {
+                return singleType.targetContent.cleanData;
             }
-
-            // Check in onlyInTarget
-            if (singleType.onlyInTarget && singleType.onlyInTarget.metadata.documentId === documentId) {
-                return singleType.onlyInTarget;
-            }
-
             return null;
         }
 
-        // Handle collection content types
+        // Handle collection content types (list-based)
         if (allMergeData.collectionTypes[contentType]) {
-            const collectionType = allMergeData.collectionTypes[contentType];
+            const entries = allMergeData.collectionTypes[contentType];
 
-            // Check in onlyInSource
-            const sourceEntry = collectionType.onlyInSource.find(entry => 
-                entry.metadata.documentId === documentId
-            );
-            if (sourceEntry) return sourceEntry;
+            // ONLY_IN_SOURCE -> return source
+            const src = entries.find(e => e.compareState === 'ONLY_IN_SOURCE' && e.sourceContent?.metadata.documentId === documentId)?.sourceContent;
+            if (src) return src.cleanData;
 
-            // Check in different
-            const diffEntry = collectionType.different.find(entry => 
-                entry.source.metadata.documentId === documentId
-            );
-            if (diffEntry) return diffEntry.source;
+            // DIFFERENT -> return source
+            const diff = entries.find(e => e.compareState === 'DIFFERENT' && e.sourceContent?.metadata.documentId === documentId)?.sourceContent;
+            if (diff) return diff.cleanData;
 
-            // Check in onlyInTarget
-            const targetEntry = collectionType.onlyInTarget.find(entry => 
-                entry.metadata.documentId === documentId
-            );
-            if (targetEntry) return targetEntry;
+            // ONLY_IN_TARGET -> return target
+            const tgt = entries.find(e => e.compareState === 'ONLY_IN_TARGET' && e.targetContent?.metadata.documentId === documentId)?.targetContent;
+            if (tgt) return tgt.cleanData;
+
+            // IDENTICAL -> return either
+            const ident = entries.find(e => e.compareState === 'IDENTICAL' && ((e.sourceContent && e.sourceContent.metadata.documentId === documentId) || (e.targetContent && e.targetContent.metadata.documentId === documentId)));
+            if (ident) return ident.sourceContent?.cleanData ?? ident.targetContent?.cleanData;
 
             return null;
         }
@@ -270,26 +366,17 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
     };
 
     // Function to find status info for a document
-    const findStatusInfo = (contentType: string, documentId: string, operation: 'create' | 'update' | 'delete'): SelectionStatusInfo | undefined => {
-        const selection = selections.find(s => s.contentType === contentType);
-        if (!selection) return undefined;
-
-        let statusList: SelectionStatusInfo[] = [];
-        if (operation === 'create' && selection.createStatus) {
-            statusList = selection.createStatus;
-        } else if (operation === 'update' && selection.updateStatus) {
-            statusList = selection.updateStatus;
-        } else if (operation === 'delete' && selection.deleteStatus) {
-            statusList = selection.deleteStatus;
-        }
-
-        return statusList.find(s => s.documentId === documentId);
+    const findStatusInfo = (contentType: string, documentId: string, operation: 'create' | 'update' | 'delete'): MergeRequestSelection | undefined => {
+        const dto = selections.find(s => s.tableName === contentType);
+        if (!dto) return undefined;
+        const dir = operation === 'create' ? 'TO_CREATE' : operation === 'update' ? 'TO_UPDATE' : 'TO_DELETE';
+        return (dto.selections || []).find(s => s.documentId === documentId && s.direction === dir);
     };
 
     // Function to render status badge
-    const renderStatusBadge = (status: SelectionStatusInfo | undefined, contentType: string, documentId: string) => {
-        // Check if we have live status from WebSocket
-        const liveStatus = syncItemsStatus[documentId];
+    const renderStatusBadge = (status: MergeRequestSelection | undefined, contentType: string, documentId: string) => {
+        // Check if we have live status from SSE (composite key table:documentId)
+        const liveStatus = syncItemsStatus[`${contentType}:${documentId}`];
 
         if (liveStatus) {
             if (liveStatus.status === 'SUCCESS') {
@@ -354,7 +441,7 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
         const { isUpdate, source, target } = isUpdateEntry(contentType, documentId);
 
         // Handle file content type (show image)
-        if (contentType === STRAPI_FILE_CONTENT_TYPE_NAME) {
+        if (contentType === 'files') {
             // Type guard to check if metadata has url and name properties (StrapiImageMetadata)
             const hasImageProperties = 'url' in entry.metadata && 'name' in entry.metadata;
 
@@ -379,7 +466,7 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
         }
 
         // Handle other content types (show representative attributes)
-        const attributes = getRepresentativeAttributes(entry);
+        const attributes = getRepresentativeAttributes(entry as StrapiContent);
 
         if (attributes.length === 0) {
             return (
@@ -404,14 +491,39 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
     };
 
     // Function to open the editor dialog
-    const openEditorDialog = (content: any, isDiff: boolean = false, source: any = null, target: any = null, header: string = "View Content") => {
+    const openEditorDialog = (
+        content: any,
+        isDiff: boolean = false,
+        source: any = null,
+        target: any = null,
+        header: string = "View Content",
+        tableName?: string,
+        documentId?: string
+    ) => {
         if (isDiff) {
             setIsDiffEditor(true);
             setOriginalContent(source);
             setModifiedContent(target);
+            setEditorErrorMessage(undefined);
         } else {
             setIsDiffEditor(false);
             setEditorContent(content);
+            // compute error message from live status or stored selection failure
+            if (tableName && documentId) {
+                const key = `${tableName}:${documentId}`;
+                const live = syncItemsStatus[key];
+                let err: string | undefined = undefined;
+                if (live && live.status === 'ERROR') {
+                    err = live.message || 'Unknown error';
+                } else {
+                    const dto = selections.find(s => s.tableName === tableName);
+                    const sel = dto?.selections?.find(s => s.documentId === documentId && s.syncSuccess === false);
+                    if (sel && sel.syncFailureResponse) err = sel.syncFailureResponse;
+                }
+                setEditorErrorMessage(err);
+            } else {
+                setEditorErrorMessage(undefined);
+            }
         }
         setEditorDialogHeader(header);
         setEditorDialogVisible(true);
@@ -422,28 +534,24 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
         if (!allMergeData) return { isUpdate: false, source: null, target: null };
 
         // Handle file content type
-        if (contentType === STRAPI_FILE_CONTENT_TYPE_NAME) {
-            const diffFile = allMergeData.files.different.find(file => 
-                file.source.metadata.documentId === documentId
-            );
-            if (diffFile) return { isUpdate: true, source: diffFile.source, target: diffFile.target };
+        if (contentType === 'files') {
+            const diffEntry = allMergeData.files.find(f => f.compareState === 'DIFFERENT' && f.sourceImage?.metadata.documentId === documentId);
+            if (diffEntry && diffEntry.sourceImage && diffEntry.targetImage) return { isUpdate: true, source: diffEntry.sourceImage, target: diffEntry.targetImage };
         }
 
         // Handle single content types
         if (allMergeData.singleTypes[contentType]) {
             const singleType = allMergeData.singleTypes[contentType];
-            if (singleType.different && singleType.different.source.metadata.documentId === documentId) {
-                return { isUpdate: true, source: singleType.different.source, target: singleType.different.target };
+            if (singleType.compareState === 'DIFFERENT' && singleType.sourceContent && singleType.targetContent && singleType.sourceContent.metadata.documentId === documentId) {
+                return { isUpdate: true, source: singleType.sourceContent.cleanData, target: singleType.targetContent.cleanData};
             }
         }
 
-        // Handle collection content types
+        // Handle collection content types (list-based)
         if (allMergeData.collectionTypes[contentType]) {
-            const collectionType = allMergeData.collectionTypes[contentType];
-            const diffEntry = collectionType.different.find(entry => 
-                entry.source.metadata.documentId === documentId
-            );
-            if (diffEntry) return { isUpdate: true, source: diffEntry.source, target: diffEntry.target };
+            const entries = allMergeData.collectionTypes[contentType];
+            const diffEntry = entries.find(e => e.compareState === 'DIFFERENT' && e.sourceContent?.metadata.documentId === documentId);
+            if (diffEntry && diffEntry.sourceContent && diffEntry.targetContent) return { isUpdate: true, source: diffEntry.sourceContent.cleanData, target: diffEntry.targetContent.cleanData };
         }
 
         return { isUpdate: false, source: null, target: null };
@@ -453,34 +561,14 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
     const prepareItemsForDataTable = () => {
         const items: any[] = [];
 
-        selections.forEach(selection => {
-            // Add items to create
-            selection.entriesToCreate.forEach(id => {
+        selections.forEach(dto => {
+            (dto.selections || []).forEach(sel => {
+                const operation = sel.direction === 'TO_CREATE' ? 'create' : sel.direction === 'TO_UPDATE' ? 'update' : 'delete';
                 items.push({
-                    contentType: selection.contentType,
-                    documentId: id,
-                    operation: 'create',
-                    statusInfo: findStatusInfo(selection.contentType, id, 'create')
-                });
-            });
-
-            // Add items to update
-            selection.entriesToUpdate.forEach(id => {
-                items.push({
-                    contentType: selection.contentType,
-                    documentId: id,
-                    operation: 'update',
-                    statusInfo: findStatusInfo(selection.contentType, id, 'update')
-                });
-            });
-
-            // Add items to delete
-            selection.entriesToDelete.forEach(id => {
-                items.push({
-                    contentType: selection.contentType,
-                    documentId: id,
-                    operation: 'delete',
-                    statusInfo: findStatusInfo(selection.contentType, id, 'delete')
+                    contentType: dto.tableName,
+                    documentId: sel.documentId,
+                    operation,
+                    statusInfo: findStatusInfo(dto.tableName, sel.documentId, operation)
                 });
             });
         });
@@ -547,11 +635,22 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                     if (isUpdate) {
                         openEditorDialog(null, true, source, target, "View Differences");
                     } else {
-                        openEditorDialog(entry, false, null, null, "View Content");
+                        openEditorDialog(entry, false, null, null, "View Content", rowData.contentType, rowData.documentId);
                     }
                 }}
             />
         );
+    };
+
+    const inspectItem = (tableName: string, documentId: string) => {
+        const entry = findEntry(tableName, documentId);
+        if (!entry) return;
+        const diff = isUpdateEntry(tableName, documentId);
+        if (diff.isUpdate) {
+            openEditorDialog(null, true, diff.source, diff.target, 'View Differences');
+        } else {
+            openEditorDialog(entry, false, null, null, 'View Content', tableName, documentId);
+        }
     };
 
     return (
@@ -584,6 +683,71 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                 <Message severity="info" text="No items selected for synchronization." className="w-full mb-3"/>
             )}
 
+            {/* Execution Plan (batches with live status) */}
+            <TabView>
+                <TabPanel header="Graph">
+            <Card className="mb-4">
+                <div className="flex align-items-center justify-content-between mb-3">
+                    <h4 className="m-0">Execution Plan</h4>
+                    <div className="flex gap-2">
+                        <Button label="Recompute Plan" icon="pi pi-refresh" className="p-button-text" onClick={loadPlan} disabled={planLoading} />
+                    </div>
+                </div>
+                {planLoading && (
+                    <Message severity="info" text="Loading sync plan..." className="w-full mb-3" />
+                )}
+                {planError && (
+                    <Message severity="error" text={planError} className="w-full mb-3" />
+                )}
+                {!planLoading && !planError && syncPlan && (
+                    <div>
+                        {syncPlan.batches.length === 0 ? (
+                            <Message severity="info" text="No content dependencies to resolve. Items will be processed directly." className="w-full" />
+                        ) : (
+                            <div>
+                                <p className="text-600 mb-3">The graph groups items by table. Each table has a single container listing its selected items; item colors indicate the operation (create/update/delete), and the icon next to each id shows the live status. Arrows represent dependencies; dashed arrows indicate circular dependencies handled in a second pass.</p>
+                                <SyncPlanGraph syncPlan={syncPlan} syncItemsStatus={syncItemsStatus} onInspect={inspectItem} />
+                            </div>
+                        )}
+
+                        {syncPlan.missingDependencies.length > 0 && (
+                            <div className="mt-3">
+                                <Message severity="warn" text="Some items have missing dependencies. They may fail during synchronization." className="w-full mb-2" />
+                                <ul className="pl-3">
+                                    {syncPlan.missingDependencies.map((m, midx) => (
+                                        <li key={midx} className="mb-1">
+                                            <span className="font-medium">{m.fromTable}:{m.fromDocumentId}</span>
+                                            <span className="ml-2">requires</span>
+                                            <Tag value={`${m.linkTargetTable}.${m.linkField}`} className="ml-2 mr-2" />
+                                            <span>- {m.reason}</span>
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        )}
+
+                        {syncPlan.circularEdges.length > 0 && (
+                            <div className="mt-3">
+                                <Message severity="info" text="Detected circular dependencies. These are handled with a second pass when possible." className="w-full mb-2" />
+                                <ul className="pl-3">
+                                    {syncPlan.circularEdges.map((c, cidx) => (
+                                        <li key={cidx} className="mb-1">
+                                            <span className="font-medium">{c.fromTable}:{c.fromDocumentId}</span>
+                                            <i className="pi pi-arrow-right mx-2"></i>
+                                            <span className="font-medium">{c.toTable}:{c.toDocumentId}</span>
+                                            <Tag value={`via ${c.viaField}`} className="ml-2" />
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        )}
+                    </div>
+                )}
+            </Card>
+                </TabPanel>
+
+
+                <TabPanel header="Data">
             {totalItems > 0 && (
                 <Card>
                     <TabView>
@@ -750,6 +914,8 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                     </TabView>
                 </Card>
             )}
+                </TabPanel>
+            </TabView>
 
             {/* Sync Progress Section */}
             {(syncInProgress || syncCompleted || syncFailed) && (
@@ -806,12 +972,12 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                         />
                     </div>
                 )}
-                {status !== 'COMPLETED' && !syncInProgress && !syncCompleted && (
+                {(status === 'MERGED_COLLECTIONS' || status === 'FAILED') && !syncInProgress && (
                     <Button
                         label="Complete Merge"
                         icon="pi pi-check"
                         loading={completing}
-                        disabled={completing || status !== 'MERGED_COLLECTIONS'}
+                        disabled={completing}
                         onClick={handleCompleteMerge}
                     />
                 )}
@@ -829,6 +995,7 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                 isDiff={isDiffEditor}
                 originalContent={originalContent}
                 modifiedContent={modifiedContent}
+                errorMessage={editorErrorMessage}
             />
         </div>
     );

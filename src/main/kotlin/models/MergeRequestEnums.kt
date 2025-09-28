@@ -26,6 +26,9 @@ enum class MergeRequestStatus {
     @SerialName("MERGED_COLLECTIONS")
     MERGED_COLLECTIONS, // Collection content types have been merged
 
+    @SerialName("IN_PROGRESS")
+    IN_PROGRESS,    // Merge has been started and is running
+
     @SerialName("COMPLETED")
     COMPLETED,      // Merge has been completed
 

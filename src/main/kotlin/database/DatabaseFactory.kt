@@ -12,9 +12,37 @@ import it.sebi.tables.MergeRequestsTable
 import it.sebi.tables.StrapiInstancesTable
 import kotlinx.coroutines.Dispatchers
 import org.jetbrains.exposed.v1.jdbc.Database
+import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.SchemaUtils
 import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+
+object DatabaseFactory {
+
+    private var initDb: Database? = null
+
+    val database: Database?
+        get() = initDb
+
+    fun init(log: Logger) {
+        if (initDb == null) {
+            initDb = Database.connect(hikari(log))
+            transaction(initDb) {
+                SchemaUtils.createMissingTablesAndColumns(
+                    StrapiInstancesTable,
+                    MergeRequestsTable,
+                    MergeRequestDocumentMappingTable,
+                    MergeRequestSelectionsTable
+                )
+            }
+        }
+    }
+
+    suspend fun <T> dbQuery(block: suspend JdbcTransaction.() -> T): T =
+        newSuspendedTransaction(db = initDb, context = Dispatchers.IO) { block() }
+
+
+}
 
 fun Application.initDatabaseConnection() {
     // Connect to the database
@@ -23,12 +51,11 @@ fun Application.initDatabaseConnection() {
 
     // Create tables
     transaction(database) {
-        SchemaUtils.create(
+        SchemaUtils.createMissingTablesAndColumns(
             StrapiInstancesTable,
             MergeRequestsTable,
             MergeRequestDocumentMappingTable,
-            MergeRequestSelectionsTable,
-            inBatch = true
+            MergeRequestSelectionsTable
         )
     }
 }
@@ -66,7 +93,16 @@ private fun hikari(log: Logger): HikariDataSource {
 
     return HikariDataSource(config)
 }
-val dbDispatcher = Dispatchers.IO.limitedParallelism(10)
 
-suspend fun <T> dbQuery(block: suspend () -> T): T =
-    newSuspendedTransaction(dbDispatcher) { block() }
+
+suspend fun <T> dbQuery(db: Database? = DatabaseFactory.database, block: suspend JdbcTransaction.() -> T): T =
+    newSuspendedTransaction(db = db, context = Dispatchers.IO) { block() }
+
+//
+//
+//fun ResultSet.getStringOrNull(columnName: String): String? = this.get(columnName, String::class.java)
+//fun ResultSet.getString(columnName: String): String = get(columnName, String::class.java)?: error("Column $columnName is null")
+//fun ResultSet.getBigDecimalOrNull(columnName: String): BigDecimal? = get(columnName, BigDecimal::class.java)
+//fun ResultSet.getBigDecimal(columnName: String): BigDecimal = get(columnName, BigDecimal::class.java)?: error("Column $columnName is null")
+//fun ResultSet.getTimestampOrNull(columnName: String): Timestamp? = get(columnName, Timestamp::class.java)
+//fun ResultSet.getTimestamp(columnName: String): Timestamp = get(columnName, Timestamp::class.java)?: error("Column $columnName is null")
