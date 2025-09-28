@@ -40,7 +40,8 @@ const InstanceFormDialog: React.FC<InstanceFormDialogProps> = ({
           !formData.name || 
           !formData.url || 
           !formData.username || 
-          (!isEditing && (!formData.password || !formData.apiKey))
+          (!isEditing && (!formData.password || !formData.apiKey)) ||
+          (!isEditing && (!formData.dbHost || !formData.dbPort || !formData.dbName || !formData.dbUser || !formData.dbPassword))
         }
         onClick={onSubmit}
       />
@@ -121,6 +122,86 @@ const InstanceFormDialog: React.FC<InstanceFormDialogProps> = ({
             feedback={false}
             toggleMask
             required={!isEditing}
+          />
+        </div>
+
+        <hr />
+        <h3>Postgres connection (per-instance)</h3>
+        <div className="field mb-3">
+          <label htmlFor="dbHost" className="block mb-2">DB Host{!isEditing && ' *'}</label>
+          <InputText
+            id="dbHost"
+            name="dbHost"
+            value={formData.dbHost || ''}
+            onChange={onInputChange}
+            placeholder="e.g. mydb.example.com"
+            required={!isEditing}
+          />
+        </div>
+        <div className="field mb-3">
+          <label htmlFor="dbPort" className="block mb-2">DB Port{!isEditing && ' *'}</label>
+          <InputText
+            id="dbPort"
+            name="dbPort"
+            value={(formData.dbPort ?? '').toString()}
+            onChange={onInputChange}
+            placeholder="5432"
+            required={!isEditing}
+          />
+        </div>
+        <div className="field mb-3">
+          <label htmlFor="dbName" className="block mb-2">DB Name{!isEditing && ' *'}</label>
+          <InputText
+            id="dbName"
+            name="dbName"
+            value={formData.dbName || ''}
+            onChange={onInputChange}
+            placeholder="database name"
+            required={!isEditing}
+          />
+        </div>
+        <div className="field mb-3">
+          <label htmlFor="dbSchema" className="block mb-2">DB Schema</label>
+          <InputText
+            id="dbSchema"
+            name="dbSchema"
+            value={formData.dbSchema || ''}
+            onChange={onInputChange}
+            placeholder="public"
+          />
+        </div>
+        <div className="field mb-3">
+          <label htmlFor="dbUser" className="block mb-2">DB User{!isEditing && ' *'}</label>
+          <InputText
+            id="dbUser"
+            name="dbUser"
+            value={formData.dbUser || ''}
+            onChange={onInputChange}
+            placeholder="db username"
+            required={!isEditing}
+          />
+        </div>
+        <div className="field mb-3">
+          <label htmlFor="dbPassword" className="block mb-2">DB Password{isEditing && <span className="text-sm text-gray-500"> (leave empty to keep current)</span>}</label>
+          <Password
+            id="dbPassword"
+            name="dbPassword"
+            value={formData.dbPassword || ''}
+            onChange={onInputChange}
+            placeholder={isEditing ? "Leave empty to keep current DB password" : "DB password"}
+            feedback={false}
+            toggleMask
+            required={!isEditing}
+          />
+        </div>
+        <div className="field mb-3">
+          <label htmlFor="dbSslMode" className="block mb-2">DB SSL Mode</label>
+          <InputText
+            id="dbSslMode"
+            name="dbSslMode"
+            value={formData.dbSslMode || ''}
+            onChange={onInputChange}
+            placeholder="disable | require | verify-ca | verify-full"
           />
         </div>
 

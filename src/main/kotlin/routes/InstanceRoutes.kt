@@ -7,7 +7,6 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import it.sebi.models.StrapiInstanceDTO
-import it.sebi.repository.MergeRequestDocumentMappingRepository
 import it.sebi.repository.MergeRequestRepository
 import it.sebi.repository.MergeRequestSelectionsRepository
 import it.sebi.repository.StrapiInstanceRepository
@@ -26,7 +25,6 @@ fun Route.configureInstanceRoutes(
     repository: StrapiInstanceRepository,
     mergeRequestRepository: MergeRequestRepository? = null,
     mergeRequestSelectionsRepository: MergeRequestSelectionsRepository? = null,
-    mergeRequestDocumentMappingRepository: MergeRequestDocumentMappingRepository? = null
 ) {
     route("/api/instances") {
         // Get all instances (secure, without sensitive data)
@@ -86,15 +84,14 @@ fun Route.configureInstanceRoutes(
             }
 
             val deleted = if (mergeRequestRepository != null && 
-                             mergeRequestSelectionsRepository != null && 
-                             mergeRequestDocumentMappingRepository != null) {
+                             mergeRequestSelectionsRepository != null
+                             ) {
                 // Use cascade delete if all repositories are provided
                 try {
                     repository.deleteInstanceCascade(
                         id,
                         mergeRequestRepository,
-                        mergeRequestSelectionsRepository,
-                        mergeRequestDocumentMappingRepository
+                        mergeRequestSelectionsRepository
                     )
                 } catch (e: Exception) {
                     application.log.error("Error during cascade delete", e)

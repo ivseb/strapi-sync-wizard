@@ -17,7 +17,7 @@ data class MergeRequestSelectionData(
 data class MergeRequestSelection(
     val id: Int,
     val mergeRequestId: Int,
-    val contentType: String,
+    val tableName: String,
     val documentId: String,
     val direction: Direction,
     @Contextual
@@ -58,44 +58,35 @@ data class SelectionStatusInfo(
  */
 @Serializable
 data class MergeRequestSelectionDTO(
-    val contentType: String,
-    val entriesToCreate: List<String> = emptyList(),
-    val entriesToUpdate: List<String> = emptyList(),
-    val entriesToDelete: List<String> = emptyList(),
-    val createStatus: List<SelectionStatusInfo> = emptyList(),
-    val updateStatus: List<SelectionStatusInfo> = emptyList(),
-    val deleteStatus: List<SelectionStatusInfo> = emptyList()
+    val tableName: String,
+    val selections: List<MergeRequestSelection> = emptyList()
 )
 
-/**
- * Data transfer object for a single selection update
- */
-@Serializable
-data class SingleSelectionDTO(
-    val contentType: String,
-    val documentId: String,
-    val direction: String,
-    val isSelected: Boolean
-)
 
-/**
- * Data transfer object for bulk selection updates
- */
-@Serializable
-data class BulkSelectionDTO(
-    val contentType: String,
-    val direction: String,
-    val documentIds: List<String>,
-    val isSelected: Boolean
-)
+
 
 /**
  * Data transfer object for the response to a selection update
  */
 @Serializable
 data class SelectionUpdateResponseDTO(
-    val success: Boolean,
-    val additionalSelections: List<RelatedSelectionDTO> = emptyList()
+    val success: Boolean
+)
+
+
+
+/**
+ * Unified selection command DTO to handle single, list, or all items
+ * - If ids is provided and non-empty: toggle selection for those items
+ * - If all is true: toggle selection for all diff items in the comparison
+ */
+@Serializable
+data class UnifiedSelectionDTO(
+    val kind: StrapiContentTypeKind,
+    val tableName: String?,
+    val ids: List<String>? = null,
+    val selectAllKind: ContentTypeComparisonResultKind? = null,
+    val isSelected: Boolean
 )
 
 /**

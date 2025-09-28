@@ -7,7 +7,6 @@ import io.ktor.server.plugins.statuspages.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import it.sebi.repository.MergeRequestDocumentMappingRepository
 import it.sebi.repository.MergeRequestRepository
 import it.sebi.repository.MergeRequestSelectionsRepository
 import it.sebi.repository.StrapiInstanceRepository
@@ -25,15 +24,13 @@ fun Application.configureRouting() {
     }
 
     val instanceRepository = StrapiInstanceRepository()
-    val mergeRequestDocumentMappingRepository = MergeRequestDocumentMappingRepository()
-    val syncService = SyncService(mergeRequestDocumentMappingRepository)
+    val syncService = SyncService()
     val mergeRequestRepository = MergeRequestRepository(instanceRepository)
     val mergeRequestSelectionsRepository = MergeRequestSelectionsRepository()
     val mergeRequestService = MergeRequestService(
         this.environment.config,
         mergeRequestRepository,
         syncService,
-        mergeRequestDocumentMappingRepository,
         mergeRequestSelectionsRepository
     )
 
@@ -42,8 +39,7 @@ fun Application.configureRouting() {
         configureInstanceRoutes(
             instanceRepository,
             mergeRequestRepository,
-            mergeRequestSelectionsRepository,
-            mergeRequestDocumentMappingRepository
+            mergeRequestSelectionsRepository
         )
         configureMergeRequestRoutes(mergeRequestService)
 

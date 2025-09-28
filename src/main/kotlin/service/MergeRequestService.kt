@@ -2,40 +2,178 @@ package it.sebi.service
 
 import io.ktor.server.config.*
 import it.sebi.JsonParser
-import it.sebi.SyncProgressService
-import it.sebi.SyncProgressUpdate
-import it.sebi.client.StrapiClient
 import it.sebi.client.client
 import it.sebi.database.dbQuery
 import it.sebi.models.*
-import it.sebi.repository.MergeRequestDocumentMappingRepository
 import it.sebi.repository.MergeRequestRepository
 import it.sebi.repository.MergeRequestSelectionsRepository
-import it.sebi.utils.calculateMD5Hash
+import it.sebi.service.merge.ContentMergeProcessor
+import it.sebi.service.merge.FileMergeProcessor
+import it.sebi.tables.MergeRequestDocumentMappingTable
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.json.*
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import org.jetbrains.exposed.v1.core.Op
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.isNull
+import org.jetbrains.exposed.v1.jdbc.deleteWhere
+import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.slf4j.LoggerFactory
 import java.io.File
-import java.time.OffsetDateTime
 
 /**
  * Service for handling merge request operations
  */
+enum class CompareMode { Full, Compare, Cache }
+
 class MergeRequestService(
     applicationConfig: ApplicationConfig,
     private val mergeRequestRepository: MergeRequestRepository,
     private val syncService: SyncService,
-    private val mergeRequestDocumentMappingRepository: MergeRequestDocumentMappingRepository,
     private val mergeRequestSelectionsRepository: MergeRequestSelectionsRepository
 ) {
+    private val fileMergeProcessor = FileMergeProcessor(mergeRequestSelectionsRepository)
+    private val contentMergeProcessor = ContentMergeProcessor(mergeRequestSelectionsRepository)
+
+    // Manual mappings list with optional filter by contentType UID, enriched with JSON for compare
+    suspend fun getManualMappingsList(mergeRequestId: Int, contentTypeUid: String?): ManualMappingsListResponseDTO {
+        val mr = mergeRequestRepository.getMergeRequestWithInstances(mergeRequestId)
+            ?: throw IllegalArgumentException("Merge request not found")
+        val rows = dbQuery {
+            var predicate: Op<Boolean> = (MergeRequestDocumentMappingTable.sourceStrapiId eq mr.sourceInstance.id) and
+                    (MergeRequestDocumentMappingTable.targetStrapiId eq mr.targetInstance.id)
+            if (!contentTypeUid.isNullOrBlank()) {
+                predicate = predicate and (MergeRequestDocumentMappingTable.contentType eq contentTypeUid)
+            }
+            MergeRequestDocumentMappingTable.selectAll().where { predicate }.toList()
+        }
+        val comparison = getContentComparisonFile(mergeRequestId)
+        fun findJson(uid: String, docId: String?): JsonObject? {
+            if (docId.isNullOrBlank() || comparison == null) return null
+            if (uid == "files") {
+                val f =
+                    comparison.files.find { it.sourceImage?.metadata?.documentId == docId || it.targetImage?.metadata?.documentId == docId }
+                val img = if (f?.sourceImage?.metadata?.documentId == docId) f?.sourceImage else f?.targetImage
+                return img?.rawData
+            }
+            // singles
+            comparison.singleTypes.values.forEach { e ->
+                if (e.contentType == uid) {
+                    if (e.sourceContent?.metadata?.documentId == docId) return e.sourceContent.cleanData
+                    if (e.targetContent?.metadata?.documentId == docId) return e.targetContent.cleanData
+                }
+            }
+            // collections
+            comparison.collectionTypes.values.forEach { list ->
+                list.forEach { e ->
+                    if (e.contentType == uid) {
+                        if (e.sourceContent?.metadata?.documentId == docId) return e.sourceContent.cleanData
+                        if (e.targetContent?.metadata?.documentId == docId) return e.targetContent.cleanData
+                    }
+                }
+            }
+            return null
+        }
+
+        val data = rows.map { r ->
+            val id = r[MergeRequestDocumentMappingTable.id].value
+            val uid = r[MergeRequestDocumentMappingTable.contentType]
+            val srcDoc = r[MergeRequestDocumentMappingTable.sourceDocumentId]
+            val tgtDoc = r[MergeRequestDocumentMappingTable.targetDocumentId]
+            val loc = r[MergeRequestDocumentMappingTable.locale]
+            ManualMappingWithContentDTO(
+                id = id,
+                contentType = uid,
+                sourceDocumentId = srcDoc,
+                targetDocumentId = tgtDoc,
+                locale = loc,
+                sourceJson = findJson(uid, srcDoc),
+                targetJson = findJson(uid, tgtDoc)
+            )
+        }
+        return ManualMappingsListResponseDTO(success = true, data = data)
+    }
+
+    // Delete a single manual mapping and recompute comparison
+    suspend fun deleteManualMapping(mergeRequestId: Int, mappingId: Int): MergeRequestData? {
+        val mr = mergeRequestRepository.getMergeRequestWithInstances(mergeRequestId)
+            ?: throw IllegalArgumentException("Merge request not found")
+        // Verify the mapping belongs to this MR instances
+        val belongs = dbQuery {
+            val rows = MergeRequestDocumentMappingTable.selectAll().where {
+                (MergeRequestDocumentMappingTable.id eq mappingId) and
+                        (MergeRequestDocumentMappingTable.sourceStrapiId eq mr.sourceInstance.id) and
+                        (MergeRequestDocumentMappingTable.targetStrapiId eq mr.targetInstance.id)
+            }.toList()
+            if (rows.isEmpty()) false else {
+                // delete it
+                MergeRequestDocumentMappingTable.deleteWhere { MergeRequestDocumentMappingTable.id eq mappingId } > 0
+            }
+        }
+        if (!belongs) throw IllegalArgumentException("Mapping not found or does not belong to this merge request instances")
+        // Recompute comparison (reuse prefetch cache if present)
+        compareContent(mr, CompareMode.Compare)
+        return getAllMergeRequestData(mergeRequestId, false)
+    }
+
+    // Manual mapping upsert for document associations (bulk)
+    suspend fun upsertManualMappings(mergeRequestId: Int, items: List<ManualMappingItemDTO>): MergeRequestData? {
+        val mr = mergeRequestRepository.getMergeRequestWithInstances(mergeRequestId)
+            ?: throw IllegalArgumentException("Merge request not found")
+        dbQuery {
+            items.forEach { item ->
+                val contentTypeUid = item.contentType
+                val srcDoc = item.sourceDocumentId
+                val srcId = item.sourceId
+                val tgtDoc = item.targetDocumentId
+                val tgtId = item.targetId
+                val locale = item.locale
+                if (srcDoc.isBlank() || tgtDoc.isBlank()) return@forEach
+                // Build predicate: by src doc if provided, otherwise by target doc
+                var predicate: Op<Boolean> =
+                    (MergeRequestDocumentMappingTable.sourceStrapiId eq mr.sourceInstance.id) and
+                            (MergeRequestDocumentMappingTable.targetStrapiId eq mr.targetInstance.id) and
+                            (MergeRequestDocumentMappingTable.contentType eq contentTypeUid) and
+                            (MergeRequestDocumentMappingTable.sourceDocumentId eq srcDoc) and
+                            (MergeRequestDocumentMappingTable.targetDocumentId eq tgtDoc)
+
+
+
+                predicate =
+                    if (locale != null) predicate and (MergeRequestDocumentMappingTable.locale eq locale) else predicate and MergeRequestDocumentMappingTable.locale.isNull()
+                val existing = MergeRequestDocumentMappingTable.selectAll().where { predicate }.toList()
+                if (existing.isEmpty()) {
+                    MergeRequestDocumentMappingTable.insert { st ->
+                        st[MergeRequestDocumentMappingTable.sourceStrapiId] = mr.sourceInstance.id
+                        st[MergeRequestDocumentMappingTable.targetStrapiId] = mr.targetInstance.id
+                        st[MergeRequestDocumentMappingTable.contentType] = contentTypeUid
+                        st[MergeRequestDocumentMappingTable.sourceDocumentId] = srcDoc
+                        st[MergeRequestDocumentMappingTable.targetDocumentId] = tgtDoc
+                        st[MergeRequestDocumentMappingTable.sourceId] = srcId
+                        st[MergeRequestDocumentMappingTable.targetId] = tgtId
+                        st[MergeRequestDocumentMappingTable.locale] = locale
+                    }
+                }
+            }
+        }
+        // Recompute comparison (reuse prefetch cache if present)
+        compareContent(mr, CompareMode.Compare)
+        return getAllMergeRequestData(mergeRequestId, false)
+    }
+
     // Load application configuration
     private val dataFolder = applicationConfig.property("application.dataFolder").getString()
 
     init {
         // Initialize data folder asynchronously
-        kotlinx.coroutines.runBlocking {
+        runBlocking {
             initializeDataFolder()
         }
     }
@@ -105,6 +243,11 @@ class MergeRequestService(
      * Update a merge request
      */
     suspend fun updateMergeRequest(id: Int, mergeRequestDTO: MergeRequestDTO): Boolean {
+        val mr = mergeRequestRepository.getMergeRequest(id)
+            ?: throw IllegalArgumentException("Merge request not found")
+        if (mr.status == MergeRequestStatus.IN_PROGRESS || mr.status == MergeRequestStatus.COMPLETED || mr.status == MergeRequestStatus.FAILED) {
+            throw IllegalStateException("Cannot update merge request after merge has been started or completed")
+        }
         return mergeRequestRepository.updateMergeRequest(id, mergeRequestDTO)
     }
 
@@ -154,240 +297,379 @@ class MergeRequestService(
         mergeRequestRepository.getMergeRequest(id)
             ?: throw IllegalArgumentException("Merge request not found")
 
-        return MergeRequestSelectionDataDTO(mergeRequestSelectionsRepository.getSelectionsGroupedByContentType(id))
+        return MergeRequestSelectionDataDTO(mergeRequestSelectionsRepository.getSelectionsGroupedByTableName(id))
     }
 
 
-    /**
-     * Update a single selection for a merge request
-     * @param id Merge request ID
-     * @param contentType Content type
-     * @param documentId Entry ID
-     * @param direction Direction (TO_CREATE, TO_UPDATE, TO_DELETE)
-     * @param isSelected Whether the entry is selected or not
-     * @return SelectionUpdateResponseDTO containing success status and any additional selections made
-     */
-    suspend fun updateSingleSelection(
-        id: Int,
-        contentType: String,
-        documentId: String,
-        direction: Direction,
-        isSelected: Boolean
-    ): SelectionUpdateResponseDTO {
-        // Check if merge request exists
-        mergeRequestRepository.getMergeRequest(id)
-            ?: throw IllegalArgumentException("Merge request not found")
+    data class Resolved(val contentTypeUid: String, val documentId: String, val direction: Direction)
 
-        // Update the selection for the main entry
-        val result = mergeRequestSelectionsRepository.updateSingleSelection(
-            id,
-            contentType,
-            documentId,
-            direction,
-            isSelected
-        )
 
-        // List to store additional selections made
-        val additionalSelections = mutableListOf<RelatedSelectionDTO>()
-
-        // If we're selecting an entry (not deselecting) and the update was successful,
-        // also select any related entries that aren't already selected
-        if (isSelected && result) {
-            // Get the content comparison data to access relationships
-            val contentComparison = getContentComparisonFile(id)
-
-            // Find relationships for this entry
-            val relationships = findRelationshipsForEntry(contentComparison, contentType, documentId)
-
-            // For each relationship, select the related entry if it isn't already selected
-            for (relationship in relationships) {
-
-                val directionMapping = when (relationship.compareStatus) {
-                    ContentTypeComparisonResultKind.ONLY_IN_SOURCE -> Direction.TO_CREATE
-                    ContentTypeComparisonResultKind.ONLY_IN_TARGET -> Direction.TO_DELETE
-                    ContentTypeComparisonResultKind.DIFFERENT -> Direction.TO_UPDATE
-                    else -> continue
-                }
-                // Check if the related entry is already selected
-                val isAlreadySelected = mergeRequestSelectionsRepository.getSelectionsForMergeRequest(id)
-                    .any {
-                        it.contentType == relationship.targetContentType &&
-                                it.documentId == relationship.targetDocumentId &&
-                                it.direction == directionMapping
-                    }
-
-                // If not already selected, select it
-                if (!isAlreadySelected) {
-                    val selectionResult = mergeRequestSelectionsRepository.updateSingleSelection(
-                        id,
-                        relationship.targetContentType,
-                        relationship.targetDocumentId,
-                        directionMapping,
-                        true
-                    )
-
-                    // If selection was successful, add to the list of additional selections
-                    if (selectionResult) {
-                        additionalSelections.add(
-                            RelatedSelectionDTO(
-                                contentType = relationship.targetContentType,
-                                documentId = relationship.targetDocumentId,
-                                direction = directionMapping
-                            )
-                        )
-                    }
-                }
+    fun resolveDeps(
+        comparison: ContentTypeComparisonResultMapWithRelationships,
+        linkRef: StrapiLinkRef,
+        visited: MutableSet<Pair<String, String>> = mutableSetOf()
+    ): List<Resolved> {
+        val deps =
+            comparison.singleTypes[linkRef.targetTable]?.let { listOf(it) }
+                ?: comparison.collectionTypes[linkRef.targetTable]
+                ?: comparison.files.map { it.asContent }
+        return deps.filter { it.sourceContent?.metadata?.id?.toString() == (linkRef.targetId?.toString() ?: "") }
+            .flatMap { d ->
+                resolveFromEntry(comparison, d, visited)
             }
+    }
+
+    fun resolveFromEntry(
+        comparison: ContentTypeComparisonResultMapWithRelationships,
+        e: ContentTypeComparisonResultWithRelationships,
+        visited: MutableSet<Pair<String, String>> = mutableSetOf()
+    ): List<Resolved> {
+        var checkLinks = false
+        val dir: Direction = when (e.compareState) {
+            ContentTypeComparisonResultKind.ONLY_IN_SOURCE -> {
+                checkLinks = true
+                Direction.TO_CREATE
+            }
+
+            ContentTypeComparisonResultKind.ONLY_IN_TARGET -> Direction.TO_DELETE
+            ContentTypeComparisonResultKind.DIFFERENT -> {
+                checkLinks = true
+                Direction.TO_UPDATE
+            }
+
+            ContentTypeComparisonResultKind.IDENTICAL -> return emptyList()
         }
+        val doc = when (e.compareState) {
+            ContentTypeComparisonResultKind.ONLY_IN_SOURCE -> e.sourceContent?.metadata?.documentId
+            ContentTypeComparisonResultKind.ONLY_IN_TARGET -> e.targetContent?.metadata?.documentId
+            ContentTypeComparisonResultKind.DIFFERENT -> e.sourceContent?.metadata?.documentId
+            ContentTypeComparisonResultKind.IDENTICAL -> null
+        } ?: return emptyList()
 
-        return SelectionUpdateResponseDTO(
-            success = result,
-            additionalSelections = additionalSelections
-        )
-    }
-
-    /**
-     * Update all selections for a merge request for a specific content type and direction
-     * @param id Merge request ID
-     * @param contentType Content type
-     * @param direction Direction (TO_CREATE, TO_UPDATE, TO_DELETE)
-     * @param documentIds List of document IDs to select or deselect
-     * @param isSelected Whether the entries should be selected or not
-     * @return SelectionUpdateResponseDTO containing success status
-     */
-    suspend fun updateAllSelections(
-        id: Int,
-        contentType: String,
-        direction: Direction,
-        documentIds: List<String>,
-        isSelected: Boolean
-    ): SelectionUpdateResponseDTO {
-        // Check if merge request exists
-        mergeRequestRepository.getMergeRequest(id)
-            ?: throw IllegalArgumentException("Merge request not found")
-
-        // Update all selections for the specified content type and direction
-        val result = mergeRequestSelectionsRepository.updateAllSelections(
-            id,
-            contentType,
-            direction,
-            documentIds,
-            isSelected
-        )
-
-        return SelectionUpdateResponseDTO(
-            success = result,
-            additionalSelections = emptyList() // No additional selections for bulk operations
-        )
-    }
-
-    /**
-     * Find relationships for a specific entry
-     * @param contentComparison The content comparison data
-     * @param contentType The content type of the entry
-     * @param documentId The document ID of the entry
-     * @param visited Set of already visited nodes to prevent infinite loops
-     * @param recursive Whether to recursively traverse the dependency tree
-     * @return List of relationships for the entry
-     */
-    private fun findRelationshipsForEntry(
-        contentComparison: ContentTypeComparisonResultMapWithRelationships?,
-        contentType: String,
-        documentId: String,
-        visited: MutableSet<Pair<String, String>> = mutableSetOf(),
-        recursive: Boolean = true
-    ): List<EntryRelationship> {
-        if (contentComparison == null) return emptyList()
-
-        // Create a node identifier for the current entry
-        val currentNode = Pair(contentType, documentId)
-
-        // If we've already visited this node, return empty list to prevent infinite loops
-        if (visited.contains(currentNode)) {
+        val key = e.tableName to doc
+        if (visited.contains(key)) {
             return emptyList()
         }
+        visited.add(key)
 
-        // Mark this node as visited
-        visited.add(currentNode)
+        if (checkLinks) {
+            val links = e.sourceContent?.links ?: emptyList()
 
-        // Result list to collect all relationships
-        val result = mutableListOf<EntryRelationship>()
-
-        // Direct relationships from single types
-        contentComparison.singleTypes[contentType]?.let { singleType ->
-            val directRelationships = singleType.relationships.filter {
-                it.sourceContentType == contentType && it.sourceDocumentId == documentId
+            return listOf(Resolved(e.tableName, doc, dir)) + links.flatMap { l ->
+                resolveDeps(comparison, l, visited)
             }
-            result.addAll(directRelationships)
+        }
 
-            // If recursive, process each related entry
-            if (recursive) {
-                directRelationships.forEach { relationship ->
-                    // Only process non-file relationships to avoid unnecessary recursion
-                    if (relationship.targetContentType != STRAPI_FILE_CONTENT_TYPE_NAME) {
-                        val childRelationships = findRelationshipsForEntry(
-                            contentComparison,
-                            relationship.targetContentType,
-                            relationship.targetDocumentId,
-                            visited,
-                            true
+        return listOf(Resolved(e.tableName, doc, dir))
+    }
+
+    /**
+     * Unified selection processing: supports single, list, and all entries using comparison ids
+     */
+    suspend fun processUnifiedSelection(id: Int, req: UnifiedSelectionDTO): SelectionUpdateResponseDTO {
+        // Check if merge request exists and is not locked
+        val mr = mergeRequestRepository.getMergeRequest(id)
+            ?: throw IllegalArgumentException("Merge request not found")
+        if (mr.status == MergeRequestStatus.IN_PROGRESS || mr.status == MergeRequestStatus.COMPLETED || mr.status == MergeRequestStatus.FAILED) {
+            throw IllegalStateException("Cannot modify selections after merge has been started or completed")
+        }
+
+        val comparison: ContentTypeComparisonResultMapWithRelationships = getContentComparisonFile(id)
+            ?: throw IllegalStateException("Comparison not available. Run compare before updating selections.")
+
+        val allEntries: List<ContentTypeComparisonResultWithRelationships> = when (req.kind) {
+            StrapiContentTypeKind.SingleType -> if (req.tableName == null) {
+                comparison.singleTypes.values.toList()
+            } else {
+                listOfNotNull(comparison.singleTypes[req.tableName])
+            }
+
+            StrapiContentTypeKind.CollectionType -> if (req.tableName == null) {
+                comparison.collectionTypes.values.flatten()
+
+            } else {
+                comparison.collectionTypes[req.tableName] ?: emptyList()
+            }
+
+            StrapiContentTypeKind.Files -> {
+                comparison.files.map { it.asContent }
+
+            }
+
+            StrapiContentTypeKind.Component -> {
+                listOf()
+            }
+        }
+
+
+        val targets: List<Resolved> = when {
+            req.selectAllKind != null -> allEntries.filter { it.compareState == req.selectAllKind }
+                .flatMap { resolveFromEntry(comparison, it) }
+
+            !req.ids.isNullOrEmpty() -> {
+                val idsSet = req.ids.toSet()
+                allEntries.filter { idsSet.contains(it.id) }.flatMap { resolveFromEntry(comparison, it) }
+            }
+
+            else -> emptyList()
+        }
+
+
+        if (req.isSelected) {
+            val upserts = targets.map { Triple(it.contentTypeUid, it.documentId, it.direction) }
+            mergeRequestSelectionsRepository.bulkUpsertAndDelete(id, upserts, emptyList())
+
+        } else {
+            val deletes = targets.map { Triple(it.contentTypeUid, it.documentId, it.direction) }
+            mergeRequestSelectionsRepository.bulkUpsertAndDelete(id, emptyList(), deletes)
+        }
+
+        return SelectionUpdateResponseDTO(
+            success = true,
+        )
+    }
+
+
+    // ----------------------
+    // Dependency planning for content sync
+    // ----------------------
+
+    private data class NodeKey(val table: String, val documentId: String)
+
+    data class MissingDependency(
+        val fromTable: String,
+        val fromDocumentId: String,
+        val link: StrapiLinkRef,
+        val reason: String
+    )
+
+    data class CircularDependencyEdge(
+        val fromTable: String,
+        val fromDocumentId: String,
+        val toTable: String,
+        val toDocumentId: String,
+        val viaLink: StrapiLinkRef
+    )
+
+    data class DependencyEdge(
+        val fromTable: String,
+        val fromDocumentId: String,
+        val toTable: String,
+        val toDocumentId: String,
+        val viaLink: StrapiLinkRef
+    )
+
+    data class SyncOrderItem(
+        val selection: MergeRequestSelection,
+        val entry: ContentTypeComparisonResultWithRelationships
+    )
+
+    data class SyncOrderResult(
+        val batches: List<List<SyncOrderItem>>, // layered order with selections
+        val missingDependencies: List<MissingDependency>,
+        val circularEdges: List<CircularDependencyEdge>,
+        val edges: List<DependencyEdge>
+    )
+
+    private fun indexByTableAndDoc(
+        comparison: ContentTypeComparisonResultMapWithRelationships
+    ): Map<NodeKey, ContentTypeComparisonResultWithRelationships> {
+        val map = mutableMapOf<NodeKey, ContentTypeComparisonResultWithRelationships>()
+        comparison.singleTypes.values.forEach { e ->
+            e.sourceContent?.metadata?.documentId?.let { map[NodeKey(e.tableName, it)] = e }
+            e.targetContent?.metadata?.documentId?.let { map.putIfAbsent(NodeKey(e.tableName, it), e) }
+        }
+        comparison.collectionTypes.forEach { (_, list) ->
+            list.forEach { e ->
+                e.sourceContent?.metadata?.documentId?.let { map[NodeKey(e.tableName, it)] = e }
+                e.targetContent?.metadata?.documentId?.let { map.putIfAbsent(NodeKey(e.tableName, it), e) }
+            }
+        }
+        // also index files as content
+        comparison.files.forEach { f ->
+            f.sourceImage?.metadata?.documentId?.let {
+                map[NodeKey("files", it)] = f.asContent
+            }
+            f.targetImage?.metadata?.documentId?.let {
+                map.putIfAbsent(NodeKey("files", it), f.asContent)
+            }
+        }
+        return map
+    }
+
+    private fun resolveDocIdForLinkInternal(
+        table: String,
+        id: Int?,
+        comparisonDataMap: ContentTypeComparisonResultMapWithRelationships
+    ): String? {
+        if (id == null) return null
+        return when (table) {
+            "files" -> {
+                comparisonDataMap.files.forEach { cmp ->
+                    val s = cmp.sourceImage?.metadata
+                    if (s?.id == id) return s.documentId
+                    val t = cmp.targetImage?.metadata
+                    if (t?.id == id) return t.documentId
+                }
+                null
+            }
+
+            else -> {
+                comparisonDataMap.singleTypes[table]?.let { st ->
+                    if (st.sourceContent?.metadata?.id == id) return st.sourceContent.metadata.documentId
+                    if (st.targetContent?.metadata?.id == id) return st.targetContent.metadata.documentId
+                }
+                comparisonDataMap.collectionTypes[table]?.forEach { e ->
+                    if (e.sourceContent?.metadata?.id == id) return e.sourceContent.metadata.documentId
+                    if (e.targetContent?.metadata?.id == id) return e.targetContent.metadata.documentId
+                }
+                null
+            }
+        }
+    }
+
+    /**
+     * Calcola l'ordine di sincronizzazione dei contenuti selezionati in base alle dipendenze tra le entità.
+     * - Prima i contenuti senza dipendenze non soddisfatte
+     * - Poi quelli cuì tutte le dipendenze risultano risolte progressivamente
+     * Considera inoltre:
+     * - File già sincronizzati/presenti (tramite allTargetMap)
+     * - Entità target già presenti dedotte dalla comparison
+     * - Segnala dipendenze mancanti e dipendenze circolari
+     */
+    fun computeContentSyncOrder(
+        contentSelections: List<MergeRequestSelection>,
+        comparison: ContentTypeComparisonResultMapWithRelationships,
+        allTargetMap: Map<String, Int>
+    ): SyncOrderResult {
+        // Build index for quick lookup
+        val index = indexByTableAndDoc(comparison)
+
+        // Selected nodes (ignore deletions for dependency ordering)
+        val selectedNodes: Map<NodeKey, Pair<ContentTypeComparisonResultWithRelationships, MergeRequestSelection>> =
+            contentSelections
+                .filter { it.direction != Direction.TO_DELETE }
+                .mapNotNull { sel ->
+                    val key = NodeKey(sel.tableName, sel.documentId)
+                    val entry = index[key]
+                    if (entry != null) key to (entry to sel) else null
+                }
+                .toMap()
+
+        // Helper to check if a dependency is already satisfied by target existing data
+        fun isSatisfiedOutsideSelection(depKey: NodeKey): Boolean {
+            if (depKey.table == "files") {
+                if (allTargetMap.containsKey(depKey.documentId)) return true
+                // also consider already present in target comparison
+                return comparison.files.any { it.targetImage?.metadata?.documentId == depKey.documentId }
+            }
+            // For non-file content types, check presence in target
+            val entry = index[depKey]
+            return entry?.targetContent != null
+        }
+
+        // Build dependency graph among selected items
+        val adjacency = mutableMapOf<NodeKey, MutableList<Pair<NodeKey, StrapiLinkRef>>>() // from -> list of (to, link)
+        val inDegree = mutableMapOf<NodeKey, Int>().apply { selectedNodes.keys.forEach { this[it] = 0 } }
+        val missing = mutableListOf<MissingDependency>()
+
+        selectedNodes.forEach { (fromKey, pair) ->
+            val (entry, _) = pair
+            val sourceLinks = entry.sourceContent?.links ?: emptyList()
+            for (link in sourceLinks) {
+                val targetDocId = resolveDocIdForLinkInternal(link.targetTable, link.targetId, comparison)
+                if (targetDocId == null) {
+                    // cannot even resolve the referenced documentId
+                    missing += MissingDependency(
+                        fromKey.table,
+                        fromKey.documentId,
+                        link,
+                        "Referenced entity not found in comparison"
+                    )
+                    continue
+                }
+                val depKey = NodeKey(link.targetTable, targetDocId)
+                if (selectedNodes.containsKey(depKey)) {
+                    // dependency inside selection -> create edge dep -> from
+                    adjacency.getOrPut(depKey) { mutableListOf() }.add(fromKey to link)
+                    inDegree[fromKey] = (inDegree[fromKey] ?: 0) + 1
+                } else if (isSatisfiedOutsideSelection(depKey)) {
+                    // dependency already satisfied -> ignore
+                } else {
+                    // missing dependency
+                    missing += MissingDependency(
+                        fromKey.table,
+                        fromKey.documentId,
+                        link,
+                        "Dependency not selected and not present in target"
+                    )
+                }
+            }
+        }
+
+        // Kahn's algorithm with layering (batches)
+        val batches = mutableListOf<List<SyncOrderItem>>()
+        val queue: ArrayDeque<NodeKey> = ArrayDeque(inDegree.filter { it.value == 0 }.keys)
+        val processed = mutableSetOf<NodeKey>()
+
+        while (queue.isNotEmpty()) {
+            val layerSize = queue.size
+            val layer = mutableListOf<SyncOrderItem>()
+            repeat(layerSize) {
+                val n = queue.removeFirst()
+                if (!processed.add(n)) return@repeat
+                selectedNodes[n]?.let { pair ->
+                    val (entry, selection) = pair
+                    layer += SyncOrderItem(selection = selection, entry = entry)
+                }
+                adjacency[n]?.forEach { (toKey, _) ->
+                    inDegree[toKey] = (inDegree[toKey] ?: 0) - 1
+                    if ((inDegree[toKey] ?: 0) == 0) {
+                        queue.addLast(toKey)
+                    }
+                }
+            }
+            if (layer.isNotEmpty()) batches += layer
+        }
+
+        // Remaining nodes with inDegree > 0 are part of cycles
+        val remaining = inDegree.filter { (k, _) -> !processed.contains(k) }.keys
+        val circularEdges = mutableListOf<CircularDependencyEdge>()
+        if (remaining.isNotEmpty()) {
+            remaining.forEach { dep ->
+                adjacency[dep]?.forEach { (toKey, link) ->
+                    if (remaining.contains(toKey)) {
+                        circularEdges += CircularDependencyEdge(
+                            fromTable = dep.table,
+                            fromDocumentId = dep.documentId,
+                            toTable = toKey.table,
+                            toDocumentId = toKey.documentId,
+                            viaLink = link
                         )
-                        result.addAll(childRelationships)
                     }
                 }
             }
         }
 
-        // Direct relationships from collection types
-        contentComparison.collectionTypes[contentType]?.let { collectionType ->
-            collectionType.relationships[documentId]?.let { relationships ->
-                val directRelationships = relationships.filter {
-                    it.sourceContentType == contentType && it.sourceDocumentId == documentId
-                }
-                result.addAll(directRelationships)
-
-                // If recursive, process each related entry
-                if (recursive) {
-                    directRelationships.forEach { relationship ->
-                        // Only process non-file relationships to avoid unnecessary recursion
-                        if (relationship.targetContentType != STRAPI_FILE_CONTENT_TYPE_NAME) {
-                            val childRelationships = findRelationshipsForEntry(
-                                contentComparison,
-                                relationship.targetContentType,
-                                relationship.targetDocumentId,
-                                visited,
-                                true
-                            )
-                            result.addAll(childRelationships)
-                        }
-                    }
-                }
+        // Build edge list for visualization (dependencies between selected items)
+        val edges: List<DependencyEdge> = adjacency.flatMap { (fromKey, tos) ->
+            tos.map { (toKey, link) ->
+                DependencyEdge(
+                    fromTable = fromKey.table,
+                    fromDocumentId = fromKey.documentId,
+                    toTable = toKey.table,
+                    toDocumentId = toKey.documentId,
+                    viaLink = link
+                )
             }
         }
 
-        // Check for relationships with files in single types
-        contentComparison.singleTypes.values.forEach { singleType ->
-            val fileRelationships = singleType.relationships.filter {
-                it.sourceContentType == contentType &&
-                        it.sourceDocumentId == documentId &&
-                        it.targetContentType == STRAPI_FILE_CONTENT_TYPE_NAME
-            }
-            result.addAll(fileRelationships)
-        }
-
-        // Check for relationships with files in collection types
-        contentComparison.collectionTypes.values.forEach { collectionType ->
-            collectionType.relationships.values.forEach { relationships ->
-                val fileRelationships = relationships.filter {
-                    it.sourceContentType == contentType &&
-                            it.sourceDocumentId == documentId &&
-                            it.targetContentType == STRAPI_FILE_CONTENT_TYPE_NAME
-                }
-                result.addAll(fileRelationships)
-            }
-        }
-
-        return result.distinctBy { it.sourceDocumentId+ it.targetDocumentId+it.sourceContentType+it.targetContentType }
+        return SyncOrderResult(
+            batches = batches,
+            missingDependencies = missing,
+            circularEdges = circularEdges,
+            edges = edges
+        )
     }
 
 
@@ -412,7 +694,7 @@ class MergeRequestService(
 
     private val logger = LoggerFactory.getLogger(this::class.java)
 
-    private suspend fun getSchemaCompatibilityFile(id: Int): SchemaCompatibilityResult? {
+    private suspend fun getSchemaCompatibilityFile(id: Int): SchemaDbCompatibilityResult? {
         return withContext(Dispatchers.IO) {
             val schemaFilePath = getSchemaCompatibilityFilePath(id)
             val schemaFile = File(schemaFilePath)
@@ -422,7 +704,7 @@ class MergeRequestService(
                 try {
                     // Read the file and deserialize
                     val fileContent = schemaFile.readText()
-                    val fileStorage = JsonParser.decodeFromString<SchemaCompatibilityResult>(fileContent)
+                    val fileStorage = JsonParser.decodeFromString<SchemaDbCompatibilityResult>(fileContent)
                     fileStorage
                 } catch (e: Exception) {
                     // If there's an error reading the file, log it and continue with a new check
@@ -436,7 +718,7 @@ class MergeRequestService(
         }
     }
 
-    private suspend fun saveSchemaCompatibilityFile(id: Int, schemaResult: SchemaCompatibilityResult) {
+    private suspend fun saveSchemaCompatibilityFile(id: Int, schemaResult: SchemaDbCompatibilityResult) {
         withContext(Dispatchers.IO) {
             try {
                 val schemaFilePath = getSchemaCompatibilityFilePath(id)
@@ -469,6 +751,114 @@ class MergeRequestService(
         }
     }
 
+    private fun stripCleanData(element: JsonElement): JsonElement = when (element) {
+        is JsonObject -> JsonObject(
+            element.mapNotNull { (k, v) ->
+                if (k == "cleanData") null else k to stripCleanData(v)
+            }.toMap()
+        )
+
+        is JsonArray -> JsonArray(element.map { stripCleanData(it) })
+        else -> element
+    }
+
+    private val TECH_FIELDS_FOR_CLEAN = setOf(
+        "id", "created_by_id", "updated_by_id", "created_at", "updated_at", "published_at"
+    )
+
+    private fun cleanValueForContent(v: JsonElement): JsonElement = when (v) {
+        is JsonObject -> JsonObject(v.filterKeys { it !in TECH_FIELDS_FOR_CLEAN }
+            .mapValues { (_, vv) -> cleanValueForContent(vv) })
+
+        is JsonArray -> JsonArray(v.map { cleanValueForContent(it) })
+        else -> v
+    }
+
+
+    private fun enrichWithCleanData(element: JsonElement): JsonElement = when (element) {
+        is JsonObject -> {
+            // First, recurse into children
+            val processedChildren = element.mapValues { (_, v) -> enrichWithCleanData(v) }.toMutableMap()
+
+            // Heuristic to detect StrapiContent: has metadata (object), rawData (object), and links (array)
+            val hasMetadata = processedChildren["metadata"] is JsonObject
+            val raw = processedChildren["rawData"] as? JsonObject
+            val hasLinks = processedChildren["links"] is JsonArray
+            if (hasMetadata && raw != null && hasLinks) {
+                // Recompute cleanData from raw
+                processedChildren["cleanData"] = cleanObject(raw)
+            }
+            JsonObject(processedChildren)
+        }
+
+        is JsonArray -> JsonArray(element.map { enrichWithCleanData(it) })
+        else -> element
+    }
+
+    @Serializable
+    data class ComparisonPrefetchCache(
+        val sourceFiles: List<StrapiImage>,
+        val targetFiles: List<StrapiImage>,
+        val sourceRowsByUid: Map<String, List<StrapiContent>>,
+        val targetRowsByUid: Map<String, List<StrapiContent>>,
+        val collectedRelationships: List<ContentRelationship>
+    )
+
+    private fun toCache(prefetch: ComparisonPrefetch): ComparisonPrefetchCache = ComparisonPrefetchCache(
+        sourceFiles = prefetch.sourceFiles,
+        targetFiles = prefetch.targetFiles,
+        sourceRowsByUid = prefetch.sourceRowsByUid,
+        targetRowsByUid = prefetch.targetRowsByUid,
+        collectedRelationships = prefetch.collectedRelationships.toList()
+    )
+
+    private fun fromCache(cache: ComparisonPrefetchCache): ComparisonPrefetch = ComparisonPrefetch(
+        sourceFiles = cache.sourceFiles,
+        targetFiles = cache.targetFiles,
+        sourceFileRelations = emptyList(),
+        targetFileRelations = emptyList(),
+        sourceCMPSMap = mutableMapOf(),
+        targetCMPSMap = mutableMapOf(),
+        sourceTableMap = mutableMapOf(),
+        targetTableMap = mutableMapOf(),
+        srcCompDef = mutableMapOf(),
+        tgtCompDef = mutableMapOf(),
+        sourceRowsByUid = cache.sourceRowsByUid,
+        targetRowsByUid = cache.targetRowsByUid,
+        collectedRelationships = cache.collectedRelationships.toSet()
+    )
+
+    private suspend fun getPrefetchCacheFilePath(id: Int): String = withContext(Dispatchers.IO) {
+        val mergeRequestFolder = File(dataFolder, "merge_request_$id")
+        if (!mergeRequestFolder.exists()) mergeRequestFolder.mkdirs()
+        File(mergeRequestFolder, "prefetch_cache.json").absolutePath
+    }
+
+    private suspend fun getPrefetchCache(id: Int): ComparisonPrefetchCache? = withContext(Dispatchers.IO) {
+        val path = getPrefetchCacheFilePath(id)
+        val f = File(path)
+        if (!f.exists()) return@withContext null
+        try {
+            val content = f.readText()
+            JsonParser.decodeFromString<ComparisonPrefetchCache>(content)
+        } catch (e: Exception) {
+            logger.error("Error reading prefetch cache for merge request $id: ${e.message}", e)
+            null
+        }
+    }
+
+    private suspend fun savePrefetchCache(id: Int, cache: ComparisonPrefetchCache) = withContext(Dispatchers.IO) {
+        try {
+            val path = getPrefetchCacheFilePath(id)
+            val f = File(path)
+            val json = JsonParser.encodeToString(cache)
+            f.writeText(json)
+        } catch (e: Exception) {
+            logger.error("Error saving prefetch cache for merge request $id: ${e.message}", e)
+            throw e
+        }
+    }
+
     private suspend fun getContentComparisonFile(id: Int): ContentTypeComparisonResultMapWithRelationships? {
         return withContext(Dispatchers.IO) {
             val schemaFilePath = getContentComparisonFilePath(id)
@@ -478,7 +868,10 @@ class MergeRequestService(
                 try {
                     // Read the file and deserialize
                     val fileContent = schemaFile.readText()
-                    val fileStorage = JsonParser.decodeFromString<ContentTypeComparisonResultMapWithRelationships>(fileContent)
+                    // Enrich JSON by recomputing cleanData for all StrapiContent elements
+                    val enrichedJson = enrichWithCleanData(Json.parseToJsonElement(fileContent)).toString()
+                    val fileStorage =
+                        JsonParser.decodeFromString<ContentTypeComparisonResultMapWithRelationships>(enrichedJson)
                     fileStorage
                 } catch (e: Exception) {
                     // If there's an error reading the file, log it and continue with a new check
@@ -491,13 +884,18 @@ class MergeRequestService(
         }
     }
 
-    private suspend fun saveContentComparisonFile(id: Int, contentComparison: ContentTypeComparisonResultMapWithRelationships) {
+    private suspend fun saveContentComparisonFile(
+        id: Int,
+        contentComparison: ContentTypeComparisonResultMapWithRelationships
+    ) {
         withContext(Dispatchers.IO) {
             try {
                 val schemaFilePath = getContentComparisonFilePath(id)
                 val schemaResultFile = File(schemaFilePath)
+                // Serialize normally, then strip all cleanData fields before saving
                 val jsonContent = JsonParser.encodeToString(contentComparison)
-                schemaResultFile.writeText(jsonContent)
+                val stripped = stripCleanData(Json.parseToJsonElement(jsonContent)).toString()
+                schemaResultFile.writeText(stripped)
             } catch (e: Exception) {
                 logger.error("Error saving content comparison file for merge request $id: ${e.message}", e)
                 throw e
@@ -509,10 +907,12 @@ class MergeRequestService(
     suspend fun checkSchemaCompatibility(
         id: Int,
         force: Boolean = false
-    ): SchemaCompatibilityResult {
+    ): SchemaDbCompatibilityResult {
         val mergeRequest = mergeRequestRepository.getMergeRequestWithInstances(id)
             ?: throw IllegalArgumentException("Merge request not found")
-
+        if (mergeRequest.status == MergeRequestStatus.IN_PROGRESS || mergeRequest.status == MergeRequestStatus.COMPLETED || mergeRequest.status == MergeRequestStatus.FAILED) {
+            throw IllegalStateException("Cannot check schema after merge has been started or completed")
+        }
         return checkSchemaCompatibility(mergeRequest, force)
     }
 
@@ -525,17 +925,19 @@ class MergeRequestService(
     private suspend fun checkSchemaCompatibility(
         mergeRequest: MergeRequestWithInstancesDTO,
         force: Boolean = false
-    ): SchemaCompatibilityResult {
+    ): SchemaDbCompatibilityResult {
 
+        if (mergeRequest.status == MergeRequestStatus.IN_PROGRESS || mergeRequest.status == MergeRequestStatus.COMPLETED || mergeRequest.status == MergeRequestStatus.FAILED) {
+            throw IllegalStateException("Cannot check schema after merge has been started or completed")
+        }
 
         if (!force)
             getSchemaCompatibilityFile(mergeRequest.id)?.let { return it }
-
-        // Perform the schema compatibility check
-        val schemaResult = syncService.checkSchemaCompatibility(
-            mergeRequest.sourceInstance,
-            mergeRequest.targetInstance
+        val dbRes: SchemaDbCompatibilityResult = syncService.checkSchemaCompatibilityDb(
+            sourceInstance = mergeRequest.sourceInstance,
+            targetInstance = mergeRequest.targetInstance
         )
+        dbRes
 
 
         // Update the merge request with the schema compatibility result and sourceContentTypes if compatible
@@ -543,9 +945,9 @@ class MergeRequestService(
         mergeRequestRepository.updateSchemaCompatibility(mergeRequest.id)
 
         // Save the result to a file
-        saveSchemaCompatibilityFile(mergeRequest.id, schemaResult)
+        saveSchemaCompatibilityFile(mergeRequest.id, dbRes)
 
-        return schemaResult
+        return dbRes
     }
 
     /**
@@ -556,12 +958,14 @@ class MergeRequestService(
      */
     suspend fun compareContent(
         id: Int,
-        force: Boolean = false
+        mode: CompareMode
     ): ContentTypeComparisonResultMapWithRelationships {
         val mergeRequest = mergeRequestRepository.getMergeRequestWithInstances(id)
             ?: throw IllegalArgumentException("Merge request not found")
-
-        return compareContent(mergeRequest, force)
+        if (mergeRequest.status == MergeRequestStatus.IN_PROGRESS || mergeRequest.status == MergeRequestStatus.COMPLETED || mergeRequest.status == MergeRequestStatus.FAILED) {
+            throw IllegalStateException("Cannot compare content after merge has been started or completed")
+        }
+        return compareContent(mergeRequest, mode)
     }
 
     /**
@@ -572,10 +976,10 @@ class MergeRequestService(
      */
     private suspend fun compareContent(
         mergeRequest: MergeRequestWithInstancesDTO,
-        force: Boolean = false
+        mode: CompareMode
     ): ContentTypeComparisonResultMapWithRelationships {
-        if (mergeRequest.status == MergeRequestStatus.COMPLETED) {
-            throw IllegalStateException("Merge request has already been completed")
+        if (mergeRequest.status == MergeRequestStatus.COMPLETED || mergeRequest.status == MergeRequestStatus.IN_PROGRESS || mergeRequest.status == MergeRequestStatus.FAILED) {
+            throw IllegalStateException("Cannot compare content after merge has been started or completed")
         }
 
         val schemas = checkSchemaCompatibility(mergeRequest)
@@ -584,29 +988,49 @@ class MergeRequestService(
             throw IllegalStateException("Source and target instances are not compatible")
         }
 
-        if (!force)
-            getContentComparisonFile(mergeRequest.id)?.let { return it }
+        suspend fun computeAndPersist(prefetch: ComparisonPrefetch): ContentTypeComparisonResultMapWithRelationships {
+            val comp = computeComparisonFromPrefetch(mergeRequest, schemas.extractedSchema!!, prefetch)
+            mergeRequestRepository.updateComparisonData(mergeRequest.id)
+            saveContentComparisonFile(mergeRequest.id, comp)
+            return comp
+        }
 
+        when (mode) {
+            CompareMode.Cache -> {
+                // Return file result if present
+                getContentComparisonFile(mergeRequest.id)?.let { return it }
+                // Try compute from cached prefetch
+                val cached = getPrefetchCache(mergeRequest.id)
+                if (cached != null) {
+                    val pre = fromCache(cached)
+                    return computeAndPersist(pre)
+                }
+                // Fallback to Full
+            }
 
-        // Perform the content comparison
-        val comparisonResults = syncService.compareContentWithRelationships(
-            mergeRequest,
-            schemas.sourceContentTypes,
-            schemas.sourceComponents
-        )
+            else -> {}
+        }
 
-        // Update the merge request with the comparison data and reset subsequent steps
-        mergeRequestRepository.updateComparisonData(mergeRequest.id)
+        return when (mode) {
+            CompareMode.Full -> {
+                val prefetch = prefetchComparisonData(mergeRequest, schemas.extractedSchema!!)
+                savePrefetchCache(mergeRequest.id, toCache(prefetch))
+                computeAndPersist(prefetch)
+            }
 
-        saveContentComparisonFile(mergeRequest.id, comparisonResults)
-
-        return comparisonResults
+            CompareMode.Compare, CompareMode.Cache -> {
+                val cached = getPrefetchCache(mergeRequest.id)
+                val prefetch = if (cached != null) fromCache(cached) else prefetchComparisonData(
+                    mergeRequest,
+                    schemas.extractedSchema!!
+                ).also {
+                    savePrefetchCache(mergeRequest.id, toCache(it))
+                }
+                computeAndPersist(prefetch)
+            }
+        }
     }
 
-
-    suspend fun getAllMergeRequestData(id: Int): MergeRequestData {
-        return getAllMergeRequestDataIfCompared(id, true) ?: throw IllegalStateException("Merge request not completed")
-    }
 
     // The methods getMergeRequestFiles and getMergeRequestCollectionContentTypes have been removed
     // All data is now provided by the getAllMergeRequestData method
@@ -617,6 +1041,10 @@ class MergeRequestService(
      * @param id Merge request ID
      * @return MergeRequestData containing all the necessary information
      */
+    suspend fun getAllMergeRequestData(id: Int, forceCompare: Boolean): MergeRequestData? {
+        return getAllMergeRequestDataIfCompared(id, forceCompare)
+    }
+
     private suspend fun getAllMergeRequestDataIfCompared(id: Int, forceCompare: Boolean): MergeRequestData? {
         // Use a single transaction for all database operations to prevent locks
         return dbQuery {
@@ -626,64 +1054,24 @@ class MergeRequestService(
             // Get comparison data from file if available, otherwise compute it
             var compareResult = getContentComparisonFile(id)
             if (compareResult == null && forceCompare)
-                compareResult = compareContent(mergeRequest, false)
+                compareResult = compareContent(mergeRequest, CompareMode.Compare)
 
             // Get selections
-            val selections = mergeRequestSelectionsRepository.getSelectionsGroupedByContentType(id)
+            val selections = mergeRequestSelectionsRepository.getSelectionsGroupedByTableName(id)
 
             // Return all data in a single object
             if (compareResult == null) {
                 return@dbQuery null
             }
             MergeRequestData(
-                files = compareResult.files.let { files ->
-                    files.copy(
-                        onlyInSource = files.onlyInSource.map {
-                            it.copy(
-                                metadata = it.metadata.copy(
-                                    url = it.downloadUrl(
-                                        mergeRequest.sourceInstance.url
-                                    )
-                                )
-                            )
-                        },
-                        onlyInTarget = files.onlyInTarget.map {
-                            it.copy(
-                                metadata = it.metadata.copy(
-                                    url = it.downloadUrl(
-                                        mergeRequest.targetInstance.url
-                                    )
-                                )
-                            )
-                        },
-                        different = files.different.map {
-                            it.copy(
-                                source = it.source.copy(
-                                    metadata = it.source.metadata.copy(
-                                        url = it.source.downloadUrl(
-                                            mergeRequest.sourceInstance.url
-                                        )
-                                    )
-                                ),
-                                target = it.target.copy(
-                                    metadata = it.target.metadata.copy(
-                                        url = it.target.downloadUrl(
-                                            mergeRequest.targetInstance.url
-                                        )
-                                    )
-                                )
-                            )
-                        },
-                        identical = files.identical.map {
-                            it.copy(
-                                metadata = it.metadata.copy(
-                                    url = it.downloadUrl(
-                                        mergeRequest.sourceInstance.url
-                                    )
-                                )
-                            )
-                        }
-                    )
+                files = compareResult.files.map { cmp ->
+                    val newSource = cmp.sourceImage?.let { img ->
+                        img.copy(metadata = img.metadata.copy(url = img.downloadUrl(mergeRequest.sourceInstance.url)))
+                    }
+                    val newTarget = cmp.targetImage?.let { img ->
+                        img.copy(metadata = img.metadata.copy(url = img.downloadUrl(mergeRequest.targetInstance.url)))
+                    }
+                    cmp.copy(sourceImage = newSource, targetImage = newTarget)
                 },
                 singleTypes = compareResult.singleTypes,
                 collectionTypes = compareResult.collectionTypes,
@@ -710,1272 +1098,324 @@ class MergeRequestService(
         val comparisonDataMap = getContentComparisonFile(id)
             ?: throw IllegalStateException("Comparison data not found")
 
+        // Mark as started to lock further changes
+        mergeRequestRepository.updateMergeRequestStatus(id, MergeRequestStatus.IN_PROGRESS)
+
         // Create clients for source and target instances
         val sourceClient = mergeRequest.sourceInstance.client()
         val targetClient = mergeRequest.targetInstance.client()
 
+        // Set error logging context on clients for this merge request
+        sourceClient.role = "source"
+        targetClient.role = "target"
+        sourceClient.currentMergeRequestId = id
+        targetClient.currentMergeRequestId = id
+        sourceClient.dataRootFolder = dataFolder
+        targetClient.dataRootFolder = dataFolder
+
+        val schema = getSchemaCompatibilityFile(mergeRequest.id)!!.extractedSchema!!
+
         val mergeRequestSelection = mergeRequestSelectionsRepository.getSelectionsForMergeRequest(id)
+        val mappingMap: MutableMap<String, MutableMap<String, MergeRequestDocumentMapping>> =
+            MergeRequestDocumentMappingTable.fetchMappingMap(mergeRequest)
+                .mapValues { (_, v) -> v.toMutableMap() }
+                .toMutableMap()
 
         // 2. Retrieve files related to the merge request from the table
-        val (mergeRequestFiles, contentSelections) = mergeRequestSelection.partition { it.contentType == STRAPI_FILE_CONTENT_TYPE_NAME }
+        val (mergeRequestFiles, contentSelections) = mergeRequestSelection.partition { it.tableName == "files" }
 
-        // Calculate total items for progress tracking
-        val totalFiles = mergeRequestFiles.size
-        val totalContentItems = contentSelections.size
-        val totalItems = totalFiles + totalContentItems
-        var processedItems = 0
-
-        // Send initial progress update
-        SyncProgressService.sendProgressUpdate(
-            SyncProgressUpdate(
-                mergeRequestId = id,
-                totalItems = totalItems,
-                processedItems = processedItems,
-                currentItem = "Starting synchronization",
-                currentItemType = "",
-                currentOperation = "INIT",
-                status = "IN_PROGRESS"
+        // Emit initial SSE event
+        try {
+            val totalItems = mergeRequestSelection.size
+            it.sebi.SyncProgressService.sendProgressUpdate(
+                it.sebi.SyncProgressUpdate(
+                    mergeRequestId = id,
+                    totalItems = totalItems,
+                    processedItems = mergeRequestSelection.count { it.syncDate != null },
+                    currentItem = "Starting synchronization",
+                    currentItemType = "SYSTEM",
+                    currentOperation = "START",
+                    status = "INFO",
+                    message = null
+                )
             )
-        )
+        } catch (_: Exception) { /* ignore */
+        }
 
         try {
             // 3. Process files if there are any
-            if (mergeRequestFiles.isNotEmpty()) {
-                val comparisonData = comparisonDataMap.files
-
-                // Process each file and send progress updates
-                mergeRequestFiles.forEachIndexed { index, file ->
-                    val currentItem = "File ${index + 1}/${mergeRequestFiles.size}"
-
-                    // Send progress update before processing the file
-                    SyncProgressService.sendProgressUpdate(
-                        SyncProgressUpdate(
-                            mergeRequestId = id,
-                            totalItems = totalItems,
-                            processedItems = processedItems,
-                            currentItem = file.documentId,
-                            currentItemType = STRAPI_FILE_CONTENT_TYPE_NAME,
-                            currentOperation = "PROCESSING",
-                            status = "IN_PROGRESS"
-                        )
-                    )
-
-                    try {
-                        // Process the file
-                        val fileList = listOf(file)
-                        mergeRequestFileMergeProcess(mergeRequest, sourceClient, targetClient, fileList, comparisonData)
-
-                        // Update processed items count and send success update
-                        processedItems++
-                        SyncProgressService.sendProgressUpdate(
-                            SyncProgressUpdate(
-                                mergeRequestId = id,
-                                totalItems = totalItems,
-                                processedItems = processedItems,
-                                currentItem = file.documentId,
-                                currentItemType = STRAPI_FILE_CONTENT_TYPE_NAME,
-                                currentOperation = "PROCESSED",
-                                status = "SUCCESS"
+            val targetFileMap: MutableMap<String, Int> =
+                comparisonDataMap.files.mapNotNull { f -> f.targetImage?.metadata?.documentId?.let { it to f.targetImage.metadata.id } }
+                    .toMap().toMutableMap()
+            val processedFiles: MutableMap<String, Int> =
+                mergeRequestFiles.fold(mutableMapOf<String, Int>()) { acc, file ->
+                    // Process the file
+                    val fileList = listOf(file)
+                    acc.apply {
+                        putAll(
+                            fileMergeProcessor.processFiles(
+                                sourceClient,
+                                targetClient,
+                                mergeRequest.sourceInstance,
+                                mergeRequest.targetInstance,
+                                fileList,
+                                comparisonDataMap.files
                             )
                         )
-                    } catch (e: Exception) {
-                        // Send failure update
-                        SyncProgressService.sendProgressUpdate(
-                            SyncProgressUpdate(
-                                mergeRequestId = id,
-                                totalItems = totalItems,
-                                processedItems = processedItems,
-                                currentItem = file.documentId,
-                                currentItemType = STRAPI_FILE_CONTENT_TYPE_NAME,
-                                currentOperation = "FAILED",
-                                status = "ERROR",
-                                message = e.message
-                            )
-                        )
-                        throw e
                     }
                 }
-            }
 
-            // 4. Retrieve content selections from the database
-            val groupedSelections = contentSelections.groupBy { it.contentType }
+            val allTargetMap = targetFileMap + processedFiles
 
-            // 5. Process singleTypes and collectionTypes
-            if (groupedSelections.isNotEmpty()) {
-                // Send progress update before processing content
-                SyncProgressService.sendProgressUpdate(
-                    SyncProgressUpdate(
-                        mergeRequestId = id,
-                        totalItems = totalItems,
-                        processedItems = processedItems,
-                        currentItem = "Processing content types",
-                        currentItemType = "content",
-                        currentOperation = "PROCESSING",
-                        status = "IN_PROGRESS"
-                    )
+            // Calcola l'ordine di sincronizzazione dei contenuti in base alle dipendenze
+            val syncOrderResult: SyncOrderResult = computeContentSyncOrder(
+                contentSelections = contentSelections,
+                comparison = comparisonDataMap,
+                allTargetMap = allTargetMap
+            )
+
+            // 5. Process content in dependency-resolved batches (create/update only)
+            if (contentSelections.isNotEmpty()) {
+                // First, process batches computed from dependencies
+                contentMergeProcessor.processBatches(
+                    mergeRequest.sourceInstance,
+                    mergeRequest.targetInstance,
+                    targetClient,
+                    syncOrderResult.batches,
+                    comparisonDataMap,
+                    schema,
+                    syncOrderResult.circularEdges,
+                    allTargetMap,
+                    mappingMap
                 )
 
-                // We need to modify the mergeRequestContentMergeProcess method to track progress,
-                // but for now we'll just process all content and then update progress
-                try {
-                    mergeRequestContentMergeProcess(
-                        mergeRequest,
-                        sourceClient,
+                // Then, process deletions (not part of dependency graph)
+                val deletionsOnly = contentSelections.filter { it.direction == Direction.TO_DELETE }
+                if (deletionsOnly.isNotEmpty()) {
+                    contentMergeProcessor.processDeletions(
+                        mergeRequest.targetInstance,
                         targetClient,
-                        groupedSelections,
-                        comparisonDataMap
+                        deletionsOnly,
+                        comparisonDataMap,
+                        schema
                     )
-
-                    // Update processed items count
-                    processedItems += totalContentItems
-
-                    // Send success update
-                    SyncProgressService.sendProgressUpdate(
-                        SyncProgressUpdate(
-                            mergeRequestId = id,
-                            totalItems = totalItems,
-                            processedItems = processedItems,
-                            currentItem = "Content types processed",
-                            currentItemType = "content",
-                            currentOperation = "PROCESSED",
-                            status = "SUCCESS"
-                        )
-                    )
-                } catch (e: Exception) {
-                    // Send failure update
-                    SyncProgressService.sendProgressUpdate(
-                        SyncProgressUpdate(
-                            mergeRequestId = id,
-                            totalItems = totalItems,
-                            processedItems = processedItems,
-                            currentItem = "Content types processing failed",
-                            currentItemType = "content",
-                            currentOperation = "FAILED",
-                            status = "ERROR",
-                            message = e.message
-                        )
-                    )
-                    throw e
                 }
             }
 
-            // 6. Update the merge request status
-            val result = mergeRequestRepository.updateMergeRequestStatus(id, MergeRequestStatus.COMPLETED)
+            // 5b. Second pass: complete circular relations where dependencies succeeded
+            if (syncOrderResult.circularEdges.isNotEmpty()) {
+                val itemsWithCircular = syncOrderResult.batches.flatten().filter { item ->
+                    syncOrderResult.circularEdges.any { it.fromTable == item.selection.tableName && it.fromDocumentId == item.selection.documentId }
+                }
+                if (itemsWithCircular.isNotEmpty()) {
+                    val latestSelections = mergeRequestSelectionsRepository.getSelectionsForMergeRequest(id)
+                    val statusByKey: Map<Pair<String, String>, Boolean> =
+                        latestSelections.associate { (it.tableName to it.documentId) to (it.syncSuccess == true) }
+                    contentMergeProcessor.processCircularSecondPass(
+                        mergeRequest.targetInstance,
+                        targetClient,
+                        itemsWithCircular,
+                        comparisonDataMap,
+                        schema,
+                        syncOrderResult.circularEdges,
+                        allTargetMap,
+                        statusByKey,
+                        mappingMap
+                    )
+                }
+            }
 
-            // Send final success update
-            SyncProgressService.sendProgressUpdate(
-                SyncProgressUpdate(
-                    mergeRequestId = id,
-                    totalItems = totalItems,
-                    processedItems = totalItems,
-                    currentItem = "Synchronization completed",
-                    currentItemType = "",
-                    currentOperation = "COMPLETED",
-                    status = "SUCCESS"
+            // 6. Update the merge request status: COMPLETED if all succeeded, otherwise FAILED (remain locked)
+            val latestSelections = mergeRequestSelectionsRepository.getSelectionsForMergeRequest(id)
+            val allSucceeded = latestSelections.isEmpty() || latestSelections.all { it.syncSuccess == true }
+            val result = if (allSucceeded) {
+                mergeRequestRepository.updateMergeRequestStatus(id, MergeRequestStatus.COMPLETED)
+            } else {
+                mergeRequestRepository.updateMergeRequestStatus(id, MergeRequestStatus.FAILED)
+            }
+
+            // Emit final SSE event
+            try {
+                it.sebi.SyncProgressService.sendProgressUpdate(
+                    it.sebi.SyncProgressUpdate(
+                        mergeRequestId = id,
+                        totalItems = latestSelections.size,
+                        processedItems = latestSelections.count { it.syncDate != null },
+                        currentItem = if (allSucceeded) "Synchronization completed" else "Content types processed",
+                        currentItemType = "SYSTEM",
+                        currentOperation = if (allSucceeded) "COMPLETED" else "PROCESSED",
+                        status = if (allSucceeded) "SUCCESS" else "INFO",
+                        message = null
+                    )
                 )
-            )
+            } catch (_: Exception) { /* ignore */
+            }
 
             return result
         } catch (e: Exception) {
             // Send final error update
-            SyncProgressService.sendProgressUpdate(
-                SyncProgressUpdate(
-                    mergeRequestId = id,
-                    totalItems = totalItems,
-                    processedItems = processedItems,
-                    currentItem = "Synchronization failed",
-                    currentItemType = "",
-                    currentOperation = "FAILED",
-                    status = "ERROR",
-                    message = e.message
+            try {
+                val currentSelections = mergeRequestSelectionsRepository.getSelectionsForMergeRequest(id)
+                it.sebi.SyncProgressService.sendProgressUpdate(
+                    it.sebi.SyncProgressUpdate(
+                        mergeRequestId = id,
+                        totalItems = currentSelections.size,
+                        processedItems = currentSelections.count { it.syncDate != null },
+                        currentItem = "Synchronization failed",
+                        currentItemType = "SYSTEM",
+                        currentOperation = "FAILED",
+                        status = "ERROR",
+                        message = e.message
+                    )
                 )
-            )
+            } catch (_: Exception) { /* ignore */
+            }
+            // Mark as FAILED to keep it locked
+            try {
+                mergeRequestRepository.updateMergeRequestStatus(id, MergeRequestStatus.FAILED)
+            } catch (_: Exception) {
+            }
             throw e
         }
     }
 
-    data class ContentMapping(
-        val targetDocumentId: String,
-        val targetId: Int
+    // ----------------------
+    // Sync Plan DTOs and API
+    // ----------------------
+    @Serializable
+    data class SyncPlanItemDTO(
+        val tableName: String,
+        val documentId: String,
+        val direction: Direction
     )
 
-    private suspend fun mergeRequestContentMergeProcess(
-        mergeRequest: MergeRequestWithInstancesDTO,
-        sourceClient: StrapiClient,
-        targetClient: StrapiClient,
-        groupedSelections: Map<String, List<MergeRequestSelection>>,
-        comparisonDataMap: ContentTypeComparisonResultMapWithRelationships
-    ) {
-        val mergeRequestSelectionsRepository = MergeRequestSelectionsRepository()
-        // Store mappings between source and target IDs for all processed content types
+    @Serializable
+    data class MissingDependencyDTO(
+        val fromTable: String,
+        val fromDocumentId: String,
+        val linkField: String,
+        val linkTargetTable: String,
+        val reason: String
+    )
 
-        val schema = getSchemaCompatibilityFile(mergeRequest.id)!!.sourceContentTypes
+    @Serializable
+    data class CircularDependencyEdgeDTO(
+        val fromTable: String,
+        val fromDocumentId: String,
+        val toTable: String,
+        val toDocumentId: String,
+        val viaField: String
+    )
 
-        val contentTypeMappingByUid: Map<String, Schema> = schema.associate { it.uid to it.schema }
+    @Serializable
+    data class DependencyEdgeDTO(
+        val fromTable: String,
+        val fromDocumentId: String,
+        val toTable: String,
+        val toDocumentId: String,
+        val viaField: String
+    )
 
-        val idMappings =
-            mutableMapOf<String, MutableMap<String, ContentMapping>>() // contentType -> sourceDocumentId -> targetDocumentId
+    @Serializable
+    data class SyncPlanDTO(
+        val batches: List<List<SyncPlanItemDTO>>,
+        val missingDependencies: List<MissingDependencyDTO>,
+        val circularEdges: List<CircularDependencyEdgeDTO>,
+        val edges: List<DependencyEdgeDTO>
+    )
 
-        // Get existing mappings from the database
-        val existingMappings = mergeRequestDocumentMappingRepository.getAllMappings(
-            mergeRequest.sourceInstance.id,
-            mergeRequest.targetInstance.id,
+    suspend fun getSyncPlan(id: Int): SyncPlanDTO {
+        val mergeRequest = mergeRequestRepository.getMergeRequestWithInstances(id)
+            ?: throw IllegalArgumentException("Merge request not found")
+        val comparisonDataMap = getContentComparisonFile(id)
+            ?: throw IllegalStateException("Comparison data not found. Run compare before requesting plan.")
+        val selections = mergeRequestSelectionsRepository.getSelectionsForMergeRequest(id)
+        // Split files from content selections
+        val (mergeRequestFiles, contentSelections) = selections.partition { it.tableName == "files" }
+        // Build map of files already in target
+        val targetFileMap: Map<String, Int> =
+            comparisonDataMap.files.mapNotNull { f ->
+                f.targetImage?.metadata?.documentId?.let { it to (f.targetImage.metadata.id) }
+            }.toMap() + comparisonDataMap.files.mapNotNull { f ->
+                f.sourceImage?.metadata?.documentId?.let { it to (f.sourceImage.metadata.id) }
+            }.toMap()
+        // Consider also files selected to be created/updated as satisfied for planning purposes
+        val pendingFileDocIds: Set<String> = mergeRequestFiles
+            .filter { it.direction != Direction.TO_DELETE }
+            .map { it.documentId }
+            .toSet()
+        val augmentedAllTargetMap: MutableMap<String, Int> = targetFileMap.toMutableMap()
+        pendingFileDocIds.forEach { docId ->
+            augmentedAllTargetMap.putIfAbsent(docId, -1)
+        }
+        val order = computeContentSyncOrder(
+            contentSelections = contentSelections,
+            comparison = comparisonDataMap,
+            allTargetMap = augmentedAllTargetMap
         )
-
-
-        groupedSelections.forEach { (contentType, selections) ->
-            if (comparisonDataMap.singleTypes.containsKey(contentType)) {
-                comparisonDataMap.singleTypes[contentType]?.relationships?.flatMap { relationship ->
-                    selections.mapNotNull { selection ->
-                        if (selection.documentId == relationship.sourceDocumentId) {
-                            existingMappings.find { m -> m.sourceDocumentId == relationship.targetDocumentId }
-                                ?.let { it.sourceDocumentId!! to ContentMapping(it.targetDocumentId!!, it.targetId!!) }
-                        } else null
-                    }
-                }?.toMap()?.let { idMappings.put(contentType, it.toMutableMap()) }
-            } else {
-                if (comparisonDataMap.collectionTypes.containsKey(contentType)) {
-                    selections.mapNotNull { selection ->
-                        comparisonDataMap.collectionTypes[contentType]?.relationships?.get(selection.documentId)
-                            ?.mapNotNull { relationship ->
-
-                                if (selection.documentId == relationship.sourceDocumentId) {
-                                    existingMappings.find { m -> m.sourceDocumentId == relationship.targetDocumentId }
-                                        ?.let {
-                                            it.sourceDocumentId!! to ContentMapping(
-                                                it.targetDocumentId!!,
-                                                it.targetId!!
-                                            )
-                                        }
-                                } else null
-                            }
-
-                    }.flatten().toMap().let { idMappings.put(contentType, it.toMutableMap()) }
-                }
-
-            }
-        }
-
-
-        // Process singleTypes first
-        val singleTypeSelections = groupedSelections.filter { entry ->
-            comparisonDataMap.singleTypes.containsKey(entry.key)
-        }
-
-
-        // Process collectionTypes next
-        val collectionTypeSelections = groupedSelections.filter { entry ->
-            comparisonDataMap.collectionTypes.containsKey(entry.key)
-        }
-
-        // Sort content types based on dependencies to ensure they are processed in the correct order
-        val sortedContentTypes = sortContentTypesByDependencies(
-            singleTypeSelections.keys.toList(),
-            collectionTypeSelections.keys.toList(),
-            comparisonDataMap
-        )
-
-        // First pass: Create or update entries without relationships
-        for (contentType in sortedContentTypes) {
-            val selections = groupedSelections[contentType] ?: continue
-
-            if (comparisonDataMap.singleTypes.containsKey(contentType)) {
-                // Process singleType
-                processSingleType(
-                    contentType,
-                    contentTypeMappingByUid[contentType]!!,
-                    selections,
-                    comparisonDataMap.singleTypes[contentType]!!,
-                    sourceClient,
-                    targetClient,
-                    mergeRequest,
-                    idMappings,
-                    firstPass = true
-                )
-            } else if (comparisonDataMap.collectionTypes.containsKey(contentType)) {
-                // Process collectionType
-                processCollectionType(
-                    contentType,
-                    contentTypeMappingByUid[contentType]!!,
-                    selections,
-                    comparisonDataMap.collectionTypes[contentType]!!,
-                    sourceClient,
-                    targetClient,
-                    mergeRequest,
-                    idMappings,
-                    firstPass = true
-                )
-            }
-        }
-
-        // Second pass: Update entries with relationships
-        for (contentType in sortedContentTypes) {
-            val selections = groupedSelections[contentType] ?: continue
-
-            if (comparisonDataMap.singleTypes.containsKey(contentType)) {
-                // Process singleType
-                processSingleType(
-                    contentType,
-                    contentTypeMappingByUid[contentType]!!,
-                    selections,
-                    comparisonDataMap.singleTypes[contentType]!!,
-                    sourceClient,
-                    targetClient,
-                    mergeRequest,
-                    idMappings,
-                    firstPass = false
-                )
-            } else if (comparisonDataMap.collectionTypes.containsKey(contentType)) {
-                // Process collectionType
-                processCollectionType(
-                    contentType,
-                    contentTypeMappingByUid[contentType]!!,
-                    selections,
-                    comparisonDataMap.collectionTypes[contentType]!!,
-                    sourceClient,
-                    targetClient,
-                    mergeRequest,
-                    idMappings,
-                    firstPass = false
-                )
-            }
-        }
-    }
-
-    private fun sortContentTypesByDependencies(
-        singleTypes: List<String>,
-        collectionTypes: List<String>,
-        comparisonDataMap: ContentTypeComparisonResultMapWithRelationships
-    ): List<String> {
-        val contentTypes = (singleTypes + collectionTypes).toMutableList()
-        val result = mutableListOf<String>()
-        val visited = mutableSetOf<String>()
-
-        // Helper function to get dependencies for a content type
-        fun getDependencies(contentType: String): List<String> {
-            return when {
-                comparisonDataMap.singleTypes.containsKey(contentType) ->
-                    comparisonDataMap.singleTypes[contentType]?.dependsOn ?: emptyList()
-
-                comparisonDataMap.collectionTypes.containsKey(contentType) ->
-                    comparisonDataMap.collectionTypes[contentType]?.dependsOn ?: emptyList()
-
-                else -> emptyList()
-            }
-        }
-
-        // Topological sort using depth-first search
-        fun visit(contentType: String) {
-            if (contentType in visited) return
-            visited.add(contentType)
-
-            val dependencies = getDependencies(contentType)
-            for (dependency in dependencies) {
-                if (dependency in contentTypes && dependency !in visited) {
-                    visit(dependency)
-                }
-            }
-
-            result.add(contentType)
-        }
-
-        // Visit all content types
-        for (contentType in contentTypes) {
-            if (contentType !in visited) {
-                visit(contentType)
-            }
-        }
-
-        return result
-    }
-
-    private suspend fun processSingleType(
-        contentTypeUid: String,
-        contentTypeSchema: Schema,
-        selections: List<MergeRequestSelection>,
-        comparisonResult: ContentTypeComparisonResultWithRelationships,
-        sourceClient: StrapiClient,
-        targetClient: StrapiClient,
-        mergeRequest: MergeRequestWithInstancesDTO,
-        idMappings: MutableMap<String, MutableMap<String, ContentMapping>>,
-        firstPass: Boolean
-    ) {
-        val mergeRequestSelectionsRepository = MergeRequestSelectionsRepository()
-        // Single types only have one entry, so we only need to check if there's a selection
-        val selection = selections.firstOrNull() ?: return
-
-        when (selection.direction) {
-            Direction.TO_CREATE -> {
-                // Create the entry in the target
-                val sourceEntry = comparisonResult.onlyInSource ?: return
-                val sourceData = sourceEntry.rawData
-
-                // Prepare data for creation by removing relationships in first pass
-                val dataToCreate = prepareDataForCreation(
-                    sourceData,
-                    idMappings,
-                    firstPass
-                )
-
-                try {
-                    val response = targetClient.createContentEntry(
-                        contentTypeSchema.queryName,
-                        dataToCreate,
-                        StrapiContentTypeKind.SingleType
-                    )
-
-                    // Extract the created entry's ID and documentId
-                    val data = response["data"]?.jsonObject
-                    val targetId = data?.get("id")?.toString()?.toInt() ?: 0
-                    val targetDocumentId = data?.get("documentId")?.toString()?.replace("\"", "") ?: ""
-
-                    // Store the mapping
-                    idMappings.getOrPut(contentTypeUid) { mutableMapOf() }[sourceEntry.metadata.documentId] =
-                        ContentMapping(targetDocumentId, targetId)
-
-                    // Create or update the mapping in the database
-                    val existingMapping = mergeRequestDocumentMappingRepository.getFilesMappingsForInstances(
-                        mergeRequest.sourceInstance.id,
-                        mergeRequest.targetInstance.id,
-                        listOf(sourceEntry.metadata.documentId),
-                        emptyList()
-                    ).firstOrNull()
-
-                    if (existingMapping == null) {
-                        // Create new mapping
-                        val newMapping = MergeRequestDocumentMapping(
-                            sourceId = sourceEntry.metadata.id,
-                            contentType = contentTypeUid,
-                            sourceStrapiInstanceId = mergeRequest.sourceInstance.id,
-                            targetStrapiInstanceId = mergeRequest.targetInstance.id,
-                            sourceDocumentId = sourceEntry.metadata.documentId,
-                            sourceLastUpdateDate = OffsetDateTime.now(),
-                            sourceDocumentMD5 = "",
-                            targetId = targetId,
-                            targetDocumentId = targetDocumentId,
-                            targetLastUpdateDate = OffsetDateTime.now(),
-                            targetDocumentMD5 = ""
+        // Filter out false-positive missing deps for files satisfied by selected files or target presence
+        val filteredMissing = order.missingDependencies.filterNot { m ->
+            if (m.link.targetTable == "files") {
+                val depDocId = resolveDocIdForLinkInternal("files", m.link.targetId, comparisonDataMap)
+                depDocId != null && (
+                        augmentedAllTargetMap.containsKey(depDocId) ||
+                                comparisonDataMap.files.any { it.targetImage?.metadata?.documentId == depDocId }
                         )
-                        mergeRequestDocumentMappingRepository.createMapping(newMapping)
-                    } else {
-                        // Update existing mapping
-                        val updatedMapping = existingMapping.copy(
-                            sourceLastUpdateDate = OffsetDateTime.now(),
-                            contentType = contentTypeUid,
-                            targetId = targetId,
-                            targetDocumentId = targetDocumentId,
-                            targetLastUpdateDate = OffsetDateTime.now()
-                        )
-                        mergeRequestDocumentMappingRepository.updateMapping(existingMapping.id, updatedMapping)
-                    }
-
-                    // Update sync status to success
-                    mergeRequestSelectionsRepository.updateSyncStatus(
-                        selection.id,
-                        true,
-                        null
-                    )
-                } catch (e: Exception) {
-                    logger.error("Error creating single type $contentTypeUid: ${e.message}", e)
-
-                    // Update sync status to failure
-                    mergeRequestSelectionsRepository.updateSyncStatus(
-                        selection.id,
-                        false,
-                        e.message ?: "Unknown error"
-                    )
-                }
-            }
-
-            Direction.TO_UPDATE -> {
-                // Update the entry in the target
-                val differentEntry = comparisonResult.different ?: return
-                val sourceData = differentEntry.source.rawData
-
-                // Prepare data for update by removing relationships in first pass
-                val dataToUpdate = prepareDataForCreation(
-                    sourceData,
-                    idMappings,
-                    firstPass
+            } else false
+        }
+        val batchesDtoContent: List<List<SyncPlanItemDTO>> = order.batches.map { batch ->
+            batch.map { item ->
+                SyncPlanItemDTO(
+                    tableName = item.selection.tableName,
+                    documentId = item.selection.documentId,
+                    direction = item.selection.direction
                 )
-
-                try {
-                    val response = targetClient.updateContentEntry(
-                        contentTypeSchema.queryName,
-                        differentEntry.target.metadata.id.toString(),
-                        dataToUpdate,
-                        StrapiContentTypeKind.SingleType
-                    )
-
-                    // Extract the updated entry's ID and documentId
-                    val data = response["data"]?.jsonObject
-                    val targetId = data?.get("id")?.toString()?.toInt() ?: 0
-                    val targetDocumentId = data?.get("documentId")?.toString()?.replace("\"", "") ?: ""
-
-                    // Store the mapping
-                    idMappings.getOrPut(contentTypeUid) { mutableMapOf() }[differentEntry.source.metadata.documentId] =
-                        ContentMapping(targetDocumentId, targetId)
-
-                    // Update the mapping in the database
-                    val existingMapping = mergeRequestDocumentMappingRepository.getFilesMappingsForInstances(
-                        mergeRequest.sourceInstance.id,
-                        mergeRequest.targetInstance.id,
-                        listOf(differentEntry.source.metadata.documentId),
-                        emptyList()
-                    ).firstOrNull()
-
-                    if (existingMapping != null) {
-                        // Update existing mapping
-                        val updatedMapping = existingMapping.copy(
-                            sourceLastUpdateDate = OffsetDateTime.now(),
-                            targetId = targetId,
-                            targetDocumentId = targetDocumentId,
-                            targetLastUpdateDate = OffsetDateTime.now()
-                        )
-                        mergeRequestDocumentMappingRepository.updateMapping(existingMapping.id, updatedMapping)
-                    }
-
-                    // Update sync status to success
-                    mergeRequestSelectionsRepository.updateSyncStatus(
-                        selection.id,
-                        true,
-                        null
-                    )
-                } catch (e: Exception) {
-                    println("Error updating single type $contentTypeUid: ${e.message}")
-
-                    // Update sync status to failure
-                    mergeRequestSelectionsRepository.updateSyncStatus(
-                        selection.id,
-                        false,
-                        e.message ?: "Unknown error"
-                    )
-                }
-            }
-
-            Direction.TO_DELETE -> {
-                // Delete the entry in the target
-                val targetEntry = comparisonResult.onlyInTarget ?: return
-
-                try {
-                    targetClient.deleteContentEntry(
-                        contentTypeSchema.queryName,
-                        targetEntry.metadata.id.toString(),
-                        "singleType"
-                    )
-
-                    // Delete the mapping from the database
-                    mergeRequestDocumentMappingRepository.deleteFilesMappingsForInstancesByTarget(
-                        mergeRequest.sourceInstance.id,
-                        mergeRequest.targetInstance.id,
-                        targetEntry.metadata.documentId
-                    )
-
-                    // Update sync status to success
-                    mergeRequestSelectionsRepository.updateSyncStatus(
-                        selection.id,
-                        true,
-                        null
-                    )
-                } catch (e: Exception) {
-                    println("Error deleting single type $contentTypeUid: ${e.message}")
-
-                    // Update sync status to failure
-                    mergeRequestSelectionsRepository.updateSyncStatus(
-                        selection.id,
-                        false,
-                        e.message ?: "Unknown error"
-                    )
-                }
             }
         }
-    }
-
-    private suspend fun processCollectionType(
-        contentType: String,
-        contentTypeSchema: Schema,
-        selections: List<MergeRequestSelection>,
-        comparisonResult: ContentTypesComparisonResultWithRelationships,
-        sourceClient: StrapiClient,
-        targetClient: StrapiClient,
-        mergeRequest: MergeRequestWithInstancesDTO,
-        idMappings: MutableMap<String, MutableMap<String, ContentMapping>>,
-        firstPass: Boolean
-    ) {
-        val mergeRequestSelectionsRepository = MergeRequestSelectionsRepository()
-        // Group selections by direction
-        val toCreate = selections.filter {
-            listOf(
-                Direction.TO_CREATE,
-                Direction.TO_UPDATE
-            ).contains(it.direction) && idMappings[contentType]?.get(it.documentId) == null
-        }
-        val toUpdate = selections.filter {
-            listOf(
-                Direction.TO_CREATE,
-                Direction.TO_UPDATE
-            ).contains(it.direction) && idMappings[contentType]?.get(it.documentId) != null
-        }
-        val toDelete = selections.filter { it.direction == Direction.TO_DELETE }
-
-        // Process entries to create
-        for (selection in toCreate) {
-            val sourceEntry =
-                comparisonResult.onlyInSource.find { it.metadata.documentId == selection.documentId } ?: continue
-            val sourceData = sourceEntry.rawData
-
-            // Prepare data for creation by removing relationships in first pass
-            val dataToCreate = prepareDataForCreation(
-                sourceData,
-                idMappings,
-                firstPass
+        // Prepend files as the first batch, since they are synchronized first during completion
+        val fileBatchDto: List<SyncPlanItemDTO> = mergeRequestFiles.map { f ->
+            SyncPlanItemDTO(
+                tableName = f.tableName,
+                documentId = f.documentId,
+                direction = f.direction
             )
-
-            try {
-                val response = targetClient.createContentEntry(
-                    contentTypeSchema.queryName,
-                    dataToCreate,
-                    StrapiContentTypeKind.CollectionType
-                )
-
-                // Extract the created entry's ID and documentId
-                val data = response["data"]?.jsonObject
-                val targetId = data?.get("id")?.toString()?.toInt() ?: 0
-                val targetDocumentId = data?.get("documentId")?.toString()?.replace("\"", "") ?: ""
-
-                // Store the mapping
-                idMappings.getOrPut(contentType) { mutableMapOf() }[sourceEntry.metadata.documentId] =
-                    ContentMapping(targetDocumentId, targetId)
-
-                // Create or update the mapping in the database
-                val existingMapping = mergeRequestDocumentMappingRepository.getFilesMappingsForInstances(
-                    mergeRequest.sourceInstance.id,
-                    mergeRequest.targetInstance.id,
-                    listOf(sourceEntry.metadata.documentId),
-                    emptyList()
-                ).firstOrNull()
-
-                if (existingMapping == null) {
-                    // Create new mapping
-                    val newMapping = MergeRequestDocumentMapping(
-                        sourceId = sourceEntry.metadata.id,
-                        contentType = contentType,
-                        sourceStrapiInstanceId = mergeRequest.sourceInstance.id,
-                        targetStrapiInstanceId = mergeRequest.targetInstance.id,
-                        sourceDocumentId = sourceEntry.metadata.documentId,
-                        sourceLastUpdateDate = OffsetDateTime.now(),
-                        sourceDocumentMD5 = "",
-                        targetId = targetId,
-                        targetDocumentId = targetDocumentId,
-                        targetLastUpdateDate = OffsetDateTime.now(),
-                        targetDocumentMD5 = ""
-                    )
-                    mergeRequestDocumentMappingRepository.createMapping(newMapping)
-                } else {
-                    // Update existing mapping
-                    val updatedMapping = existingMapping.copy(
-                        sourceLastUpdateDate = OffsetDateTime.now(),
-                        targetId = targetId,
-                        targetDocumentId = targetDocumentId,
-                        targetLastUpdateDate = OffsetDateTime.now()
-                    )
-                    mergeRequestDocumentMappingRepository.updateMapping(existingMapping.id, updatedMapping)
-                }
-
-                // Update sync status to success
-                mergeRequestSelectionsRepository.updateSyncStatus(
-                    selection.id,
-                    true,
-                    null
-                )
-            } catch (e: Exception) {
-                println("Error creating collection type entry $contentType: ${e.message}")
-
-                // Update sync status to failure
-                mergeRequestSelectionsRepository.updateSyncStatus(
-                    selection.id,
-                    false,
-                    e.message ?: "Unknown error"
-                )
-            }
         }
+        val batchesDto: List<List<SyncPlanItemDTO>> =
+            if (fileBatchDto.isNotEmpty()) listOf(fileBatchDto) + batchesDtoContent else batchesDtoContent
 
-        // Process entries to update
-        for (selection in toUpdate) {
-            val differentEntry =
-                comparisonResult.different.find { it.source.metadata.documentId == selection.documentId }?.source
-                    ?: comparisonResult.onlyInSource.find { it.metadata.documentId == selection.documentId } ?: continue
-            val sourceData = differentEntry.rawData
-
-            // Prepare data for update by removing relationships in first pass
-            val dataToUpdate = prepareDataForCreation(
-                sourceData,
-                idMappings,
-                firstPass
+        val missingDto = filteredMissing.map { m ->
+            MissingDependencyDTO(
+                fromTable = m.fromTable,
+                fromDocumentId = m.fromDocumentId,
+                linkField = m.link.field,
+                linkTargetTable = m.link.targetTable,
+                reason = m.reason
             )
-            val mapping = idMappings[contentType]?.get(differentEntry.metadata.documentId) ?: continue
-
-
-            try {
-                val response = targetClient.updateContentEntry(
-                    contentTypeSchema.queryName,
-                    mapping.targetDocumentId,
-                    dataToUpdate,
-                    StrapiContentTypeKind.CollectionType
-                )
-
-                // Extract the updated entry's ID and documentId
-                val data = response["data"]?.jsonObject
-                val targetId = data?.get("id")?.toString()?.toInt() ?: 0
-                val targetDocumentId = data?.get("documentId")?.toString()?.replace("\"", "") ?: ""
-
-                // Store the mapping
-                idMappings.getOrPut(contentType) { mutableMapOf() }[differentEntry.metadata.documentId] =
-                    ContentMapping(targetDocumentId, targetId)
-
-                // Update the mapping in the database
-                val existingMapping = mergeRequestDocumentMappingRepository.getFilesMappingForInstances(
-                    mergeRequest.sourceInstance.id,
-                    mergeRequest.targetInstance.id,
-                    differentEntry.metadata.documentId,
-                    targetDocumentId
-                )
-
-                if (existingMapping != null) {
-                    // Update existing mapping
-                    val updatedMapping = existingMapping.copy(
-                        sourceLastUpdateDate = OffsetDateTime.now(),
-                        targetId = targetId,
-                        targetDocumentId = targetDocumentId,
-                        targetLastUpdateDate = OffsetDateTime.now()
-                    )
-                    mergeRequestDocumentMappingRepository.updateMapping(existingMapping.id, updatedMapping)
-                }
-
-                // Update sync status to success
-                mergeRequestSelectionsRepository.updateSyncStatus(
-                    selection.id,
-                    true,
-                    null
-                )
-            } catch (e: Exception) {
-                println("Error updating collection type entry $contentType: ${e.message}")
-
-                // Update sync status to failure
-                mergeRequestSelectionsRepository.updateSyncStatus(
-                    selection.id,
-                    false,
-                    e.message ?: "Unknown error"
-                )
-            }
         }
-
-        // Process entries to delete
-        for (selection in toDelete) {
-            val targetEntry =
-                comparisonResult.onlyInTarget.find { it.metadata.documentId == selection.documentId } ?: continue
-
-            try {
-                val success = targetClient.deleteContentEntry(
-                    contentTypeSchema.queryName,
-                    targetEntry.metadata.documentId,
-                    "collectionType"
-                )
-
-                // Delete the mapping from the database
-                mergeRequestDocumentMappingRepository.deleteFilesMappingsForInstancesByTarget(
-                    mergeRequest.sourceInstance.id,
-                    mergeRequest.targetInstance.id,
-                    targetEntry.metadata.documentId
-                )
-
-                // Update sync status to success
-                mergeRequestSelectionsRepository.updateSyncStatus(
-                    selection.id,
-                    success,
-                    null
-                )
-            } catch (e: Exception) {
-                println("Error deleting collection type entry $contentType: ${e.message}")
-
-                // Update sync status to failure
-                mergeRequestSelectionsRepository.updateSyncStatus(
-                    selection.id,
-                    false,
-                    e.message ?: "Unknown error"
-                )
-            }
+        val circularDto = order.circularEdges.map { c ->
+            CircularDependencyEdgeDTO(
+                fromTable = c.fromTable,
+                fromDocumentId = c.fromDocumentId,
+                toTable = c.toTable,
+                toDocumentId = c.toDocumentId,
+                viaField = c.viaLink.field
+            )
         }
-    }
-
-    private fun prepareDataForCreation(
-        sourceData: JsonObject,
-        idMappings: Map<String, Map<String, ContentMapping>>,
-        firstPass: Boolean,
-        alreadyInObject: Boolean = false
-    ): JsonObject {
-        // Create a mutable copy of the source data
-        val result = sourceData.toMutableMap()
-
-        // Remove metadata fields that should not be included in the creation/update
-        val hasDocumentId = result.containsKey("documentId")
-        result.remove("id")
-        result.remove("documentId")
-        result.remove("createdAt")
-        result.remove("updatedAt")
-        result.remove("publishedAt")
-        result.remove("createdBy")
-        result.remove("updatedBy")
-        result.remove("status")
-        result.remove("localizations")
-
-
-        // Process relationships at the first level
-        // Create a list of changes to apply after iteration to avoid ConcurrentModificationException
-        val updates = mutableMapOf<String, JsonElement>()
-        val keysToRemove = mutableListOf<String>()
-
-        // Use toList() to create a copy of entries for safe iteration
-        result.entries.toList().forEach { (key, value) ->
-            when (value) {
-                is JsonObject -> {
-                    // Handle single relationship
-                    if (value.containsKey("id") && value.containsKey("documentId")) {
-                        val relatedContentType = findContentTypeForDocumentId(
-                            value["documentId"].toString().replace("\"", ""),
-                            idMappings
-                        )
-                        if (relatedContentType != null) {
-                            val sourceDocumentId = value["documentId"].toString().replace("\"", "")
-                            val targetDocumentId = idMappings[relatedContentType]?.get(sourceDocumentId)
-
-                            if (targetDocumentId != null) {
-                                // Replace with target ID reference
-                                if (value.containsKey("formats") && value.containsKey("ext") && value.containsKey("mime")) {
-                                    updates[key] = buildJsonObject {
-                                        put("set", JsonArray(listOf(JsonPrimitive(targetDocumentId.targetId))))
-                                    }
-                                } else {
-                                    updates[key] = buildJsonObject {
-                                        put("set", JsonArray(listOf(JsonPrimitive(targetDocumentId.targetDocumentId))))
-                                    }
-                                }
-                            } else {
-                                // No mapping found, remove the relationship
-                                keysToRemove.add(key)
-                            }
-                        } else {
-                            keysToRemove.add(key)
-                        }
-                    } else {
-                        // Process nested objects recursively
-                        val res = processNestedObject(value, idMappings)
-                        if (res != null) {
-                            updates[key] = res
-                        } else keysToRemove.add(key)
-                    }
-                }
-
-                is JsonArray -> {
-                    // Handle multiple relationships
-                    val relatedItems = value.jsonArray.mapNotNull { item ->
-                        if (item is JsonObject && item.containsKey("id") && item.containsKey("documentId")) {
-                            val relatedContentType = findContentTypeForDocumentId(
-                                item["documentId"].toString().replace("\"", ""),
-                                idMappings
-                            )
-                            if (relatedContentType != null) {
-                                val sourceDocumentId = item["documentId"].toString().replace("\"", "")
-                                val targetDocumentId = idMappings[relatedContentType]?.get(sourceDocumentId)
-
-                                if (targetDocumentId != null) {
-                                    if (item.containsKey("formats") && item.containsKey("ext") && item.containsKey("mime")) {
-                                        JsonPrimitive(targetDocumentId.targetId)
-                                    } else
-                                        JsonPrimitive(targetDocumentId.targetDocumentId)
-                                } else {
-                                    null
-                                }
-                            } else {
-                                null
-                            }
-                        } else {
-                            prepareDataForCreation(item.jsonObject, idMappings, firstPass, true)
-                        }
-                    }
-
-                    if (relatedItems.isNotEmpty() && relatedItems.none { it is JsonObject || it is JsonArray }) {
-                        // Replace with target ID references
-                        updates[key] = buildJsonObject {
-                            put("set", JsonArray(relatedItems.map { it }))
-                        }
-                    } else if (relatedItems.isNotEmpty() && hasDocumentId) {
-                        updates[key] = JsonArray(relatedItems.map { it })
-                    } else if (value.jsonArray.isNotEmpty()) {
-                        // Process array elements recursively
-                        val res = processNestedArray(value, idMappings)
-                        if (res.isNotEmpty())
-                            updates[key] = res
-                        else
-                            keysToRemove.add(key)
-                    } else {
-                        // No mappings found, remove the relationship
-                        keysToRemove.add(key)
-                    }
-                }
-                // For other JSON element types, keep them as is
-                else -> {
-                    // No action needed for primitive values or null
-                }
-            }
+        val edgesDto = order.edges.map { e ->
+            DependencyEdgeDTO(
+                fromTable = e.fromTable,
+                fromDocumentId = e.fromDocumentId,
+                toTable = e.toTable,
+                toDocumentId = e.toDocumentId,
+                viaField = e.viaLink.field
+            )
         }
-
-        // Apply all updates
-        updates.forEach { (key, value) ->
-            result[key] = value
-        }
-
-        // Remove keys marked for removal
-        keysToRemove.forEach { key ->
-            result.remove(key)
-        }
-
-        return JsonObject(result)
-    }
-
-    /**
-     * Recursively process a nested JsonObject
-     */
-    private fun processNestedObject(
-        obj: JsonObject,
-        idMappings: Map<String, Map<String, ContentMapping>>
-    ): JsonObject? {
-        val result = obj.toMutableMap()
-
-        // If object has both id and documentId, replace with target id if found
-        if (obj.containsKey("id") && obj.containsKey("documentId")) {
-            val documentId = obj["documentId"].toString().replace("\"", "")
-            val relatedContentType = findContentTypeForDocumentId(documentId, idMappings)
-
-            if (relatedContentType != null) {
-                val targetId = idMappings[relatedContentType]?.get(documentId)
-                if (targetId != null) {
-                    // Replace the entire object with just the id
-                    if (obj.containsKey("formats") && obj.containsKey("ext") && obj.containsKey("mime")) {
-                        return buildJsonObject {
-                            put("id", JsonPrimitive(targetId.targetId))
-                        }
-                    }
-                    return buildJsonObject {
-                        put("documentId", JsonPrimitive(targetId.targetDocumentId))
-                    }
-                }
-            } else {
-                return null
-            }
-        } else if (obj.containsKey("id") && !obj.containsKey("documentId")) {
-            // If object has id but no documentId, remove the id field
-            result.remove("id")
-        }
-
-        // Process all fields recursively
-        // Create collections to track changes to avoid ConcurrentModificationException
-        val updates = mutableMapOf<String, JsonElement>()
-        val keysToRemove = mutableListOf<String>()
-
-        // Use toList() to create a copy of entries for safe iteration
-        obj.entries.toList().forEach { (key, value) ->
-            when (value) {
-                is JsonObject -> {
-                    val res = processNestedObject(value, idMappings)
-                    if (res != null) {
-                        updates[key] = res
-                    } else keysToRemove.add(key)
-                }
-
-                is JsonArray -> {
-                    val res = processNestedArray(value, idMappings)
-                    if (res.isNotEmpty())
-                        updates[key] = res
-                    else
-                        keysToRemove.add(key)
-                }
-
-                else -> {
-                    // Keep primitive values as is
-                }
-            }
-        }
-
-        // Apply all updates
-        updates.forEach { (key, value) ->
-            result[key] = value
-        }
-        keysToRemove.forEach { key ->
-            result.remove(key)
-        }
-
-        return JsonObject(result)
-    }
-
-    /**
-     * Recursively process a nested JsonArray
-     */
-    private fun processNestedArray(array: JsonArray, idMappings: Map<String, Map<String, ContentMapping>>): JsonArray {
-        val processedItems = array.mapNotNull { item ->
-            when (item) {
-                is JsonObject -> processNestedObject(item, idMappings)
-                is JsonArray -> processNestedArray(item, idMappings)
-                else -> item // Keep primitive values as is
-            }
-        }
-
-        return JsonArray(processedItems)
-    }
-
-    private fun findContentTypeForDocumentId(
-        documentId: String,
-        idMappings: Map<String, Map<String, ContentMapping>>
-    ): String? {
-        for ((contentType, mappings) in idMappings) {
-            if (mappings.containsKey(documentId)) {
-                return contentType
-            }
-        }
-        return null
-    }
-
-    private suspend fun mergeRequestFileMergeProcess(
-        mergeRequest: MergeRequestWithInstancesDTO,
-        sourceClient: StrapiClient,
-        targetClient: StrapiClient,
-        mergeRequestFiles: List<MergeRequestSelection>,
-        comparisonData: ContentTypeFileComparisonResult
-    ) {
-        val mergeRequestSelectionsRepository = MergeRequestSelectionsRepository()
-        val sourceFolders = sourceClient.getFolders()
-        val sourceFoldersMap = sourceFolders.associateBy { it.path }
-
-        val fileMapping = mergeRequestDocumentMappingRepository.getFilesMappingsForInstances(
-            mergeRequest.sourceInstance.id,
-            mergeRequest.targetInstance.id,
-            mergeRequestFiles.filter { it.direction != Direction.TO_DELETE }.map { it.documentId },
-            mergeRequestFiles.filter { it.direction == Direction.TO_DELETE }.map { it.documentId },
+        return SyncPlanDTO(
+            batches = batchesDto,
+            missingDependencies = missingDto,
+            circularEdges = circularDto,
+            edges = edgesDto
         )
-
-
-        // 4. Find folders present in the target and identify missing folders
-        val targetFolders = targetClient.getFolders()
-        val targetFolderPaths = targetFolders.map { it.pathFull }.toSet()
-        val targetFolderMap = targetFolders.associateBy { it.pathFull }.toMutableMap()
-
-
-        // Collect all folder paths from images to be processed
-        val requiredFolderPaths = mutableSetOf<String>()
-
-        // Process files to create or update based on the merge request files
-        val filesToProcess = mutableListOf<Pair<StrapiImage, Direction>>()
-
-        // Files to delete
-        val filesToDelete = mutableListOf<StrapiImage>()
-
-        // Extract files from comparison data based on documentIds in mergeRequestFiles
-        for (file in mergeRequestFiles) {
-            when (file.direction) {
-                Direction.TO_CREATE -> {
-                    // Find the file in onlyInSource
-                    val sourceFile = comparisonData.onlyInSource.find { it.metadata.documentId == file.documentId }
-                    if (sourceFile != null) {
-                        filesToProcess.add(Pair(sourceFile, Direction.TO_CREATE))
-                        sourceFoldersMap[sourceFile.metadata.folderPath]?.pathFull?.let { requiredFolderPaths.add(it) }
-                    }
-                }
-
-                Direction.TO_UPDATE -> {
-                    // Find the file in different
-                    val differentFile =
-                        comparisonData.different.find { it.source.metadata.documentId == file.documentId }
-                    if (differentFile != null) {
-                        filesToProcess.add(Pair(differentFile.source, Direction.TO_UPDATE))
-                        sourceFoldersMap[differentFile.source.metadata.folderPath]?.pathFull?.let {
-                            requiredFolderPaths.add(
-                                it
-                            )
-                        }
-                    }
-                }
-
-                Direction.TO_DELETE -> {
-                    // Find the file in onlyInTarget
-                    val targetFile = comparisonData.onlyInTarget.find { it.metadata.documentId == file.documentId }
-                    if (targetFile != null) {
-                        filesToDelete.add(targetFile)
-                    }
-                }
-            }
-        }
-
-        // 5. Create missing folders on the target
-        val missingFolderPaths = requiredFolderPaths.flatMap { folderPath ->
-            folderPath.split("/")
-                .filter { it.isNotEmpty() }
-                .scan("") { acc, segment ->
-                    if (acc.isEmpty()) "/$segment" else "$acc/$segment"
-                }
-                .filter { it.isNotEmpty() }
-        }.distinct()
-            .filter { folderPath ->
-                !targetFolderPaths.contains(folderPath)
-            }
-
-        for (folderPath in missingFolderPaths.sortedBy { it.split("/").size }) {
-            try {
-                // Extract folder name from path (last segment)
-                val folderName = folderPath.split("/").last()
-                // Extract parent path (everything before the last segment)
-                val parentPath = if (folderPath.contains("/")) {
-                    folderPath.substring(0, folderPath.lastIndexOf("/"))
-                } else {
-                    ""
-                }
-
-                val parent = if (parentPath.isNotEmpty())
-                    targetFolderMap[parentPath]?.id
-                else
-                    null
-
-
-                // Create the folder on the target
-                val createdFolder = targetClient.createFolder(folderName, parent)
-                val fullPath = "$parentPath/$folderName"
-                targetFolderMap[fullPath] = createdFolder.copy(pathFull = fullPath)
-
-            } catch (e: Exception) {
-                println("Error creating folder $folderPath: ${e.message}")
-                // Continue with other folders even if one fails
-            }
-        }
-
-        // 6. Delete files marked for deletion
-        for (selection in mergeRequestFiles.filter { it.direction == Direction.TO_DELETE }) {
-            val file = comparisonData.onlyInTarget.find { it.metadata.documentId == selection.documentId }
-            if (file != null) {
-                try {
-                    // Delete the file from target
-                    newSuspendedTransaction {
-                        targetClient.deleteFile(file.metadata.id.toString())
-
-                        println("Deleted file ${file.metadata.name} with ID ${file.metadata.id}")
-
-                        mergeRequestDocumentMappingRepository.deleteFilesMappingsForInstancesByTarget(
-                            mergeRequest.sourceInstance.id,
-                            mergeRequest.targetInstance.id,
-                            file.metadata.documentId
-                        )
-
-                        // Update sync status to success
-                        mergeRequestSelectionsRepository.updateSyncStatus(
-                            selection.id,
-                            true,
-                            null
-                        )
-                    }
-                } catch (e: Exception) {
-                    println("Error deleting file ${file.metadata.name}: ${e.message}")
-                    // Update sync status to failure
-                    mergeRequestSelectionsRepository.updateSyncStatus(
-                        selection.id,
-                        false,
-                        e.message ?: "Unknown error"
-                    )
-                    // Continue with other files even if one fails
-                }
-            }
-        }
-
-        // 7. Create or update each image by making appropriate calls to the target
-        for ((file, direction) in filesToProcess) {
-            // Find the corresponding selection
-            val selection = mergeRequestFiles.find {
-                it.documentId == file.metadata.documentId &&
-                        (it.direction == Direction.TO_CREATE || it.direction == Direction.TO_UPDATE)
-            }
-
-            if (selection == null) continue
-
-            try {
-                // Download the file from source
-                val sourceFile = sourceClient.downloadFile(file)
-                val md5 = calculateMD5Hash(sourceFile.inputStream())
-
-                val folder = sourceFoldersMap[file.metadata.folderPath]?.let { targetFolderMap[it.pathFull]?.id }
-
-                val existingMappings = fileMapping.find { it.sourceDocumentId == file.metadata.documentId }
-
-                // Upload or update the file on target
-                val uploadResponse = targetClient.uploadFile(
-                    existingMappings?.targetId,
-                    file.metadata.name,
-                    sourceFile,
-                    file.metadata.mime,
-                    file.metadata.caption,
-                    file.metadata.alternativeText,
-                    folder
-                )
-
-                // Update the document mapping table
-                if (existingMappings == null) {
-                    // Create new mapping
-                    val newMapping = MergeRequestDocumentMapping(
-                        sourceId = file.metadata.id,
-                        contentType = STRAPI_FILE_CONTENT_TYPE_NAME,
-                        sourceStrapiInstanceId = mergeRequest.sourceInstance.id,
-                        targetStrapiInstanceId = mergeRequest.targetInstance.id,
-                        sourceDocumentId = file.metadata.documentId,
-                        sourceLastUpdateDate = OffsetDateTime.now(),
-                        sourceDocumentMD5 = md5,
-                        targetId = uploadResponse.id,
-                        targetDocumentId = uploadResponse.documentId,
-                        targetLastUpdateDate = OffsetDateTime.now(),
-                        targetDocumentMD5 = md5
-                    )
-                    mergeRequestDocumentMappingRepository.createMapping(newMapping)
-                } else {
-                    // Update existing mapping
-                    val updatedMapping = existingMappings.copy(
-                        sourceLastUpdateDate = OffsetDateTime.now(),
-                        contentType = STRAPI_FILE_CONTENT_TYPE_NAME,
-                        sourceDocumentMD5 = md5,
-                        targetId = uploadResponse.id,
-                        targetDocumentId = uploadResponse.documentId,
-                        targetLastUpdateDate = OffsetDateTime.now(),
-                        targetDocumentMD5 = md5
-                    )
-                    mergeRequestDocumentMappingRepository.updateMapping(existingMappings.id, updatedMapping)
-                }
-
-                // Clean up the temporary file
-                sourceFile.delete()
-
-                println("${if (direction == Direction.TO_CREATE) "Created" else "Updated"} file ${file.metadata.name} with ID ${uploadResponse.id}")
-
-                // Update sync status to success
-                mergeRequestSelectionsRepository.updateSyncStatus(
-                    selection.id,
-                    true,
-                    null
-                )
-            } catch (e: Exception) {
-                println("Error ${if (direction == Direction.TO_CREATE) "creating" else "updating"} file ${file.metadata.name}: ${e.message}")
-
-                // Update sync status to failure
-                mergeRequestSelectionsRepository.updateSyncStatus(
-                    selection.id,
-                    false,
-                    e.message ?: "Unknown error"
-                )
-                // Continue with other files even if one fails
-            }
-        }
     }
+
 }

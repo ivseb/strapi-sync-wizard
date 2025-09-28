@@ -23,7 +23,7 @@ kotlin {
 
 
 group = "it.sebi"
-version = "0.1.9"
+version = "0.2.0"
 
 application {
     mainClass = "io.ktor.server.netty.EngineMain"
@@ -48,8 +48,10 @@ dependencies {
     implementation("org.jetbrains.exposed:exposed-core:$exposed_version")
     implementation("org.jetbrains.exposed:exposed-crypt:$exposed_version")
     implementation("org.jetbrains.exposed:exposed-jdbc:$exposed_version")
-    implementation("org.jetbrains.exposed:exposed-dao:$exposed_version")
-    implementation("org.jetbrains.exposed:exposed-migration:$exposed_version")
+//    implementation("org.jetbrains.exposed:exposed-r2dbc:$exposed_version")
+//    implementation("org.jetbrains.exposed:exposed-migration-r2dbc:$exposed_version")
+//    implementation("org.jetbrains.exposed:exposed-dao:$exposed_version")
+//    implementation("org.jetbrains.exposed:exposed-migration:$exposed_version")
     implementation("org.jetbrains.exposed:exposed-json:$exposed_version")
     implementation("org.jetbrains.exposed:exposed-java-time:$exposed_version")
     implementation("io.ktor:ktor-client-core")
@@ -59,9 +61,13 @@ dependencies {
     implementation("com.zaxxer:HikariCP:4.0.3")
     implementation("com.h2database:h2:$h2_version")
     implementation("org.postgresql:postgresql:42.5.4")
+//    implementation("org.postgresql:r2dbc-postgresql:1.0.7.RELEASE")
     implementation("io.ktor:ktor-server-netty")
     implementation("ch.qos.logback:logback-classic:$logback_version")
     implementation("io.ktor:ktor-server-cors:3.1.3")
+    implementation("io.ktor:ktor-server-sse:3.1.3")
+    // Robust fingerprinting of PDFs
+    implementation("org.apache.pdfbox:pdfbox:2.0.31")
     testImplementation("io.ktor:ktor-server-test-host")
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit:$kotlin_version")
     testImplementation("io.mockk:mockk:1.13.5")

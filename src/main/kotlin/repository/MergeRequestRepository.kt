@@ -6,12 +6,15 @@ import it.sebi.models.MergeRequestDTO
 import it.sebi.models.MergeRequestStatus
 import it.sebi.models.MergeRequestWithInstancesDTO
 import it.sebi.tables.MergeRequestsTable
-import org.jetbrains.exposed.v1.core.ResultRow
-import org.jetbrains.exposed.v1.core.SortOrder
-import org.jetbrains.exposed.v1.core.SqlExpressionBuilder.eq
-import org.jetbrains.exposed.v1.core.and
-import org.jetbrains.exposed.v1.core.or
-import org.jetbrains.exposed.v1.jdbc.*
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.singleOrNull
+import kotlinx.coroutines.flow.toList
+import org.jetbrains.exposed.v1.core.*
+import org.jetbrains.exposed.v1.jdbc.andWhere
+import org.jetbrains.exposed.v1.jdbc.deleteWhere
+import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.update
 import java.time.OffsetDateTime
 
 class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepository) {
@@ -22,7 +25,7 @@ class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepos
     suspend fun findMergeRequestsForInstance(instanceId: Int): List<MergeRequest> = dbQuery {
         MergeRequestsTable.selectAll()
             .where { (MergeRequestsTable.sourceInstanceId eq instanceId) or (MergeRequestsTable.targetInstanceId eq instanceId) }
-            .map { it.toMergeRequest() }
+            .map { it.toMergeRequest() }.toList()
     }
 
     /**
@@ -36,7 +39,7 @@ class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepos
 
     suspend fun getAllMergeRequests(): List<MergeRequest> = dbQuery {
         MergeRequestsTable.selectAll()
-            .map { it.toMergeRequest() }
+            .map { it.toMergeRequest() }.toList()
     }
 
     suspend fun getMergeRequestsWithInstances(
@@ -76,7 +79,7 @@ class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepos
         }
 
         // Execute the query and map to domain objects
-        val mergeRequests = sortedQuery.map { it.toMergeRequest() }
+        val mergeRequests = sortedQuery.map { it.toMergeRequest() }.toList()
 
         // Get all instances in a single query to avoid N+1 problem
         val sourceInstanceIds = mergeRequests.map { it.sourceInstanceId }

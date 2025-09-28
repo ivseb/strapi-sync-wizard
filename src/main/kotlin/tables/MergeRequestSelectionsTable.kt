@@ -10,7 +10,7 @@ import java.time.OffsetDateTime
  */
 object MergeRequestSelectionsTable : IntIdTable("merge_request_selections") {
     val mergeRequestId = reference("merge_request_id", MergeRequestsTable)
-    val contentType = varchar("content_type", 255)
+    val table = varchar("content_type", 255)
     val documentId = varchar("documentId", 255)
     val direction = enumeration("direction", Direction::class)
     val createdAt = timestampWithTimeZone("created_at").default(OffsetDateTime.now())

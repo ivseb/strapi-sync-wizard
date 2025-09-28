@@ -8,7 +8,14 @@ const initialFormData: FormData = {
   url: '',
   username: '',
   password: '',
-  apiKey: ''
+  apiKey: '',
+  dbHost: '',
+  dbPort: null,
+  dbName: '',
+  dbSchema: '',
+  dbUser: '',
+  dbPassword: '',
+  dbSslMode: ''
 };
 
 export const useInstanceManagement = () => {
@@ -62,7 +69,14 @@ export const useInstanceManagement = () => {
         url: instance.url,
         username: instance.username,
         password: '',
-        apiKey: ''
+        apiKey: '',
+        dbHost: instance.dbHost ?? '',
+        dbPort: instance.dbPort ?? null,
+        dbName: instance.dbName ?? '',
+        dbSchema: instance.dbSchema ?? '',
+        dbUser: instance.dbUser ?? '',
+        dbPassword: '',
+        dbSslMode: instance.dbSslMode ?? ''
       });
       setIsEditing(true);
     } else {
@@ -75,7 +89,10 @@ export const useInstanceManagement = () => {
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const { name, value } = e.target;
-    setFormData(prev => ({ ...prev, [name]: value }));
+    setFormData(prev => ({
+      ...prev,
+      [name]: name === 'dbPort' ? (value ? Number(value) : null) : value
+    }));
     // Clear connection status when inputs change
     setConnectionStatus(null);
   };
@@ -107,11 +124,28 @@ export const useInstanceManagement = () => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
+    // Prepare payload: ensure empty strings become null for optional fields, and dbPort is number|null
+    const payload = {
+      id: formData.id,
+      name: formData.name,
+      url: formData.url,
+      username: formData.username,
+      password: formData.password,
+      apiKey: formData.apiKey,
+      dbHost: formData.dbHost && formData.dbHost.trim() !== '' ? formData.dbHost : null,
+      dbPort: typeof formData.dbPort === 'number' ? formData.dbPort : null,
+      dbName: formData.dbName && formData.dbName.trim() !== '' ? formData.dbName : null,
+      dbSchema: formData.dbSchema && formData.dbSchema.trim() !== '' ? formData.dbSchema : null,
+      dbUser: formData.dbUser && formData.dbUser.trim() !== '' ? formData.dbUser : null,
+      dbPassword: formData.dbPassword && formData.dbPassword.trim() !== '' ? formData.dbPassword : null,
+      dbSslMode: formData.dbSslMode && formData.dbSslMode.trim() !== '' ? formData.dbSslMode : null
+    };
+
     try {
       if (isEditing && formData.id) {
-        await axios.put(`/api/instances/${formData.id}`, formData);
+        await axios.put(`/api/instances/${formData.id}`, payload);
       } else {
-        await axios.post('/api/instances', formData);
+        await axios.post('/api/instances', payload);
       }
 
       handleCloseModal();
