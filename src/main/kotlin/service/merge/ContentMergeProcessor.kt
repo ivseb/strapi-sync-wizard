@@ -669,7 +669,13 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
             // Prepare a processed array starting from source clean data (so replacing the array won't lose fields)
             val processedItems: MutableList<JsonObject> = rawArray.map { el ->
                 val obj = el as? JsonObject ?: buildJsonObject { }
-                ContentJsonUtils.processJsonElement(obj, subFieldNameResolver) as JsonObject
+                ContentJsonUtils.processJsonElement(
+                    element = obj,
+                    currentResolver = subFieldNameResolver,
+                    currentSchema = componentSchema,
+                    dbSchema = dbSchema,
+                    contentTypeMappingByTable = contentTypeMappingByTable
+                ) as JsonObject
             }.toMutableList()
 
             // Accumulate values per index and sub-field, preserving order by 'order' and then by 'id'
@@ -682,36 +688,33 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                 if (subField.isEmpty()) return@forEach
                 val idx = idToIndex[link.sourceId] ?: return@forEach
                 val value = resolveTargetValue(link) ?: return@forEach
-                val resolvedSubFieldKey = subFieldNameResolver[ContentJsonUtils.normalizeKeyName(subField)]
-                    ?: ContentJsonUtils.convertToCamelCase(subField)
+                val subPath = subField
                 val ord = link.order ?: Double.MAX_VALUE
                 val tie = link.id ?: Int.MAX_VALUE
                 val m1 = perIndex.getOrPut(idx) { mutableMapOf() }
-                val list = m1.getOrPut(resolvedSubFieldKey) { mutableListOf() }
+                val list = m1.getOrPut(subPath) { mutableListOf() }
                 list.add(OrderedVal(ord, tie, value))
             }
 
             // Inject relation sets into the processed items
             perIndex.forEach { (idx, subMap) ->
-                val baseObj = processedItems[idx].toMutableMap()
-                subMap.forEach { (subKey, ovalues) ->
-                    fun resolveKey(raw: String): String {
-                        val normalized = normalizeKeyName(raw)
-                        val normalizedPlural = normalized + "s"
-
-                        return subFieldNameResolver[normalized] ?: subFieldNameResolver[normalizedPlural]
-                        ?: fieldNameResolver[normalized] ?: fieldNameResolver[normalizedPlural]
-                        ?: error("Cannot resolve key $raw")
-                    }
-
-                    val realKey = resolveKey(subKey)
+                var currentObj: JsonObject = processedItems[idx]
+                subMap.forEach { (subPath, ovalues) ->
                     val sortedValues = ovalues.sortedWith(compareBy<OrderedVal> { it.ord }.thenBy { it.tie })
                         .map { it.value }
                     if (sortedValues.isNotEmpty()) {
-                        baseObj[realKey] = buildJsonObject { put("set", JsonArray(sortedValues)) }
+                        val fieldObj = buildJsonObject { put("set", JsonArray(sortedValues)) }
+                        val nested = ContentJsonUtils.buildNestedObjectFromPathWithSchema(
+                            subPath,
+                            fieldObj,
+                            componentSchema,
+                            dbSchema,
+                            contentTypeMappingByTable
+                        )
+                        currentObj = ContentJsonUtils.deepMergeJsonObjects(currentObj, nested)
                     }
                 }
-                processedItems[idx] = JsonObject(baseObj)
+                processedItems[idx] = currentObj
             }
 
             // Now build the nested object to merge at rootKey
@@ -727,26 +730,180 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
             dataObj = ContentJsonUtils.deepMergeJsonObjects(dataObj, nested)
         }
 
-        // 2) Handle non-repeatable fields as before
-        for ((fieldPath, list) in nonRepeatableFieldGroups) {
-            val componentName =
-                baseContentTypeSchema.metadata?.columns?.find { fieldPath.startsWith(it.name) }?.component
-            val component = resolveComponentTableName(componentName, dbSchema)
-            val componentSchema = component?.let { contentTypeMappingByTable[it] }
-            val subFieldNameResolver = componentSchema?.let { ContentJsonUtils.buildFieldNameResolver(it) }
+        // 2) Handle non-repeatable fields, but detect and process nested repeatable components recursively
+        // Helper: resolve mapped key from schema for a raw segment name
+        fun resolveMappedKey(schema: DbTable?, raw: String): String {
+            val normalized = ContentJsonUtils.normalizeKeyName(raw)
+            val col = schema?.metadata?.columns?.firstOrNull { ContentJsonUtils.normalizeKeyName(it.name) == normalized }
+            return col?.name ?: ContentJsonUtils.convertToCamelCase(raw)
+        }
 
+        // Helper: traverse rawData to the parent object of a given path (schema-aware)
+        fun traverseRawToParent(raw: JsonObject, parentPath: String, rootSchema: DbTable?): JsonObject? {
+            if (parentPath.isEmpty()) return raw
+            var currentObj: JsonObject = raw
+            var currentSchema: DbTable? = rootSchema
+            val parts = parentPath.split('.')
+            for (part in parts) {
+                val normalized = ContentJsonUtils.normalizeKeyName(part)
+                val col = currentSchema?.metadata?.columns?.firstOrNull { ContentJsonUtils.normalizeKeyName(it.name) == normalized }
+                val mapped = col?.name ?: ContentJsonUtils.convertToCamelCase(part)
+                val nextEl = currentObj[mapped] ?: currentObj[part] ?: currentObj[ContentJsonUtils.convertToCamelCase(part)]
+                val nextObj = nextEl as? JsonObject ?: return null
+                // switch schema if this level is a component
+                currentSchema = if (col?.component != null) {
+                    val compTable = resolveComponentTableName(col.component, dbSchema)
+                    if (compTable != null) contentTypeMappingByTable[compTable] else currentSchema
+                } else currentSchema
+                currentObj = nextObj
+            }
+            return currentObj
+        }
+
+        data class PathInfo(
+            val parentPath: String,
+            val repeatSegment: String,
+            val remainder: String,
+            val parentSchema: DbTable?,
+            val itemSchema: DbTable?
+        )
+
+        fun analyzePath(path: String, startSchema: DbTable?): PathInfo? {
+            val parts = path.split('.')
+            var currentSchema: DbTable? = startSchema
+            var parentSchema: DbTable? = startSchema
+            val parentParts = mutableListOf<String>()
+            for (i in parts.indices) {
+                val seg = parts[i]
+                val normalized = ContentJsonUtils.normalizeKeyName(seg)
+                val col = currentSchema?.metadata?.columns?.firstOrNull { ContentJsonUtils.normalizeKeyName(it.name) == normalized }
+                if (col != null && col.repeatable && col.component != null) {
+                    val compTable = resolveComponentTableName(col.component, dbSchema)
+                    val itemSchema = compTable?.let { contentTypeMappingByTable[it] }
+                    val parentPath = parentParts.joinToString(".")
+                    val remainder = if (i + 1 < parts.size) parts.subList(i + 1, parts.size).joinToString(".") else ""
+                    return PathInfo(parentPath, seg, remainder, parentSchema, itemSchema)
+                }
+                // advance
+                if (col?.component != null) {
+                    parentSchema = currentSchema
+                    val compTable = resolveComponentTableName(col.component, dbSchema)
+                    currentSchema = compTable?.let { contentTypeMappingByTable[it] }
+                }
+                parentParts.add(seg)
+            }
+            return null
+        }
+
+        // Group nonRepeatable fields by nested repeatable anchor if present
+        val anchorGroups: MutableMap<String, MutableList<Pair<String, List<StrapiLinkRef>>>> = mutableMapOf()
+        val anchorInfo: MutableMap<String, PathInfo> = mutableMapOf()
+        val simpleNonRepeatable: MutableMap<String, List<StrapiLinkRef>> = mutableMapOf()
+
+        nonRepeatableFieldGroups.forEach { (fieldPath, links) ->
+            val info = analyzePath(fieldPath, baseContentTypeSchema)
+            if (info != null) {
+                val anchor = if (info.parentPath.isEmpty()) info.repeatSegment else info.parentPath + "." + info.repeatSegment
+                anchorGroups.getOrPut(anchor) { mutableListOf() }.add(fieldPath to links)
+                anchorInfo.putIfAbsent(anchor, info)
+            } else {
+                simpleNonRepeatable[fieldPath] = links
+            }
+        }
+
+        // Process groups with nested repeatable components
+        for ((anchor, entries) in anchorGroups) {
+            val info = anchorInfo[anchor] ?: continue
+            val parentObj = traverseRawToParent(base.rawData, info.parentPath, baseContentTypeSchema) ?: continue
+            val repeatKey = resolveMappedKey(info.parentSchema, info.repeatSegment)
+            val rawArrayEl = parentObj[repeatKey] ?: parentObj[info.repeatSegment] ?: parentObj[ContentJsonUtils.convertToCamelCase(info.repeatSegment)]
+            val rawArray = rawArrayEl as? JsonArray ?: continue
+
+            // Map source component id -> index
+            val idToIndex: Map<Int, Int> = rawArray.mapIndexedNotNull { idx, el ->
+                val id = (el as? JsonObject)?.get("id")?.toString()?.trim('"')?.toIntOrNull()
+                if (id != null) id to idx else null
+            }.toMap()
+
+            // Prepare processed items starting from raw data
+            val itemSchema = info.itemSchema ?: continue
+            val itemResolver = ContentJsonUtils.buildFieldNameResolver(itemSchema)
+            val processedItems: MutableList<JsonObject> = rawArray.map { el ->
+                val obj = el as? JsonObject ?: buildJsonObject { }
+                ContentJsonUtils.processJsonElement(
+                    element = obj,
+                    currentResolver = itemResolver,
+                    currentSchema = itemSchema,
+                    dbSchema = dbSchema,
+                    contentTypeMappingByTable = contentTypeMappingByTable
+                ) as JsonObject
+            }.toMutableList()
+
+            data class OrderedVal2(val ord: Double, val tie: Int, val value: JsonElement)
+            val perIndex: MutableMap<Int, MutableMap<String, MutableList<OrderedVal2>>> = mutableMapOf()
+
+            entries.forEach { (fieldPath, links) ->
+                val pi = analyzePath(fieldPath, baseContentTypeSchema) ?: return@forEach
+                val subPath = pi.remainder
+                links.forEach { link ->
+                    val idx = idToIndex[link.sourceId] ?: return@forEach
+                    val value = resolveTargetValue(link) ?: return@forEach
+                    val ord = link.order ?: Double.MAX_VALUE
+                    val tie = link.id ?: Int.MAX_VALUE
+                    val m1 = perIndex.getOrPut(idx) { mutableMapOf() }
+                    val list = m1.getOrPut(subPath) { mutableListOf() }
+                    list.add(OrderedVal2(ord, tie, value))
+                }
+            }
+
+            // Inject into processed items
+            perIndex.forEach { (idx, subMap) ->
+                var currentObj: JsonObject = processedItems[idx]
+                subMap.forEach { (subPath, ovalues) ->
+                    val sortedValues = ovalues.sortedWith(compareBy<OrderedVal2> { it.ord }.thenBy { it.tie }).map { it.value }
+                    if (sortedValues.isNotEmpty()) {
+                        val fieldObj = buildJsonObject { put("set", JsonArray(sortedValues)) }
+                        val nested = ContentJsonUtils.buildNestedObjectFromPathWithSchema(
+                            subPath,
+                            fieldObj,
+                            itemSchema,
+                            dbSchema,
+                            contentTypeMappingByTable
+                        )
+                        currentObj = ContentJsonUtils.deepMergeJsonObjects(currentObj, nested)
+                    }
+                }
+                processedItems[idx] = currentObj
+            }
+
+            // Build object at parent level with the processed array
+            val cleanArray = processedItems.map { o ->
+                buildJsonObject { o.entries.filterNot { it.key == "id" }.forEach { (k, v) -> put(k, v) } }
+            }
+            val leafAtParent = buildJsonObject { put(repeatKey, JsonArray(cleanArray)) }
+            val nestedParent = if (info.parentPath.isEmpty()) leafAtParent else ContentJsonUtils.buildNestedObjectFromPathWithSchema(
+                info.parentPath,
+                leafAtParent,
+                baseContentTypeSchema,
+                dbSchema,
+                contentTypeMappingByTable
+            )
+            dataObj = ContentJsonUtils.deepMergeJsonObjects(dataObj, nestedParent)
+        }
+
+        // Finally, handle simple non-repeatable fields (no nested repeatables)
+        for ((fieldPath, list) in simpleNonRepeatable) {
             val values: List<JsonElement> = list
                 .sortedWith(compareBy<StrapiLinkRef> { it.order ?: Double.MAX_VALUE }.thenBy { it.id ?: Int.MAX_VALUE })
                 .mapNotNull { link -> resolveTargetValue(link) }
-
             if (values.isNotEmpty()) {
                 val fieldObj = buildJsonObject { put("set", JsonArray(values)) }
-                val nested = ContentJsonUtils.buildNestedObjectFromPath(
+                val nested = ContentJsonUtils.buildNestedObjectFromPathWithSchema(
                     fieldPath,
                     fieldObj,
-                    repeatableByKey,
-                    fieldNameResolver,
-                    subFieldNameResolver
+                    baseContentTypeSchema,
+                    dbSchema,
+                    contentTypeMappingByTable
                 )
                 dataObj = ContentJsonUtils.deepMergeJsonObjects(dataObj, nested)
             }

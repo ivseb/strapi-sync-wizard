@@ -1,5 +1,6 @@
 package it.sebi.service
 
+import it.sebi.client.client
 import it.sebi.database.dbQuery
 import it.sebi.models.*
 import kotlinx.serialization.json.*
@@ -103,9 +104,13 @@ suspend fun SyncService.checkSchemaCompatibilityDb(
 
     val extracted: DbSchema? = if (isCompatible) {
         // Build enriched schema from source DB JSON and Strapi metadata
-        val metadataList = fetchStrapiMetadataJsonFromDb(sourceInstance)
-        val metaByCollection = metadataList.associateBy { it.collectionName }
-        parseDbSchemaModel(sourceJson, metaByCollection)
+        val contentTypesMeta: Map<String, StrapiContentType> =
+            sourceInstance.client().getContentTypes().associateBy { it.schema.collectionName }
+        val componentMeta: Map<String, StrapiComponent> =
+            sourceInstance.client().getComponentSchema().associateBy { it.schema.collectionName }
+//        val metadataList = fetchStrapiMetadataJsonFromDb(sourceInstance)
+//        val metaByCollection = metadataList.associateBy { it.collectionName }
+        parseDbSchemaModel(sourceJson, contentTypesMeta, componentMeta)
     } else null
 
     val result = SchemaDbCompatibilityResult(
@@ -192,7 +197,11 @@ private fun parseStrapiDbSchema(json: String): Map<String, TableDef> {
     return map.filterNot { it.key.startsWith("strapi_") }
 }
 
-private fun parseDbSchemaModel(json: String, metaByCollection: Map<String, DbTableMetadata>? = null): DbSchema {
+private fun parseDbSchemaModel(
+    json: String,
+    contentTypesMeta: Map<String, StrapiContentType>,
+    componentMetas: Map<String, StrapiComponent>
+): DbSchema {
     val root = Json.parseToJsonElement(json).jsonObject
     val tables = root["tables"]?.jsonArray ?: return DbSchema(emptyList())
 
@@ -252,13 +261,73 @@ private fun parseDbSchemaModel(json: String, metaByCollection: Map<String, DbTab
             )
         }
 
+        val componentMetaData = componentMetas[name]?.let { cm ->
+
+            val columns: List<DbColumnMeta> = cm.schema.attributes.map { (key, value) ->
+                DbColumnMeta(
+                    key,
+                    value.required,
+                    value.type,
+                    value.unique,
+                    value.repeatable ?: false,
+                    value.component,
+                )
+            }
+            DbTableMetadata(
+                cm.uid,
+                StrapiContentTypeKind.Component,
+                cm.schema.collectionName,
+                cm.apiId,
+                cm.category,
+                cm.category,
+                false,
+                false,
+                false,
+                false,
+                columns
+
+
+            )
+        }
+
+        val contentMetaData = contentTypesMeta[name]?.let { cm ->
+
+            val columns: List<DbColumnMeta> = cm.schema.attributes.map { (key, value) ->
+                DbColumnMeta(
+                    key,
+                    value.required,
+                    value.type,
+                    value.unique,
+                    value.repeatable ?: false,
+                    value.component,
+                )
+            }
+            DbTableMetadata(
+                cm.uid,
+                cm.schema.kind,
+                cm.schema.collectionName,
+                cm.schema.singularName,
+                cm.schema.pluralName,
+                cm.schema.displayName,
+                cm.schema.draftAndPublish,
+                cm.schema.pluginOptions?.i18n?.localized ?: false,
+                cm.schema.pluginOptions?.contentManager?.visible ?: false,
+                cm.schema.pluginOptions?.contentTypeBuilder?.visible ?: false,
+                columns
+
+
+            )
+        }
+
+
+
         parsed.add(
             DbTable(
                 name = name,
                 columns = columns,
                 indexes = indexes,
                 foreignKeys = foreignKeys,
-                metadata = metaByCollection?.get(name)
+                metadata = contentMetaData ?: componentMetaData
             )
         )
     }
@@ -400,54 +469,54 @@ private suspend fun fetchStrapiMetadataJsonFromDb(instance: StrapiInstance): Lis
 
 
 
-            """.trimIndent()
-        ,explicitStatementType = StatementType.SELECT){rs ->
+            """.trimIndent(), explicitStatementType = StatementType.SELECT
+        ) { rs ->
             val results = mutableListOf<DbTableMetadata>()
             try {
 
 
-            while (rs.next()) {
-                val columns = rs.getString("columns_data")?.let {
-                    val obj = Json.parseToJsonElement(it).jsonObject
-                    obj.map { (k, v) ->
-                        DbColumnMeta(
-                            name = k,
-                            required = v.jsonObject["required"]?.jsonPrimitive?.booleanOrNull ?: false,
-                            unique = v.jsonObject["unique"]?.jsonPrimitive?.booleanOrNull ?: false,
-                            repeatable = v.jsonObject["repeatable"]?.jsonPrimitive?.booleanOrNull ?: false,
-                            type = v.jsonObject["type"]?.jsonPrimitive?.contentOrNull ?: "string",
-                            component = v.jsonObject["component"]?.jsonPrimitive?.contentOrNull,
+                while (rs.next()) {
+                    val columns = rs.getString("columns_data")?.let {
+                        val obj = Json.parseToJsonElement(it).jsonObject
+                        obj.map { (k, v) ->
+                            DbColumnMeta(
+                                name = k,
+                                required = v.jsonObject["required"]?.jsonPrimitive?.booleanOrNull ?: false,
+                                unique = v.jsonObject["unique"]?.jsonPrimitive?.booleanOrNull ?: false,
+                                repeatable = v.jsonObject["repeatable"]?.jsonPrimitive?.booleanOrNull ?: false,
+                                type = v.jsonObject["type"]?.jsonPrimitive?.contentOrNull ?: "string",
+                                component = v.jsonObject["component"]?.jsonPrimitive?.contentOrNull,
+                            )
+                        }
+                    } ?: emptyList()
+                    results.add(
+                        DbTableMetadata(
+                            apiUid = rs.getString("api_uid"),
+                            collectionType = rs.getString("collection_type").let {
+                                when (it) {
+                                    "singleType" -> StrapiContentTypeKind.SingleType
+                                    "collectionType" -> StrapiContentTypeKind.CollectionType
+                                    "component" -> StrapiContentTypeKind.Component
+                                    else -> throw IllegalArgumentException("Unknown collection type: $it")
+                                }
+                            },
+                            singularName = rs.getString("singular_name"),
+                            pluralName = rs.getString("plural_name"),
+                            collectionName = rs.getString("collection_name"),
+                            displayName = rs.getString("display_name"),
+                            draftAndPublish = rs.getBoolean("draft_and_publish"),
+                            localized = rs.getBoolean("localized"),
+                            contentManagerVisible = rs.getBoolean("content_manager_visible"),
+                            contentTypeBuilderVisible = rs.getBoolean("content_type_builder_visible"),
+                            columns = columns,
                         )
-                    }
-                } ?: emptyList()
-                results.add(
-                    DbTableMetadata(
-                        apiUid = rs.getString("api_uid"),
-                        collectionType = rs.getString("collection_type").let {
-                            when (it) {
-                                "singleType" -> StrapiContentTypeKind.SingleType
-                                "collectionType" -> StrapiContentTypeKind.CollectionType
-                                "component" -> StrapiContentTypeKind.Component
-                                else -> throw IllegalArgumentException("Unknown collection type: $it")
-                            }
-                        },
-                        singularName = rs.getString("singular_name"),
-                        pluralName = rs.getString("plural_name"),
-                        collectionName = rs.getString("collection_name"),
-                        displayName = rs.getString("display_name"),
-                        draftAndPublish = rs.getBoolean("draft_and_publish"),
-                        localized = rs.getBoolean("localized"),
-                        contentManagerVisible = rs.getBoolean("content_manager_visible"),
-                        contentTypeBuilderVisible = rs.getBoolean("content_type_builder_visible"),
-                        columns = columns,
                     )
-                )
-            }
+                }
             } catch (e: Exception) {
                 logger.error("Error parsing strapi_core_store_settings: ${e.message}", e)
                 throw e
             }
             results
-        }?.toList()?:emptyList()
+        }?.toList() ?: emptyList()
     }
 }

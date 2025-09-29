@@ -186,6 +186,7 @@ const MergeRequestDetails: React.FC = () => {
 
     // Proceed to next step
     const proceedToNextStep = async (nextStep: number) => {
+        debugger
         if (!id) return;
 
         // Only update status when moving forward
@@ -193,15 +194,17 @@ const MergeRequestDetails: React.FC = () => {
             // Determine the new status based on the next step
             let newStatus = mergeRequestDetail.mergeRequest.status;
 
-            if (nextStep === 1 && mergeRequestDetail.mergeRequest.status === 'COMPARED') {
-                newStatus = 'MERGED_FILES';
-                await updateMergeRequestStatus(newStatus);
-            } else if (nextStep === 2 && mergeRequestDetail.mergeRequest.status === 'MERGED_FILES') {
-                newStatus = 'MERGED_SINGLES';
-                await updateMergeRequestStatus(newStatus);
-            } else if (nextStep === 3 && mergeRequestDetail.mergeRequest.status === 'MERGED_SINGLES') {
-                newStatus = 'MERGED_COLLECTIONS';
-                await updateMergeRequestStatus(newStatus);
+            if (!['MERGED_COLLECTIONS', 'IN_PROGRESS', 'COMPLETED', 'FAILED'].includes(status)) {
+                if (nextStep === 1 && mergeRequestDetail.mergeRequest.status === 'COMPARED') {
+                    newStatus = 'MERGED_FILES';
+                    await updateMergeRequestStatus(newStatus);
+                } else if (nextStep === 2 && mergeRequestDetail.mergeRequest.status != 'MERGED_FILES') {
+                    newStatus = 'MERGED_SINGLES';
+                    await updateMergeRequestStatus(newStatus);
+                } else if (nextStep === 3) {
+                    newStatus = 'MERGED_COLLECTIONS';
+                    await updateMergeRequestStatus(newStatus);
+                }
             }
         }
 
@@ -223,8 +226,12 @@ const MergeRequestDetails: React.FC = () => {
                 status: status
             });
 
-            const updatedMergeRequest = await axios.get(`/api/merge-requests/${id}`);
-            setMergeRequestDetail(updatedMergeRequest.data);
+
+            const newData: MergeRequestDetail = {
+                ...mergeRequestDetail,
+                mergeRequest: {...mergeRequestDetail.mergeRequest, status: status}
+            }
+            setMergeRequestDetail(newData);
 
             return true;
         } catch (err: any) {
@@ -708,7 +715,7 @@ const MergeRequestDetails: React.FC = () => {
                                                 });
                                                 return;
                                             }
-                                            proceedToNextStep(2).catch(error => {
+                                            proceedToNextStep(3).catch(error => {
                                                 toast.current?.show({
                                                     severity: 'error',
                                                     summary: 'Error',

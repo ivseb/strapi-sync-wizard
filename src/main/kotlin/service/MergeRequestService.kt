@@ -1,7 +1,6 @@
 package it.sebi.service
 
 import io.ktor.server.config.*
-import it.sebi.JsonParser
 import it.sebi.client.client
 import it.sebi.database.dbQuery
 import it.sebi.models.*
@@ -10,11 +9,7 @@ import it.sebi.repository.MergeRequestSelectionsRepository
 import it.sebi.service.merge.ContentMergeProcessor
 import it.sebi.service.merge.FileMergeProcessor
 import it.sebi.tables.MergeRequestDocumentMappingTable
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -26,12 +21,22 @@ import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.slf4j.LoggerFactory
-import java.io.File
+import service.merge.MergeRequestServiceFileUtils
 
 /**
  * Service for handling merge request operations
  */
 enum class CompareMode { Full, Compare, Cache }
+
+@Serializable
+data class ComparisonPrefetchCache(
+    val sourceFiles: List<StrapiImage>,
+    val targetFiles: List<StrapiImage>,
+    val sourceRowsByUid: Map<String, List<StrapiContent>>,
+    val targetRowsByUid: Map<String, List<StrapiContent>>,
+    val collectedRelationships: List<ContentRelationship>
+)
+
 
 class MergeRequestService(
     applicationConfig: ApplicationConfig,
@@ -41,6 +46,8 @@ class MergeRequestService(
 ) {
     private val fileMergeProcessor = FileMergeProcessor(mergeRequestSelectionsRepository)
     private val contentMergeProcessor = ContentMergeProcessor(mergeRequestSelectionsRepository)
+
+    private val dataFileUtils = MergeRequestServiceFileUtils(applicationConfig)
 
     // Manual mappings list with optional filter by contentType UID, enriched with JSON for compare
     suspend fun getManualMappingsList(mergeRequestId: Int, contentTypeUid: String?): ManualMappingsListResponseDTO {
@@ -54,7 +61,7 @@ class MergeRequestService(
             }
             MergeRequestDocumentMappingTable.selectAll().where { predicate }.toList()
         }
-        val comparison = getContentComparisonFile(mergeRequestId)
+        val comparison = dataFileUtils.getContentComparisonFile(mergeRequestId)
         fun findJson(uid: String, docId: String?): JsonObject? {
             if (docId.isNullOrBlank() || comparison == null) return null
             if (uid == "files") {
@@ -169,30 +176,7 @@ class MergeRequestService(
     }
 
     // Load application configuration
-    private val dataFolder = applicationConfig.property("application.dataFolder").getString()
 
-    init {
-        // Initialize data folder asynchronously
-        runBlocking {
-            initializeDataFolder()
-        }
-    }
-
-    private suspend fun initializeDataFolder() {
-        withContext(Dispatchers.IO) {
-            try {
-                // Create data folder if it doesn't exist
-                val folder = File(dataFolder)
-                if (!folder.exists()) {
-                    folder.mkdirs()
-                }
-            } catch (e: Exception) {
-                logger.error("Error initializing data folder: ${e.message}", e)
-                // We don't rethrow here as this is initialization code
-                // and we don't want to prevent the service from starting
-            }
-        }
-    }
 
     /**
      * Create a new merge request
@@ -273,17 +257,7 @@ class MergeRequestService(
         // They are shared across merge requests, so we don't delete them here
 
         // Delete any files stored on disk for this merge request using IO dispatcher
-        withContext(Dispatchers.IO) {
-            try {
-                val mergeRequestFolder = File(dataFolder, "merge_request_$id")
-                if (mergeRequestFolder.exists()) {
-                    mergeRequestFolder.deleteRecursively()
-                }
-            } catch (e: Exception) {
-                logger.error("Error deleting merge request folder for merge request $id: ${e.message}", e)
-                // Continue with deleting the merge request from the database even if file deletion fails
-            }
-        }
+        dataFileUtils.deleteFilesOfMergeRequest(id)
 
         // Finally, delete the merge request itself
         return mergeRequestRepository.deleteMergeRequest(id)
@@ -374,7 +348,7 @@ class MergeRequestService(
             throw IllegalStateException("Cannot modify selections after merge has been started or completed")
         }
 
-        val comparison: ContentTypeComparisonResultMapWithRelationships = getContentComparisonFile(id)
+        val comparison: ContentTypeComparisonResultMapWithRelationships = dataFileUtils.getContentComparisonFile(id)
             ?: throw IllegalStateException("Comparison not available. Run compare before updating selections.")
 
         val allEntries: List<ContentTypeComparisonResultWithRelationships> = when (req.kind) {
@@ -673,94 +647,13 @@ class MergeRequestService(
     }
 
 
-    /**
-     * Get the file path for storing schema compatibility results for a merge request
-     */
-    private suspend fun getSchemaCompatibilityFilePath(id: Int): String {
-        return withContext(Dispatchers.IO) {
-            val mergeRequestFolder = File(dataFolder, "merge_request_$id")
-            if (!mergeRequestFolder.exists()) {
-                try {
-                    mergeRequestFolder.mkdirs()
-                } catch (e: Exception) {
-                    logger.error("Error creating directory for merge request $id: ${e.message}", e)
-                    throw e
-                }
-            }
-            File(mergeRequestFolder, "schema_compatibility.json").absolutePath
-        }
-    }
-
-
     private val logger = LoggerFactory.getLogger(this::class.java)
-
-    private suspend fun getSchemaCompatibilityFile(id: Int): SchemaDbCompatibilityResult? {
-        return withContext(Dispatchers.IO) {
-            val schemaFilePath = getSchemaCompatibilityFilePath(id)
-            val schemaFile = File(schemaFilePath)
-
-            // Check if file exists
-            if (schemaFile.exists()) {
-                try {
-                    // Read the file and deserialize
-                    val fileContent = schemaFile.readText()
-                    val fileStorage = JsonParser.decodeFromString<SchemaDbCompatibilityResult>(fileContent)
-                    fileStorage
-                } catch (e: Exception) {
-                    // If there's an error reading the file, log it and continue with a new check
-                    logger.error("Error reading schema compatibility file for merge request $id: ${e.message}", e)
-                    // Continue with a new check
-                    null
-                }
-            } else {
-                null
-            }
-        }
-    }
-
-    private suspend fun saveSchemaCompatibilityFile(id: Int, schemaResult: SchemaDbCompatibilityResult) {
-        withContext(Dispatchers.IO) {
-            try {
-                val schemaFilePath = getSchemaCompatibilityFilePath(id)
-                val schemaResultFile = File(schemaFilePath)
-                val jsonContent = JsonParser.encodeToString(schemaResult)
-                schemaResultFile.writeText(jsonContent)
-            } catch (e: Exception) {
-                logger.error("Error saving schema compatibility file for merge request $id: ${e.message}", e)
-                throw e
-            }
-        }
-    }
 
 
     /**
      * Get the file path for storing content comparison results for a merge request
      */
-    private suspend fun getContentComparisonFilePath(id: Int): String {
-        return withContext(Dispatchers.IO) {
-            val mergeRequestFolder = File(dataFolder, "merge_request_$id")
-            if (!mergeRequestFolder.exists()) {
-                try {
-                    mergeRequestFolder.mkdirs()
-                } catch (e: Exception) {
-                    logger.error("Error creating directory for merge request $id: ${e.message}", e)
-                    throw e
-                }
-            }
-            File(mergeRequestFolder, "content_comparison.json").absolutePath
-        }
-    }
 
-    private fun stripCleanData(element: JsonElement): JsonElement = when (element) {
-        is JsonObject -> JsonObject(
-            element.mapNotNull { (k, v) ->
-                if (k == "cleanData") null else k to stripCleanData(v)
-            }.toMap()
-        )
-
-        is JsonArray -> JsonArray(element.map { stripCleanData(it) })
-        else -> element
-    }
 
     private val TECH_FIELDS_FOR_CLEAN = setOf(
         "id", "created_by_id", "updated_by_id", "created_at", "updated_at", "published_at"
@@ -774,35 +667,6 @@ class MergeRequestService(
         else -> v
     }
 
-
-    private fun enrichWithCleanData(element: JsonElement): JsonElement = when (element) {
-        is JsonObject -> {
-            // First, recurse into children
-            val processedChildren = element.mapValues { (_, v) -> enrichWithCleanData(v) }.toMutableMap()
-
-            // Heuristic to detect StrapiContent: has metadata (object), rawData (object), and links (array)
-            val hasMetadata = processedChildren["metadata"] is JsonObject
-            val raw = processedChildren["rawData"] as? JsonObject
-            val hasLinks = processedChildren["links"] is JsonArray
-            if (hasMetadata && raw != null && hasLinks) {
-                // Recompute cleanData from raw
-                processedChildren["cleanData"] = cleanObject(raw)
-            }
-            JsonObject(processedChildren)
-        }
-
-        is JsonArray -> JsonArray(element.map { enrichWithCleanData(it) })
-        else -> element
-    }
-
-    @Serializable
-    data class ComparisonPrefetchCache(
-        val sourceFiles: List<StrapiImage>,
-        val targetFiles: List<StrapiImage>,
-        val sourceRowsByUid: Map<String, List<StrapiContent>>,
-        val targetRowsByUid: Map<String, List<StrapiContent>>,
-        val collectedRelationships: List<ContentRelationship>
-    )
 
     private fun toCache(prefetch: ComparisonPrefetch): ComparisonPrefetchCache = ComparisonPrefetchCache(
         sourceFiles = prefetch.sourceFiles,
@@ -827,81 +691,6 @@ class MergeRequestService(
         targetRowsByUid = cache.targetRowsByUid,
         collectedRelationships = cache.collectedRelationships.toSet()
     )
-
-    private suspend fun getPrefetchCacheFilePath(id: Int): String = withContext(Dispatchers.IO) {
-        val mergeRequestFolder = File(dataFolder, "merge_request_$id")
-        if (!mergeRequestFolder.exists()) mergeRequestFolder.mkdirs()
-        File(mergeRequestFolder, "prefetch_cache.json").absolutePath
-    }
-
-    private suspend fun getPrefetchCache(id: Int): ComparisonPrefetchCache? = withContext(Dispatchers.IO) {
-        val path = getPrefetchCacheFilePath(id)
-        val f = File(path)
-        if (!f.exists()) return@withContext null
-        try {
-            val content = f.readText()
-            JsonParser.decodeFromString<ComparisonPrefetchCache>(content)
-        } catch (e: Exception) {
-            logger.error("Error reading prefetch cache for merge request $id: ${e.message}", e)
-            null
-        }
-    }
-
-    private suspend fun savePrefetchCache(id: Int, cache: ComparisonPrefetchCache) = withContext(Dispatchers.IO) {
-        try {
-            val path = getPrefetchCacheFilePath(id)
-            val f = File(path)
-            val json = JsonParser.encodeToString(cache)
-            f.writeText(json)
-        } catch (e: Exception) {
-            logger.error("Error saving prefetch cache for merge request $id: ${e.message}", e)
-            throw e
-        }
-    }
-
-    private suspend fun getContentComparisonFile(id: Int): ContentTypeComparisonResultMapWithRelationships? {
-        return withContext(Dispatchers.IO) {
-            val schemaFilePath = getContentComparisonFilePath(id)
-            val schemaFile = File(schemaFilePath)
-
-            if (schemaFile.exists()) {
-                try {
-                    // Read the file and deserialize
-                    val fileContent = schemaFile.readText()
-                    // Enrich JSON by recomputing cleanData for all StrapiContent elements
-                    val enrichedJson = enrichWithCleanData(Json.parseToJsonElement(fileContent)).toString()
-                    val fileStorage =
-                        JsonParser.decodeFromString<ContentTypeComparisonResultMapWithRelationships>(enrichedJson)
-                    fileStorage
-                } catch (e: Exception) {
-                    // If there's an error reading the file, log it and continue with a new check
-                    logger.error("Error reading content comparison file for merge request $id: ${e.message}", e)
-                    null
-                }
-            } else {
-                null
-            }
-        }
-    }
-
-    private suspend fun saveContentComparisonFile(
-        id: Int,
-        contentComparison: ContentTypeComparisonResultMapWithRelationships
-    ) {
-        withContext(Dispatchers.IO) {
-            try {
-                val schemaFilePath = getContentComparisonFilePath(id)
-                val schemaResultFile = File(schemaFilePath)
-                // Serialize normally, then strip all cleanData fields before saving
-                val jsonContent = JsonParser.encodeToString(contentComparison)
-                val stripped = stripCleanData(Json.parseToJsonElement(jsonContent)).toString()
-                schemaResultFile.writeText(stripped)
-            } catch (e: Exception) {
-                logger.error("Error saving content comparison file for merge request $id: ${e.message}", e)
-                throw e
-            }
-        }
-    }
 
 
     suspend fun checkSchemaCompatibility(
@@ -932,7 +721,7 @@ class MergeRequestService(
         }
 
         if (!force)
-            getSchemaCompatibilityFile(mergeRequest.id)?.let { return it }
+            dataFileUtils.getSchemaCompatibilityFile(mergeRequest.id)?.let { return it }
         val dbRes: SchemaDbCompatibilityResult = syncService.checkSchemaCompatibilityDb(
             sourceInstance = mergeRequest.sourceInstance,
             targetInstance = mergeRequest.targetInstance
@@ -945,7 +734,7 @@ class MergeRequestService(
         mergeRequestRepository.updateSchemaCompatibility(mergeRequest.id)
 
         // Save the result to a file
-        saveSchemaCompatibilityFile(mergeRequest.id, dbRes)
+        dataFileUtils.saveSchemaCompatibilityFile(mergeRequest.id, dbRes)
 
         return dbRes
     }
@@ -991,16 +780,16 @@ class MergeRequestService(
         suspend fun computeAndPersist(prefetch: ComparisonPrefetch): ContentTypeComparisonResultMapWithRelationships {
             val comp = computeComparisonFromPrefetch(mergeRequest, schemas.extractedSchema!!, prefetch)
             mergeRequestRepository.updateComparisonData(mergeRequest.id)
-            saveContentComparisonFile(mergeRequest.id, comp)
+            dataFileUtils.saveContentComparisonFile(mergeRequest.id, comp)
             return comp
         }
 
         when (mode) {
             CompareMode.Cache -> {
                 // Return file result if present
-                getContentComparisonFile(mergeRequest.id)?.let { return it }
+                dataFileUtils.getContentComparisonFile(mergeRequest.id)?.let { return it }
                 // Try compute from cached prefetch
-                val cached = getPrefetchCache(mergeRequest.id)
+                val cached = dataFileUtils.getPrefetchCache(mergeRequest.id)
                 if (cached != null) {
                     val pre = fromCache(cached)
                     return computeAndPersist(pre)
@@ -1014,17 +803,17 @@ class MergeRequestService(
         return when (mode) {
             CompareMode.Full -> {
                 val prefetch = prefetchComparisonData(mergeRequest, schemas.extractedSchema!!)
-                savePrefetchCache(mergeRequest.id, toCache(prefetch))
+                dataFileUtils.savePrefetchCache(mergeRequest.id, toCache(prefetch))
                 computeAndPersist(prefetch)
             }
 
             CompareMode.Compare, CompareMode.Cache -> {
-                val cached = getPrefetchCache(mergeRequest.id)
+                val cached = dataFileUtils.getPrefetchCache(mergeRequest.id)
                 val prefetch = if (cached != null) fromCache(cached) else prefetchComparisonData(
                     mergeRequest,
                     schemas.extractedSchema!!
                 ).also {
-                    savePrefetchCache(mergeRequest.id, toCache(it))
+                    dataFileUtils.savePrefetchCache(mergeRequest.id, toCache(it))
                 }
                 computeAndPersist(prefetch)
             }
@@ -1052,7 +841,7 @@ class MergeRequestService(
                 ?: throw IllegalArgumentException("Merge request not found")
 
             // Get comparison data from file if available, otherwise compute it
-            var compareResult = getContentComparisonFile(id)
+            var compareResult = dataFileUtils.getContentComparisonFile(id)
             if (compareResult == null && forceCompare)
                 compareResult = compareContent(mergeRequest, CompareMode.Compare)
 
@@ -1095,7 +884,7 @@ class MergeRequestService(
         val mergeRequest = mergeRequestRepository.getMergeRequestWithInstances(id)
             ?: throw IllegalArgumentException("Merge request not found")
 
-        val comparisonDataMap = getContentComparisonFile(id)
+        val comparisonDataMap = dataFileUtils.getContentComparisonFile(id)
             ?: throw IllegalStateException("Comparison data not found")
 
         // Mark as started to lock further changes
@@ -1110,10 +899,10 @@ class MergeRequestService(
         targetClient.role = "target"
         sourceClient.currentMergeRequestId = id
         targetClient.currentMergeRequestId = id
-        sourceClient.dataRootFolder = dataFolder
-        targetClient.dataRootFolder = dataFolder
+        sourceClient.dataRootFolder = dataFileUtils.dataFolder
+        targetClient.dataRootFolder = dataFileUtils.dataFolder
 
-        val schema = getSchemaCompatibilityFile(mergeRequest.id)!!.extractedSchema!!
+        val schema = dataFileUtils.getSchemaCompatibilityFile(mergeRequest.id)!!.extractedSchema!!
 
         val mergeRequestSelection = mergeRequestSelectionsRepository.getSelectionsForMergeRequest(id)
         val mappingMap: MutableMap<String, MutableMap<String, MergeRequestDocumentMapping>> =
@@ -1327,7 +1116,7 @@ class MergeRequestService(
     suspend fun getSyncPlan(id: Int): SyncPlanDTO {
         val mergeRequest = mergeRequestRepository.getMergeRequestWithInstances(id)
             ?: throw IllegalArgumentException("Merge request not found")
-        val comparisonDataMap = getContentComparisonFile(id)
+        val comparisonDataMap = dataFileUtils.getContentComparisonFile(id)
             ?: throw IllegalStateException("Comparison data not found. Run compare before requesting plan.")
         val selections = mergeRequestSelectionsRepository.getSelectionsForMergeRequest(id)
         // Split files from content selections

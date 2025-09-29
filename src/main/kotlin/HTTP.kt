@@ -5,10 +5,11 @@ import com.asyncapi.kotlinasyncapi.ktor.AsyncApiPlugin
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.plugins.compression.*
-import io.ktor.server.plugins.cors.routing.CORS
+import io.ktor.server.plugins.cors.routing.*
 import io.ktor.server.sse.*
 
 fun Application.configureHTTP() {
+
     install(CORS) {
         allowHeader(HttpHeaders.ContentType)
         allowHeader(HttpHeaders.Authorization)

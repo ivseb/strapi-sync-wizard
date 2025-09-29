@@ -42,9 +42,15 @@ data class ContentManagerOptions(
 )
 
 @Serializable
+data class I18NOptions(
+    val localized: Boolean
+)
+
+@Serializable
 data class PluginOptions(
     val contentManager: ContentManagerOptions? = null,
-    val contentTypeBuilder: ContentTypeBuilderOptions? = null
+    val contentTypeBuilder: ContentTypeBuilderOptions? = null,
+    val i18n: I18NOptions? = null
 )
 
 @Serializable

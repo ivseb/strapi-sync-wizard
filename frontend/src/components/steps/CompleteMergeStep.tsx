@@ -972,7 +972,7 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                         />
                     </div>
                 )}
-                {(status === 'MERGED_COLLECTIONS' || status === 'FAILED') && !syncInProgress && (
+                {(status === 'MERGED_COLLECTIONS' || status === 'FAILED'|| status === 'IN_PROGRESS') && !syncInProgress && (
                     <Button
                         label="Complete Merge"
                         icon="pi pi-check"

@@ -34,7 +34,7 @@ object ContentJsonUtils {
             is JsonObject -> {
                 buildJsonObject {
                     for ((key, value) in element) {
-                        if (key == "document_id" || key == "__order" || key == "__links") continue
+                        if (key == "document_id" || key == "__order" || key == "__links" || key == "id") continue
                         val normalized = normalizeKeyName(key)
                         val mappedKey = fieldNameResolver[normalized] ?: convertToCamelCase(key)
                         val processedValue = processJsonElement(value, fieldNameResolver)
@@ -60,28 +60,40 @@ object ContentJsonUtils {
             is JsonObject -> {
                 buildJsonObject {
                     for ((key, value) in element) {
-                        if (key == "document_id" || key == "__order" || key == "__links") continue
+                        if (key == "document_id" || key == "__order" || key == "__links" || key == "id") continue
                         val normalized = normalizeKeyName(key)
                         val mappedKey = currentResolver[normalized] ?: convertToCamelCase(key)
 
-                        // Decide next resolver/schema: if key is a component field in currentSchema, switch
-                        val nextSchemaAndResolver = run {
-                            val col = currentSchema?.metadata?.columns?.firstOrNull { normalizeKeyName(it.name) == normalized }
-                            val compType = col?.component
-                            if (compType != null) {
-                                val compTable = resolveComponentTableName(compType, dbSchema)
-                                val compSchema = if (compTable != null) contentTypeMappingByTable[compTable] else null
-                                if (compSchema != null) buildFieldNameResolver(compSchema) to compSchema else null
-                            } else null
-                        }
+                        // Determine if this field is a component of the current schema
+                        val col = currentSchema?.metadata?.columns?.firstOrNull { normalizeKeyName(it.name) == normalized }
+                        val nextSchemaAndResolver = if (col?.component != null) {
+                            val compTable = resolveComponentTableName(col.component, dbSchema)
+                            val compSchema = compTable?.let { contentTypeMappingByTable[it] }
+                            if (compSchema != null) buildFieldNameResolver(compSchema) to compSchema else null
+                        } else null
 
                         val processedValue: JsonElement = if (nextSchemaAndResolver != null) {
                             val (subResolver, subSchema) = nextSchemaAndResolver
-                            when (value) {
-                                is JsonArray -> buildJsonArray {
-                                    value.forEach { add(processJsonElement(it, subResolver, subSchema, dbSchema, contentTypeMappingByTable)) }
+                            val isRepeatable = col?.repeatable == true
+                            when {
+                                isRepeatable && value is JsonObject -> {
+                                    // Wrap single object into array for repeatable component fields
+                                    buildJsonArray {
+                                        add(processJsonElement(value, subResolver, subSchema, dbSchema, contentTypeMappingByTable))
+                                    }
                                 }
-                                is JsonObject -> processJsonElement(value, subResolver, subSchema, dbSchema, contentTypeMappingByTable)
+                                isRepeatable && value is JsonArray -> {
+                                    buildJsonArray {
+                                        value.forEach { add(processJsonElement(it, subResolver, subSchema, dbSchema, contentTypeMappingByTable)) }
+                                    }
+                                }
+                                value is JsonArray -> {
+
+                                    processJsonElement(value.first(), subResolver, subSchema, dbSchema, contentTypeMappingByTable)
+                                }
+                                value is JsonObject -> {
+                                    processJsonElement(value, subResolver, subSchema, dbSchema, contentTypeMappingByTable)
+                                }
                                 else -> value
                             }
                         } else {
@@ -206,6 +218,53 @@ object ContentJsonUtils {
             val key = resolveKey(part, index == 0)
             val valueToPut: JsonElement = if (isRepeatableKey(part)) JsonArray(listOf(current)) else current
             current = buildJsonObject { put(key, valueToPut) }
+        }
+        return current as JsonObject
+    }
+
+    // Schema-aware builder that resolves each segment using the corresponding component schema when needed
+    fun buildNestedObjectFromPathWithSchema(
+        path: String,
+        leaf: JsonObject,
+        rootSchema: DbTable?,
+        dbSchema: DbSchema,
+        contentTypeMappingByTable: Map<String, DbTable>
+    ): JsonObject {
+        if (path.isEmpty()) return leaf
+        val parts = path.split('.')
+        var currentSchema: DbTable? = rootSchema
+        var current: JsonElement = leaf
+
+        // Build from leaf upwards
+        for (index in parts.indices.reversed()) {
+            val rawPart = parts[index]
+            val normalized = normalizeKeyName(rawPart)
+
+            // Determine mapping for this level using the current schema (if available)
+            val col = currentSchema?.metadata?.columns?.firstOrNull { normalizeKeyName(it.name) == normalized }
+            val mappedKey = col?.name ?: buildFieldNameResolver(currentSchema ?: return buildJsonObject { put(convertToCamelCase(rawPart), current) })
+                .getOrElse(normalized) { convertToCamelCase(rawPart) }
+
+            // Wrap if this segment is a repeatable component field
+            val valueToPut: JsonElement = if (col?.repeatable == true) JsonArray(listOf(current)) else current
+
+            // Create the object for this level
+            current = buildJsonObject { put(mappedKey, valueToPut) }
+
+            // Prepare next schema if this is the root-most segment (moving outward) and it is a component
+            // When moving upwards, the next iteration will handle the parent segment; so we must update
+            // currentSchema to that parent schema. Here, we update schema for the child we just wrapped, so that
+            // on the previous iteration we still use parent's schema.
+            // Therefore we only change schema for the next inner level before the loop continues: if parent is component, it will be resolved on its iteration.
+            // To keep traversal correct, we need to switch schema for the next inner segment when the parent of that inner segment is a component.
+            // At this point, to compute the schema for the next iteration (one level deeper), check if col?.component exists.
+            currentSchema = if (col?.component != null) {
+                val compTable = resolveComponentTableName(col.component, dbSchema)
+                if (compTable != null) contentTypeMappingByTable[compTable] else null
+            } else {
+                // If not a component, deeper keys (towards the leaf) will still use the same schema
+                currentSchema
+            }
         }
         return current as JsonObject
     }

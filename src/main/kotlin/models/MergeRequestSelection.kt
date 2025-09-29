@@ -83,7 +83,7 @@ data class SelectionUpdateResponseDTO(
 @Serializable
 data class UnifiedSelectionDTO(
     val kind: StrapiContentTypeKind,
-    val tableName: String?,
+    val tableName: String?=null,
     val ids: List<String>? = null,
     val selectAllKind: ContentTypeComparisonResultKind? = null,
     val isSelected: Boolean

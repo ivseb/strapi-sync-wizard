@@ -33,7 +33,7 @@ interface MergeSingleTypesStepProps {
     selections: MergeRequestSelectionDTO[];
     loading?: boolean;
     allMergeData: MergeRequestData;
-    updateAllSelections: (kind: StrapiContentTypeKind, isSelected: boolean, tableName?: string, documentIds?: string[]) => Promise<boolean>;
+    updateAllSelections: (kind: StrapiContentTypeKind, isSelected: boolean, tableName?: string, documentIds?: string[], selectAllKind?: ContentTypeComparisonResultKind) => Promise<boolean>;
     onSaved?: (data?: MergeRequestData) => void | Promise<void>;
 }
 
@@ -383,7 +383,7 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
                             onSelectAllChange={() => {
                                 if (disableSelection) return;
                                 setUpdateTableLoading(true);
-                                updateAllSelections(kind, !isSelectAll)
+                                updateAllSelections(kind, !isSelectAll,undefined,undefined, group.key)
                                     .then(() => {
                                         setUpdateTableLoading(false);
                                     })
