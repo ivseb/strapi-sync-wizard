@@ -23,7 +23,7 @@ kotlin {
 
 
 group = "it.sebi"
-version = "0.2.0"
+version = "0.2.1"
 
 application {
     mainClass = "io.ktor.server.netty.EngineMain"
@@ -114,6 +114,10 @@ ktor {
         jreVersion.set(JavaVersion.VERSION_17)
         localImageName.set("sample-docker-image")
         imageTag.set(rootProject.version.toString())
+        environmentVariables.set(listOf(
+            DockerEnvironmentVariable("JAVA_OPTS", "-Xmx2g -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -server"),
+            DockerEnvironmentVariable("JVM_OPTS", "-Xmx2g -XX:+UseG1GC")
+        ))
         portMappings.set(
             listOf(
                 DockerPortMapping(
