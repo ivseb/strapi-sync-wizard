@@ -1,5 +1,5 @@
 import React, {useEffect, useRef, useState} from 'react';
-import {useNavigate, useParams} from 'react-router-dom';
+import {useLocation, useNavigate, useParams} from 'react-router-dom';
 import axios from 'axios';
 import {Card} from 'primereact/card';
 import {Button} from 'primereact/button';
@@ -31,6 +31,7 @@ const MergeRequestDetails: React.FC = () => {
     console.log('Rendering MergeRequestDetails');
     const {id} = useParams<{ id: string }>();
     const navigate = useNavigate();
+    const location = useLocation();
     const toast = useRef<Toast>(null);
 
     const [mergeRequestDetail, setMergeRequestDetail] = useState<MergeRequestDetail | null>(null);
@@ -194,15 +195,18 @@ const MergeRequestDetails: React.FC = () => {
             // Determine the new status based on the next step
             let newStatus = mergeRequestDetail.mergeRequest.status;
 
-            if (!['MERGED_COLLECTIONS', 'IN_PROGRESS', 'COMPLETED', 'FAILED'].includes(status)) {
-                if (nextStep === 1 && mergeRequestDetail.mergeRequest.status === 'COMPARED') {
+            if (!['IN_PROGRESS', 'COMPLETED', 'FAILED'].includes(status)) {
+                if (nextStep <=1) {
                     newStatus = 'MERGED_FILES';
                     await updateMergeRequestStatus(newStatus);
-                } else if (nextStep === 2 && mergeRequestDetail.mergeRequest.status != 'MERGED_FILES') {
+                } else if (nextStep === 2) {
                     newStatus = 'MERGED_SINGLES';
                     await updateMergeRequestStatus(newStatus);
                 } else if (nextStep === 3) {
                     newStatus = 'MERGED_COLLECTIONS';
+                    await updateMergeRequestStatus(newStatus);
+                } else if (nextStep > 3) {
+                    newStatus = 'REVIEW';
                     await updateMergeRequestStatus(newStatus);
                 }
             }
@@ -423,6 +427,7 @@ const MergeRequestDetails: React.FC = () => {
 
     const status = mergeRequestDetail.mergeRequest.status;
     const isLocked = ['IN_PROGRESS', 'COMPLETED', 'FAILED'].includes(status);
+    const completeOnly = location.pathname.endsWith('/complete');
 
     return (
         <div className="container py-4">
@@ -476,8 +481,10 @@ const MergeRequestDetails: React.FC = () => {
                 </div>
             </Card>
 
-            {/* Pre-steps Actions */}
-            {!isLocked && (
+
+            {/* Stepper */}
+            {(!isLocked && !completeOnly && ['CREATED','SCHEMA_CHECKED','COMPARED', 'MERGED_FILES', 'MERGED_SINGLES', 'MERGED_COLLECTIONS'].includes(status)) && (
+
                 <Card className="mb-4">
                     <div className="p-3">
                         <div className="grid">
@@ -491,7 +498,7 @@ const MergeRequestDetails: React.FC = () => {
                                         />
                                     </div>
                                     <SchemaCompatibilityStep
-                                        schemaCompatible={mergeRequestDetail.mergeRequest.status === 'SCHEMA_CHECKED' || mergeRequestDetail.mergeRequest.status === 'COMPARED' || mergeRequestDetail.mergeRequest.status === 'MERGED_FILES' || mergeRequestDetail.mergeRequest.status === 'MERGED_SINGLES' || mergeRequestDetail.mergeRequest.status === 'MERGED_COLLECTIONS' || mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
+                                        schemaCompatible={mergeRequestDetail?.isCompatible === true}
                                         checkingSchema={checkingSchema}
                                         checkSchemaCompatibility={checkSchemaCompatibility}
                                     />
@@ -508,7 +515,7 @@ const MergeRequestDetails: React.FC = () => {
                                     </div>
                                     <ContentComparisonStep
                                         comparingContent={comparingContent}
-                                        schemaCompatible={mergeRequestDetail.mergeRequest.status !== 'CREATED'}
+                                        schemaCompatible={mergeRequestDetail?.isCompatible === true}
                                         compareContent={compareContent}
                                         status={mergeRequestDetail.mergeRequest.status}
                                     />
@@ -518,9 +525,7 @@ const MergeRequestDetails: React.FC = () => {
                     </div>
                 </Card>
             )}
-
-            {/* Stepper */}
-            {(!isLocked && ['COMPARED', 'MERGED_FILES', 'MERGED_SINGLES', 'MERGED_COLLECTIONS'].includes(status)) && (
+            {(!isLocked && !completeOnly && ['COMPARED', 'MERGED_FILES', 'MERGED_SINGLES', 'MERGED_COLLECTIONS'].includes(status)) && (
                 <Card>
                     <div className="p-3">
                         <Stepper
@@ -715,7 +720,7 @@ const MergeRequestDetails: React.FC = () => {
                                                 });
                                                 return;
                                             }
-                                            proceedToNextStep(3).catch(error => {
+                                            proceedToNextStep(4).catch(error => {
                                                 toast.current?.show({
                                                     severity: 'error',
                                                     summary: 'Error',
@@ -732,9 +737,23 @@ const MergeRequestDetails: React.FC = () => {
                         </Stepper>
                     </div>
                 </Card>
+
             )}
 
-            {(['MERGED_COLLECTIONS', 'IN_PROGRESS', 'COMPLETED', 'FAILED'].includes(status)) && (
+            {['REVIEW', 'IN_PROGRESS'].includes(status) && (
+                <div className="mb-3">
+                    <Button label="Torna alla wizard" icon="pi pi-arrow-left" className="p-button-outlined"
+                            onClick={() => {
+                                setActiveStep(2)
+                                updateMergeRequestStatus('MERGED_COLLECTIONS').catch(error => {
+                                    console.error('Error updating merge request status:', error);
+                                })
+                            }
+                            }/>
+                </div>
+            )}
+
+            {(['REVIEW', 'IN_PROGRESS', 'COMPLETED', 'FAILED'].includes(status)) && (
                 <Card className="mt-4">
                     <div className="p-3">
                         <CompleteMergeStep

@@ -215,6 +215,7 @@ export interface ManualMappingsResponseDTO {
 
 // Main data structure for merge requests
 export interface MergeRequestData {
+
     files: ContentTypeFileComparisonResult[];
     singleTypes: Record<string, ContentTypeComparisonResultWithRelationships>;
     collectionTypes: Record<string, ContentTypeComparisonResultWithRelationships[]>;
@@ -224,6 +225,7 @@ export interface MergeRequestData {
 
 // Combined structure returned by the API
 export interface MergeRequestDetail {
+    isCompatible:boolean;
     mergeRequest: {
         id: number;
         name: string;

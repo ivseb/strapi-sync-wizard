@@ -175,7 +175,6 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
             if (event.data === 'heartbeat') return;
             console.log('SSE message received:', event);
             try {
-                debugger
                 const update: SyncProgressUpdate = JSON.parse(event.data);
                 console.log('Received sync progress update (message):', update);
 
@@ -290,7 +289,6 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
             startSyncProgressSSE(mergeRequestId);
 
             // Call the original completeMerge function
-            //TODO: RESTORE
             completeMerge();
         } else {
             console.error('Could not determine merge request ID from URL');
@@ -972,7 +970,7 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                         />
                     </div>
                 )}
-                {(status === 'MERGED_COLLECTIONS' || status === 'FAILED'|| status === 'IN_PROGRESS') && !syncInProgress && (
+                {(status === 'MERGED_COLLECTIONS' || status === 'FAILED'|| status === 'IN_PROGRESS' || status === 'REVIEW') && !syncInProgress && (
                     <Button
                         label="Complete Merge"
                         icon="pi pi-check"

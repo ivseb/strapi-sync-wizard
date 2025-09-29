@@ -30,6 +30,7 @@ const App: React.FC = () => {
             <Route path="/instances" element={<Instances />} />
             <Route path="/merge-requests" element={<MergeRequests />} />
             <Route path="/merge-requests/:id" element={<MergeRequestDetails />} />
+            <Route path="/merge-requests/:id/complete" element={<MergeRequestDetails />} />
           </Routes>
         </Layout>
       </LayoutProvider>

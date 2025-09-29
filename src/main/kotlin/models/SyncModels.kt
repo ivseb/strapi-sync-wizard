@@ -204,6 +204,7 @@ data class SelectedContentTypeDependency(
  */
 @Serializable
 data class MergeRequestData(
+
     val files: List<ContentTypeFileComparisonResult>,
     val singleTypes: Map<String, ContentTypeComparisonResultWithRelationships>,
     val collectionTypes: Map<String, List<ContentTypeComparisonResultWithRelationships>>,

@@ -219,8 +219,9 @@ class MergeRequestService(
         val mergeRequest = mergeRequestRepository.getMergeRequestWithInstances(id)
             ?: throw IllegalArgumentException("Merge request not found")
         val mergeData = getAllMergeRequestDataIfCompared(id, false)
+        val schemaCompatibility = dataFileUtils.getSchemaCompatibilityFile(id)?.isCompatible
 
-        return MergeRequestDetail(mergeRequest, mergeData)
+        return MergeRequestDetail(mergeRequest, schemaCompatibility,mergeData)
     }
 
     /**
@@ -841,6 +842,7 @@ class MergeRequestService(
                 ?: throw IllegalArgumentException("Merge request not found")
 
             // Get comparison data from file if available, otherwise compute it
+
             var compareResult = dataFileUtils.getContentComparisonFile(id)
             if (compareResult == null && forceCompare)
                 compareResult = compareContent(mergeRequest, CompareMode.Compare)
@@ -1169,8 +1171,21 @@ class MergeRequestService(
                 direction = f.direction
             )
         }
+        // Append a final batch with content deletions so they appear in the graph (ordering not required)
+        val deletionsBatchDto: List<SyncPlanItemDTO> = contentSelections
+            .filter { it.direction == Direction.TO_DELETE }
+            .map { sel ->
+                SyncPlanItemDTO(
+                    tableName = sel.tableName,
+                    documentId = sel.documentId,
+                    direction = sel.direction
+                )
+            }
+
         val batchesDto: List<List<SyncPlanItemDTO>> =
-            if (fileBatchDto.isNotEmpty()) listOf(fileBatchDto) + batchesDtoContent else batchesDtoContent
+            (if (fileBatchDto.isNotEmpty()) listOf(fileBatchDto) + batchesDtoContent else batchesDtoContent).let { base ->
+                if (deletionsBatchDto.isNotEmpty()) base + listOf(deletionsBatchDto) else base
+            }
 
         val missingDto = filteredMissing.map { m ->
             MissingDependencyDTO(
