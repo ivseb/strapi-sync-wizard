@@ -520,3 +520,135 @@ private suspend fun fetchStrapiMetadataJsonFromDb(instance: StrapiInstance): Lis
         }?.toList() ?: emptyList()
     }
 }
+
+
+// Added for async mode: build comparable signatures from DbSchema and compare against live target
+private fun buildTableDefFromDbSchema(schema: DbSchema): Map<String, TableDef> {
+    fun colSig(c: DbColumn): String = buildString {
+        append("type=").append(c.type)
+        append("|args=").append(c.args?.toString())
+        append("|defaultTo=").append(c.defaultTo?.toString())
+        append("|notNullable=").append(c.notNullable)
+        append("|unsigned=").append(c.unsigned)
+    }
+    fun idxSig(i: DbIndex): String = buildString {
+        append("columns=").append(i.columns.joinToString(","))
+        append("|type=").append(i.type)
+    }
+    fun fkSig(fk: DbForeignKey): String = buildString {
+        append("columns=").append(fk.columns.joinToString(","))
+        append("|refTable=").append(fk.referencedTable)
+        append("|refCols=").append(fk.referencedColumns.joinToString(","))
+        append("|onDelete=").append(fk.onDelete)
+    }
+    val map = mutableMapOf<String, TableDef>()
+    for (t in schema.tables) {
+        val colMap = t.columns.associate { it.name to colSig(it) }
+        val idxMap = t.indexes.associate { it.name to idxSig(it) }
+        val fkMap = t.foreignKeys.associate { it.name to fkSig(it) }
+        map[t.name] = TableDef(colMap, idxMap, fkMap)
+    }
+    return map
+}
+
+suspend fun SyncService.checkSchemaCompatibilityAgainstTarget(
+    sourceSchema: DbSchema,
+    targetInstance: StrapiInstance
+): SchemaDbCompatibilityResult {
+    val logger = LoggerFactory.getLogger("SyncServiceDb")
+    logger.info("Checking DB schema compatibility between uploaded source schema and live target '${targetInstance.name}'")
+
+    val targetJson = fetchStrapiSchemaJsonFromDb(targetInstance)
+    if (targetJson == null) {
+        logger.warn("Target schema JSON missing; returning incompatible result")
+        return SchemaDbCompatibilityResult(isCompatible = false)
+    }
+
+    val targetContentTypes: Map<String, StrapiContentType> =
+        targetInstance.client().getContentTypes().associateBy { it.schema.collectionName }
+    val targetComponents: Map<String, StrapiComponent> =
+        targetInstance.client().getComponentSchema().associateBy { it.schema.collectionName }
+    val targetSchema = parseDbSchemaModel(targetJson, targetContentTypes, targetComponents)
+
+    val sourceDef = buildTableDefFromDbSchema(sourceSchema)
+    val targetDef = buildTableDefFromDbSchema(targetSchema)
+
+    val sourceTables = sourceDef.keys
+    val targetTables = targetDef.keys
+
+    val missingInTarget = sourceTables.minus(targetTables).sorted()
+    val missingInSource = targetTables.minus(sourceTables).sorted()
+    val commonTables = sourceTables.intersect(targetTables)
+
+    val tableDiffs = mutableListOf<TableDifference>()
+    for (table in commonTables) {
+        val s = sourceDef.getValue(table)
+        val t = targetDef.getValue(table)
+        val colMissingInTarget = s.columns.keys.minus(t.columns.keys).sorted()
+        val colMissingInSource = t.columns.keys.minus(s.columns.keys).sorted()
+        val commonCols = s.columns.keys.intersect(t.columns.keys)
+        val differentCols = commonCols.mapNotNull { c ->
+            val sv = s.columns.getValue(c)
+            val tv = t.columns.getValue(c)
+            if (sv != tv) ColumnDifference(c, sv, tv) else null
+        }
+        val idxMissingInTarget = s.indexes.keys.minus(t.indexes.keys).sorted()
+        val idxMissingInSource = t.indexes.keys.minus(s.indexes.keys).sorted()
+        val commonIdx = s.indexes.keys.intersect(t.indexes.keys)
+        val differentIdx = commonIdx.mapNotNull { i ->
+            val sv = s.indexes.getValue(i)
+            val tv = t.indexes.getValue(i)
+            if (sv != tv) IndexDifference(i, sv, tv) else null
+        }
+        val fkMissingInTarget = s.foreignKeys.keys.minus(t.foreignKeys.keys).sorted()
+        val fkMissingInSource = t.foreignKeys.keys.minus(s.foreignKeys.keys).sorted()
+        val commonFk = s.foreignKeys.keys.intersect(t.foreignKeys.keys)
+        val differentFk = commonFk.mapNotNull { f ->
+            val sv = s.foreignKeys.getValue(f)
+            val tv = t.foreignKeys.getValue(f)
+            if (sv != tv) ForeignKeyDifference(f, sv, tv) else null
+        }
+        if (colMissingInTarget.isNotEmpty() || colMissingInSource.isNotEmpty() ||
+            differentCols.isNotEmpty() || idxMissingInTarget.isNotEmpty() || idxMissingInSource.isNotEmpty() ||
+            differentIdx.isNotEmpty() || fkMissingInTarget.isNotEmpty() || fkMissingInSource.isNotEmpty() ||
+            differentFk.isNotEmpty()
+        ) {
+            tableDiffs.add(
+                TableDifference(
+                    table = table,
+                    missingColumnsInTarget = colMissingInTarget,
+                    missingColumnsInSource = colMissingInSource,
+                    differentColumns = differentCols,
+                    missingIndexesInTarget = idxMissingInTarget,
+                    missingIndexesInSource = idxMissingInSource,
+                    differentIndexes = differentIdx,
+                    missingForeignKeysInTarget = fkMissingInTarget,
+                    missingForeignKeysInSource = fkMissingInSource,
+                    differentForeignKeys = differentFk
+                )
+            )
+        }
+    }
+
+    val isCompatible = missingInTarget.isEmpty() && missingInSource.isEmpty() && tableDiffs.isEmpty()
+    val extracted: DbSchema? = if (isCompatible) sourceSchema else null
+
+    return SchemaDbCompatibilityResult(
+        isCompatible = isCompatible,
+        missingTablesInTarget = missingInTarget,
+        missingTablesInSource = missingInSource,
+        tableDifferences = tableDiffs.sortedBy { it.table },
+        extractedSchema = extracted
+    )
+}
+
+
+// Public helper to build enriched DbSchema for a single instance (used for async export)
+suspend fun buildDbSchemaForInstance(instance: StrapiInstance): DbSchema? {
+    val json = fetchStrapiSchemaJsonFromDb(instance) ?: return null
+    val contentTypesMeta: Map<String, StrapiContentType> =
+        instance.client().getContentTypes().associateBy { it.schema.collectionName }
+    val componentMeta: Map<String, StrapiComponent> =
+        instance.client().getComponentSchema().associateBy { it.schema.collectionName }
+    return parseDbSchemaModel(json, contentTypesMeta, componentMeta)
+}

@@ -226,6 +226,60 @@ suspend fun prefetchComparisonData(
     )
 }
 
+// Export source-only prefetch cache (for async/offline mode)
+@Suppress("RedundantSuspendModifier")
+suspend fun exportSourcePrefetch(
+    instance: StrapiInstance,
+    dbSchema: DbSchema
+): ComparisonPrefetchCache = coroutineScope {
+    val logger = LoggerFactory.getLogger("SyncServiceDb")
+    logger.info("Exporting source-only prefetch for instance '${instance.name}'")
+
+    // Files and relations/components/tables/components definitions for source only
+    val filesDef: Deferred<List<StrapiImage>> = async { fetchFilesFromDb(instance) }
+    val relDef: Deferred<List<FilesRelatedMph>> = async { fetchFilesRelatedMph(instance) }
+    val cmpsDef: Deferred<CmpsMap> = async { fetchCMPS(instance, dbSchema) }
+    val tablesDef: Deferred<TableMap> = async { fetchTables(instance, dbSchema) }
+    val compDef: Deferred<MutableMap<String, MutableMap<Int, JsonObject>>> = async { fetchComponents(instance, dbSchema) }
+
+    val files = filesDef.await()
+    val filesWithFp = computeFingerprints(instance, files)
+    val fileRelations = relDef.await()
+    val cmpsMap = cmpsDef.await()
+    val tableMap = tablesDef.await()
+    val compMap = compDef.await()
+
+    val relationshipsCollected = mutableSetOf<ContentRelationship>()
+    val sourceRowsByUid = mutableMapOf<String, List<StrapiContent>>()
+
+    for (table in dbSchema.tables) {
+        val meta = table.metadata ?: continue
+        val uid = meta.apiUid
+        if (!uid.startsWith("api::")) continue
+        val rows = fetchPublishedRowsAsJson(
+            instance,
+            table.name,
+            dbSchema,
+            relationshipsCollector = relationshipsCollected,
+            currentSourceUid = uid,
+            fileRelations = fileRelations,
+            cmpsMap = cmpsMap,
+            componentTableCache = compMap,
+            tableMap = tableMap,
+            fileCache = filesWithFp.associate { it.metadata.id to it.metadata.documentId }
+        ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata) }
+        sourceRowsByUid[uid] = rows
+    }
+
+    ComparisonPrefetchCache(
+        sourceFiles = filesWithFp,
+        targetFiles = emptyList(),
+        sourceRowsByUid = sourceRowsByUid,
+        targetRowsByUid = emptyMap(),
+        collectedRelationships = relationshipsCollected.toList()
+    )
+}
+
 suspend fun computeComparisonFromPrefetch(
     mergeRequest: MergeRequestWithInstancesDTO,
     dbSchema: DbSchema,

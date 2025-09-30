@@ -11,6 +11,8 @@ import it.sebi.repository.MergeRequestRepository
 import it.sebi.repository.MergeRequestSelectionsRepository
 import it.sebi.repository.StrapiInstanceRepository
 import kotlinx.serialization.Serializable
+import it.sebi.models.*
+import it.sebi.service.exportSourcePrefetch
 
 @Serializable
 data class ConnectionTestResponse(val connected: Boolean, val message: String)
@@ -20,6 +22,9 @@ data class AdminPasswordRequest(val password: String)
 
 @Serializable
 data class AdminPasswordResponse(val success: Boolean, val message: String)
+
+@Serializable
+data class InstanceSchemaExport(val schema: DbSchema)
 
 fun Route.configureInstanceRoutes(
     repository: StrapiInstanceRepository,
@@ -133,6 +138,39 @@ fun Route.configureInstanceRoutes(
                     HttpStatusCode.OK,
                     ConnectionTestResponse(connected = false, message = "Could not connect to Strapi instance")
                 )
+            }
+        }
+
+        // Export schema (DbSchema) for async mode
+        get("/{id}/export/schema") {
+            val id = call.parameters["id"]?.toIntOrNull()
+            if (id == null) {
+                call.respond(HttpStatusCode.BadRequest, "Invalid ID format"); return@get
+            }
+            val instance = repository.getInstance(id)
+            if (instance == null) { call.respond(HttpStatusCode.NotFound, "Instance not found"); return@get }
+            try {
+                val dbSchema = it.sebi.service.buildDbSchemaForInstance(instance)
+                if (dbSchema == null) { call.respond(HttpStatusCode.BadRequest, "Schema not available for this instance"); return@get }
+                call.respond(HttpStatusCode.OK, InstanceSchemaExport(schema = dbSchema))
+            } catch (e: Exception) {
+                call.respond(HttpStatusCode.InternalServerError, e.message ?: "Error exporting schema")
+            }
+        }
+
+        // Export source-only prefetch for async mode
+        get("/{id}/export/prefetch") {
+            val id = call.parameters["id"]?.toIntOrNull()
+            if (id == null) { call.respond(HttpStatusCode.BadRequest, "Invalid ID format"); return@get }
+            val instance = repository.getInstance(id)
+            if (instance == null) { call.respond(HttpStatusCode.NotFound, "Instance not found"); return@get }
+            try {
+                val dbSchema = it.sebi.service.buildDbSchemaForInstance(instance)
+                if (dbSchema == null) { call.respond(HttpStatusCode.BadRequest, "Schema not available for this instance"); return@get }
+                val cache = exportSourcePrefetch(instance, dbSchema)
+                call.respond(HttpStatusCode.OK, cache)
+            } catch (e: Exception) {
+                call.respond(HttpStatusCode.InternalServerError, e.message ?: "Error exporting prefetch")
             }
         }
 

@@ -63,9 +63,9 @@ const Instances: React.FC = () => {
               <Column field="url" header="URL" />
               <Column body={(instance: StrapiInstance) => (
                 <div className="flex gap-2">
-                  <Button 
-                    icon="pi pi-eye" 
-                    className="p-button-outlined p-button-info p-button-sm" 
+                  <Button
+                    icon="pi pi-eye"
+                    className="p-button-outlined p-button-info p-button-sm"
                     onClick={() => handleShowDetailsModal(instance.id)}
                     tooltip="View Details"
                   />
@@ -76,11 +76,45 @@ const Instances: React.FC = () => {
                     tooltip="Edit"
                   />
                   <Button 
-                    icon="pi pi-trash" 
+                    icon="pi pi-trash"
                     className="p-button-outlined p-button-danger p-button-sm"
                     onClick={() => handleDelete(instance.id)}
                     tooltip="Delete"
                   />
+                  <Button label="Export schema JSON" icon="pi pi-download" onClick={async ()=>{
+                    if(!instance.id) return;
+                    try {
+                      const resp = await fetch(`/api/instances/${instance.id}/export/schema`)
+                      if(!resp.ok) throw new Error(await resp.text())
+                      const data = await resp.json()
+                      const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'})
+                      const url = URL.createObjectURL(blob)
+                      const a = document.createElement('a')
+                      a.href = url
+                      a.download = `instance_${instance.id}_schema.json`
+                      a.click()
+                      URL.revokeObjectURL(url)
+                    } catch (e) {
+                      console.error(e)
+                    }
+                  }} />
+                  <Button label="Export prefetch JSON" icon="pi pi-download" onClick={async ()=>{
+                    if(!instance.id) return;
+                    try {
+                      const resp = await fetch(`/api/instances/${instance.id}/export/prefetch`)
+                      if(!resp.ok) throw new Error(await resp.text())
+                      const data = await resp.json()
+                      const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'})
+                      const url = URL.createObjectURL(blob)
+                      const a = document.createElement('a')
+                      a.href = url
+                      a.download = `instance_${instance.id}_prefetch.json`
+                      a.click()
+                      URL.revokeObjectURL(url)
+                    } catch (e) {
+                      console.error(e)
+                    }
+                  }} />
                 </div>
               )} header="Actions" />
             </DataTable>

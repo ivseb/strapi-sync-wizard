@@ -87,6 +87,36 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
             val mergeRequest = mergeRequestService.createMergeRequest(mergeRequestDTO)
             call.respond(HttpStatusCode.Created, mergeRequest)
         }
+
+        // Import uploaded schema (DbSchema) for async mode and compute compatibility vs target
+        post("/{id}/import/schema") {
+            val id = call.parameters["id"]?.toIntOrNull()
+                ?: return@post call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+            try {
+                val body = call.receive<it.sebi.routes.InstanceSchemaExport>()
+                val result = mergeRequestService.importSourceSchema(id, body.schema)
+                call.respond(HttpStatusCode.OK, result)
+            } catch (e: IllegalArgumentException) {
+                call.respond(HttpStatusCode.NotFound, e.message ?: "Merge request not found")
+            } catch (e: Exception) {
+                call.respond(HttpStatusCode.InternalServerError, e.message ?: "Error importing schema")
+            }
+        }
+
+        // Import uploaded source prefetch cache for async mode
+        post("/{id}/import/prefetch") {
+            val id = call.parameters["id"]?.toIntOrNull()
+                ?: return@post call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+            try {
+                val cache = call.receive<it.sebi.service.ComparisonPrefetchCache>()
+                mergeRequestService.importSourcePrefetch(id, cache)
+                call.respond(HttpStatusCode.OK)
+            } catch (e: IllegalArgumentException) {
+                call.respond(HttpStatusCode.NotFound, e.message ?: "Merge request not found")
+            } catch (e: Exception) {
+                call.respond(HttpStatusCode.InternalServerError, e.message ?: "Error importing prefetch")
+            }
+        }
         // Check schema compatibility
         post("/{id}/check-schema") {
             val id = call.parameters["id"]?.toIntOrNull()

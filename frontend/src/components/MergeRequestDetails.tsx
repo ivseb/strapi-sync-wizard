@@ -43,6 +43,12 @@ const MergeRequestDetails: React.FC = () => {
     const [mergingCollections, setMergingCollections] = useState<boolean>(false);
     const [completing, setCompleting] = useState<boolean>(false);
 
+    // Async mode upload state
+    const schemaInputRef = useRef<HTMLInputElement>(null)
+    const prefetchInputRef = useRef<HTMLInputElement>(null)
+    const [uploadingSchema, setUploadingSchema] = useState(false)
+    const [uploadingPrefetch, setUploadingPrefetch] = useState(false)
+
     // Create a ref for the stepper
     const stepperRef = useRef<any>(null);
 
@@ -105,6 +111,57 @@ const MergeRequestDetails: React.FC = () => {
 
         // No need for cleanup function as we're not using localStorage anymore
     }, [id]);
+
+    // Async mode: import schema JSON
+    const onSchemaFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        if (!id) return;
+        const file = e.target.files?.[0]
+        if (!file) return
+        try {
+            setUploadingSchema(true)
+            const text = await file.text()
+            let parsed: any
+            try { parsed = JSON.parse(text) } catch (err) { throw new Error('Invalid JSON file') }
+            const body = parsed && parsed.schema ? parsed : { schema: parsed }
+            const resp = await axios.post(`/api/merge-requests/${id}/import/schema`, body)
+            const { isCompatible } = resp.data || {}
+            toast.current?.show({
+                severity: isCompatible ? 'success' : 'warn',
+                summary: 'Schema imported',
+                detail: isCompatible ? 'Uploaded schema is compatible with target' : 'Uploaded schema is not compatible with target',
+                life: 4000
+            })
+            // refresh MR detail
+            const updatedMergeRequest = await axios.get(`/api/merge-requests/${id}`)
+            setMergeRequestDetail(updatedMergeRequest.data)
+        } catch (err: any) {
+            console.error('Error importing schema', err)
+            toast.current?.show({ severity:'error', summary:'Error', detail: err.response?.data || err.message || 'Failed to import schema', life: 5000 })
+        } finally {
+            setUploadingSchema(false)
+            if (schemaInputRef.current) schemaInputRef.current.value = ''
+        }
+    }
+
+    const onPrefetchFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        if (!id) return;
+        const file = e.target.files?.[0]
+        if (!file) return
+        try {
+            setUploadingPrefetch(true)
+            const text = await file.text()
+            let parsed: any
+            try { parsed = JSON.parse(text) } catch (err) { throw new Error('Invalid JSON file') }
+            await axios.post(`/api/merge-requests/${id}/import/prefetch`, parsed)
+            toast.current?.show({ severity:'success', summary:'Prefetch imported', detail:'Source prefetch cache uploaded. You can now run Compare (mode=cache/full).', life: 5000 })
+        } catch (err: any) {
+            console.error('Error importing prefetch', err)
+            toast.current?.show({ severity:'error', summary:'Error', detail: err.response?.data || err.message || 'Failed to import prefetch', life: 5000 })
+        } finally {
+            setUploadingPrefetch(false)
+            if (prefetchInputRef.current) prefetchInputRef.current.value = ''
+        }
+    }
 
     // Check schema compatibility
     const checkSchemaCompatibility = async (force: boolean = false) => {
@@ -496,6 +553,13 @@ const MergeRequestDetails: React.FC = () => {
                                             value={mergeRequestDetail.mergeRequest.status !== 'CREATED' ? 'Checked' : 'Pending'}
                                             severity={mergeRequestDetail.mergeRequest.status !== 'CREATED' ? 'success' : 'warning'}
                                         />
+                                    </div>
+                                    {/* Async mode: import schema/prefetch */}
+                                    <div className="mb-3 flex gap-2 flex-wrap">
+                                        <input type="file" accept="application/json" style={{display:'none'}} ref={schemaInputRef} onChange={onSchemaFileSelected} />
+                                        <Button label={uploadingSchema ? 'Importing schema…' : 'Import schema JSON'} icon="pi pi-upload" disabled={uploadingSchema || isLocked} onClick={() => schemaInputRef.current?.click()} />
+                                        <input type="file" accept="application/json" style={{display:'none'}} ref={prefetchInputRef} onChange={onPrefetchFileSelected} />
+                                        <Button label={uploadingPrefetch ? 'Import prefetch…' : 'Import prefetch JSON'} icon="pi pi-upload" disabled={uploadingPrefetch || isLocked} onClick={() => prefetchInputRef.current?.click()} />
                                     </div>
                                     <SchemaCompatibilityStep
                                         schemaCompatible={mergeRequestDetail?.isCompatible === true}

@@ -740,6 +740,37 @@ class MergeRequestService(
         return dbRes
     }
 
+    // Async mode: import an uploaded source schema and compare against live target
+    suspend fun importSourceSchema(mergeRequestId: Int, sourceSchema: DbSchema): SchemaDbCompatibilityResult {
+        val mr = mergeRequestRepository.getMergeRequestWithInstances(mergeRequestId)
+            ?: throw IllegalArgumentException("Merge request not found")
+        if (mr.status == MergeRequestStatus.IN_PROGRESS || mr.status == MergeRequestStatus.COMPLETED || mr.status == MergeRequestStatus.FAILED) {
+            throw IllegalStateException("Cannot check schema after merge has been started or completed")
+        }
+        val res = syncService.checkSchemaCompatibilityAgainstTarget(sourceSchema, mr.targetInstance)
+        // Persist and update MR state
+        mergeRequestRepository.updateSchemaCompatibility(mergeRequestId)
+        dataFileUtils.saveSchemaCompatibilityFile(mergeRequestId, res)
+        return res
+    }
+
+    // Async mode: import an uploaded source-only prefetch cache
+    suspend fun importSourcePrefetch(mergeRequestId: Int, cache: ComparisonPrefetchCache) {
+        val mr = mergeRequestRepository.getMergeRequest(mergeRequestId)
+            ?: throw IllegalArgumentException("Merge request not found")
+        if (mr.status == MergeRequestStatus.IN_PROGRESS || mr.status == MergeRequestStatus.COMPLETED || mr.status == MergeRequestStatus.FAILED) {
+            throw IllegalStateException("Cannot import prefetch after merge has been started or completed")
+        }
+        val sanitized = ComparisonPrefetchCache(
+            sourceFiles = cache.sourceFiles,
+            targetFiles = emptyList(),
+            sourceRowsByUid = cache.sourceRowsByUid,
+            targetRowsByUid = emptyMap(),
+            collectedRelationships = cache.collectedRelationships
+        )
+        dataFileUtils.savePrefetchCache(mergeRequestId, sanitized)
+    }
+
     /**
      * Compare content for a merge request
      * @param id Merge request ID
@@ -793,6 +824,50 @@ class MergeRequestService(
                 val cached = dataFileUtils.getPrefetchCache(mergeRequest.id)
                 if (cached != null) {
                     val pre = fromCache(cached)
+                    val needsTarget = pre.targetFiles.isEmpty() && pre.targetRowsByUid.isEmpty()
+                    if (needsTarget) {
+                        // Build target side live and merge with cached source
+                        val dbSchema = schemas.extractedSchema!!
+                        // Fetch target-only data
+                        val tgtFiles = computeFingerprints(mergeRequest.targetInstance, fetchFilesFromDb(mergeRequest.targetInstance))
+                        val tgtRel = fetchFilesRelatedMph(mergeRequest.targetInstance)
+                        val tgtCmps = fetchCMPS(mergeRequest.targetInstance, dbSchema)
+                        val tgtTables = fetchTables(mergeRequest.targetInstance, dbSchema)
+                        val tgtCompDef = fetchComponents(mergeRequest.targetInstance, dbSchema)
+                        val targetRowsByUid = mutableMapOf<String, List<StrapiContent>>()
+                        for (table in dbSchema.tables) {
+                            val meta = table.metadata ?: continue
+                            val uid = meta.apiUid
+                            if (!uid.startsWith("api::")) continue
+                            val rows = fetchPublishedRowsAsJson(
+                                mergeRequest.targetInstance,
+                                table.name,
+                                dbSchema,
+                                fileRelations = tgtRel,
+                                cmpsMap = tgtCmps,
+                                componentTableCache = tgtCompDef,
+                                tableMap = tgtTables,
+                                fileCache = tgtFiles.associate { it.metadata.id to it.metadata.documentId }
+                            ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata) }
+                            targetRowsByUid[uid] = rows
+                        }
+                        val merged = ComparisonPrefetch(
+                            sourceFiles = pre.sourceFiles,
+                            targetFiles = tgtFiles,
+                            sourceFileRelations = emptyList(),
+                            targetFileRelations = tgtRel,
+                            sourceCMPSMap = mutableMapOf(),
+                            targetCMPSMap = tgtCmps,
+                            sourceTableMap = mutableMapOf(),
+                            targetTableMap = tgtTables,
+                            srcCompDef = mutableMapOf(),
+                            tgtCompDef = tgtCompDef,
+                            sourceRowsByUid = pre.sourceRowsByUid,
+                            targetRowsByUid = targetRowsByUid,
+                            collectedRelationships = pre.collectedRelationships
+                        )
+                        return computeAndPersist(merged)
+                    }
                     return computeAndPersist(pre)
                 }
                 // Fallback to Full
@@ -810,7 +885,50 @@ class MergeRequestService(
 
             CompareMode.Compare, CompareMode.Cache -> {
                 val cached = dataFileUtils.getPrefetchCache(mergeRequest.id)
-                val prefetch = if (cached != null) fromCache(cached) else prefetchComparisonData(
+                val prefetch = if (cached != null) {
+                    val pre = fromCache(cached)
+                    val needsTarget = pre.targetFiles.isEmpty() && pre.targetRowsByUid.isEmpty()
+                    if (needsTarget) {
+                        val dbSchema = schemas.extractedSchema!!
+                        val tgtFiles = computeFingerprints(mergeRequest.targetInstance, fetchFilesFromDb(mergeRequest.targetInstance))
+                        val tgtRel = fetchFilesRelatedMph(mergeRequest.targetInstance)
+                        val tgtCmps = fetchCMPS(mergeRequest.targetInstance, dbSchema)
+                        val tgtTables = fetchTables(mergeRequest.targetInstance, dbSchema)
+                        val tgtCompDef = fetchComponents(mergeRequest.targetInstance, dbSchema)
+                        val targetRowsByUid = mutableMapOf<String, List<StrapiContent>>()
+                        for (table in dbSchema.tables) {
+                            val meta = table.metadata ?: continue
+                            val uid = meta.apiUid
+                            if (!uid.startsWith("api::")) continue
+                            val rows = fetchPublishedRowsAsJson(
+                                mergeRequest.targetInstance,
+                                table.name,
+                                dbSchema,
+                                fileRelations = tgtRel,
+                                cmpsMap = tgtCmps,
+                                componentTableCache = tgtCompDef,
+                                tableMap = tgtTables,
+                                fileCache = tgtFiles.associate { it.metadata.id to it.metadata.documentId }
+                            ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata) }
+                            targetRowsByUid[uid] = rows
+                        }
+                        ComparisonPrefetch(
+                            sourceFiles = pre.sourceFiles,
+                            targetFiles = tgtFiles,
+                            sourceFileRelations = emptyList(),
+                            targetFileRelations = tgtRel,
+                            sourceCMPSMap = mutableMapOf(),
+                            targetCMPSMap = tgtCmps,
+                            sourceTableMap = mutableMapOf(),
+                            targetTableMap = tgtTables,
+                            srcCompDef = mutableMapOf(),
+                            tgtCompDef = tgtCompDef,
+                            sourceRowsByUid = pre.sourceRowsByUid,
+                            targetRowsByUid = targetRowsByUid,
+                            collectedRelationships = pre.collectedRelationships
+                        )
+                    } else pre
+                } else prefetchComparisonData(
                     mergeRequest,
                     schemas.extractedSchema!!
                 ).also {
