@@ -7,6 +7,10 @@ metadata:
   labels:
     {{- include "strapi-sync-wizard.labels" . | nindent 4 }}
     router: {{ .Values.openshift.route.routerLabel | default "internal" }}
+  {{- if .Values.openshift.route.annotations }}
+  annotations:
+     {{- toYaml .Values.openshift.route.annotations | nindent 4 }}
+   {{- end }}
 spec:
   {{- if .Values.openshift.route.host }}
   host: {{ .Values.openshift.route.host }}

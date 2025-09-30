@@ -2,8 +2,27 @@ apiVersion: v1
 entries:
   strapi-sync-wizard:
   - apiVersion: v2
+    appVersion: 0.2.6
+    created: "2025-09-30T17:28:42.260666+02:00"
+    description: A Helm chart for StrapiSyncWizard application
+    digest: e7143089555b67ed1ef6372d6e327f176bb4c68b53806c4a2c556c83e154de9a
+    home: https://github.com/ivseb/strapi-sync-wizard
+    keywords:
+    - strapi
+    - sync
+    - wizard
+    - ktor
+    - kotlin
+    maintainers:
+    - name: StrapiSyncWizard Team
+    name: strapi-sync-wizard
+    type: application
+    urls:
+    - https://ivseb.github.io/strapi-sync-wizard/charts/strapi-sync-wizard-0.2.5.tgz
+    version: 0.2.5
+  - apiVersion: v2
     appVersion: 0.1.0
-    created: "2025-09-30T17:07:03.876513+02:00"
+    created: "2025-09-30T17:28:42.260384+02:00"
     description: A Helm chart for StrapiSyncWizard application
     digest: e84aff1f7d145a473867c65c35c72a817f6189441eeed77233c2956d15ee3b4f
     home: https://github.com/ivseb/strapi-sync-wizard
@@ -22,7 +41,7 @@ entries:
     version: 0.2.4
   - apiVersion: v2
     appVersion: 0.1.0
-    created: "2025-09-30T17:07:03.876259+02:00"
+    created: "2025-09-30T17:28:42.260097+02:00"
     description: A Helm chart for StrapiSyncWizard application
     digest: 4e8b3b85c452d94a38c1cc90491884199c35163574acbb7414276db2aab6fff3
     home: https://github.com/ivseb/StrapiSyncWizard
@@ -41,7 +60,7 @@ entries:
     version: 0.2.3
   - apiVersion: v2
     appVersion: 0.0.7
-    created: "2025-09-30T17:07:03.875799+02:00"
+    created: "2025-09-30T17:28:42.259599+02:00"
     description: A Helm chart for StrapiSyncWizard application
     digest: 1ca86833e696d734c04a5502f7fba288669b32cc8fb0db9d12fa3588853af0f8
     home: https://github.com/ivseb/StrapiSyncWizard
@@ -60,7 +79,7 @@ entries:
     version: 0.2.2
   - apiVersion: v2
     appVersion: 0.0.6
-    created: "2025-09-30T17:07:03.875297+02:00"
+    created: "2025-09-30T17:28:42.259134+02:00"
     description: A Helm chart for StrapiSyncWizard application
     digest: 3561377bfe5e09be99236cdb1a75599052d251bbc868b8fa49fc487bd617f7fa
     home: https://github.com/ivseb/StrapiSyncWizard
@@ -79,7 +98,7 @@ entries:
     version: 0.2.1
   - apiVersion: v2
     appVersion: 0.0.3
-    created: "2025-09-30T17:07:03.874532+02:00"
+    created: "2025-09-30T17:28:42.258518+02:00"
     description: A Helm chart for StrapiSyncWizard application
     digest: 3c7f569d20c0b36281e95bb8c5b9615883182e9482ca2839bfcb5d754487993e
     home: https://github.com/ivseb/StrapiSyncWizard
@@ -96,4 +115,4 @@ entries:
     urls:
     - https://ivseb.github.io/strapi-sync-wizard/charts/strapi-sync-wizard-0.2.0.tgz
     version: 0.2.0
-generated: "2025-09-30T17:07:03.873883+02:00"
+generated: "2025-09-30T17:28:42.257942+02:00"

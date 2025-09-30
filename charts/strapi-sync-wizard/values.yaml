@@ -148,6 +148,9 @@ openshift:
     host: ""
     # Router label, defaults to "internal" if not specified
     routerLabel: ""
+    annotations: { }
+    # haproxy.router.openshift.io/timeout: "300s"
+
     tls:
       enabled: true
       termination: edge
