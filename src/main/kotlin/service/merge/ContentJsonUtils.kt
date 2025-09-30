@@ -1,33 +1,286 @@
 package it.sebi.service.merge
 
+import it.sebi.models.ContentTypeComparisonResultMapWithRelationships
 import it.sebi.models.DbSchema
 import it.sebi.models.DbTable
+import it.sebi.models.MergeRequestDocumentMapping
+import it.sebi.models.STRAPI_FILE_CONTENT_TYPE_NAME
+import it.sebi.models.StrapiLinkRef
+import it.sebi.service.TECHNICAL_FIELDS
 import it.sebi.service.resolveComponentTableName
 import kotlinx.serialization.json.*
+import kotlin.collections.forEach
 
 object ContentJsonUtils {
-    // Old overload kept for backward compatibility in places where the resolver is already decided (e.g., inside components)
-    fun prepareDataForCreation(
-        sourceData: JsonObject,
-        fieldNameResolver: Map<String, String>
-    ): JsonObject = processJsonElement(sourceData, fieldNameResolver) as JsonObject
+    private fun resolveTargetDocIdForLink(
+        table: String,
+        targetCollectionUID: String,
+        id: Int?,
+        comparisonDataMap: ContentTypeComparisonResultMapWithRelationships,
+        mappingMap: Map<String, Map<String, MergeRequestDocumentMapping>> = emptyMap()
+    ): String? {
+        if (id == null) return null
+        // Step 1: find the SOURCE documentId for the provided numeric id
+        var sourceDocId: String? = null
+        when (table) {
+            "files" -> {
+                comparisonDataMap.files.forEach { cmp ->
+                    val s = cmp.sourceImage?.metadata
+                    if (s?.id == id) sourceDocId = s.documentId
+                    val t = cmp.targetImage?.metadata
+                    // if only target match is found, keep that as fallback
+                    if (sourceDocId == null && t?.id == id) sourceDocId = t.documentId
+                }
+            }
+
+            else -> {
+                comparisonDataMap.singleTypes[table]?.let { st ->
+                    if (st.sourceContent?.metadata?.id == id) sourceDocId = st.sourceContent.metadata.documentId
+                    if (sourceDocId == null && st.targetContent?.metadata?.id == id) sourceDocId =
+                        st.targetContent.metadata.documentId
+                }
+                if (sourceDocId == null) {
+                    comparisonDataMap.collectionTypes[table]?.forEach { e ->
+                        if (e.sourceContent?.metadata?.id == id) sourceDocId = e.sourceContent.metadata.documentId
+                        if (sourceDocId == null && e.targetContent?.metadata?.id == id) sourceDocId =
+                            e.targetContent.metadata.documentId
+                    }
+                }
+            }
+        }
+        val src = sourceDocId ?: return null
+        // Step 2: map SOURCE -> TARGET using mappingMap (if present)
+        val mappingForType = mappingMap[targetCollectionUID]
+        val targetDoc = mappingForType?.get(src)?.targetDocumentId
+        return targetDoc ?: src
+    }
+
+    fun processJsonElementNew(
+        comparisonDataMap: ContentTypeComparisonResultMapWithRelationships,
+        element: JsonElement,
+        currentSchema: DbTable?,
+        dbSchema: DbSchema,
+        contentTypeMappingByTable: Map<String, DbTable>,
+        linkToProcess: List<StrapiLinkRef>,
+        allTargetFileIdByDoc: Map<String, Int> = emptyMap(),
+        mappingMap: Map<String, Map<String, MergeRequestDocumentMapping>> = emptyMap()
+    ): JsonElement {
+        val currentResolver = currentSchema?.let { buildFieldNameResolver(it) }
+
+        fun resolveTargetValue(link: StrapiLinkRef): JsonElement? {
+            return if (link.targetTable == "files") {
+
+                val srcOrTgtDocId = resolveTargetDocIdForLink(
+                    link.targetTable,
+                    STRAPI_FILE_CONTENT_TYPE_NAME,
+                    link.targetId,
+                    comparisonDataMap,
+                    mappingMap
+                )
+                val numericId = srcOrTgtDocId?.let { did ->
+                    allTargetFileIdByDoc[did]
+                        ?: comparisonDataMap.files.firstOrNull { f -> f.targetImage?.metadata?.documentId == did }?.targetImage?.metadata?.id
+                }
+                numericId?.let { JsonPrimitive(it) }
+            } else {
+                val table = link.targetTable
+                contentTypeMappingByTable[table]?.metadata?.let { schemaLinkMeta ->
+                    val targetDocId =
+                        resolveTargetDocIdForLink(
+                            link.targetTable,
+                            schemaLinkMeta.apiUid,
+                            link.targetId,
+                            comparisonDataMap,
+                            mappingMap
+                        )
+                    targetDocId?.let { JsonPrimitive(it) }
+                }
+            }
+        }
+        return when (element) {
+            is JsonObject -> {
+                buildJsonObject {
+                    val currentId = element["id"]?.jsonPrimitive?.intOrNull
+                    val linkToAdd = linkToProcess.filter { !it.field.contains('.') && it.sourceId == (currentId ?: 0) }
+                    if (linkToAdd.isNotEmpty()) {
+                        linkToAdd.groupBy { it.field }.forEach { (field, value) ->
+                            value.groupBy { it.targetTable }.forEach { (table, links) ->
+                                val normalized = normalizeKeyName(field)
+                                val mappedKey = currentResolver?.get(normalized) ?: convertToCamelCase(field)
+
+                                val linkMap: List<JsonElement> = links.mapNotNull { resolveTargetValue(it) }
+                                if(linkMap.isNotEmpty()){
+                                    put(mappedKey, buildJsonObject { put("set", JsonArray(linkMap))})
+                                }
+
+                            }
+                        }
+                    }
+                    for ((key, value) in element) {
+                        println(key)
+                        if (TECHNICAL_FIELDS.contains(key) || key == "document_id" || key == "__order" || key == "__links" || key == "id") continue
+                        val normalized = normalizeKeyName(key)
+                        val mappedKey = currentResolver?.get(normalized) ?: convertToCamelCase(key)
+                        val nestedLinkToProcess = linkToProcess.filter { it.field.startsWith("$key.") }
+                            .map { it.copy(field = it.field.substring("$key.".length)) }
+
+
+                        // Determine if this field is a component of the current schema
+                        val col =
+                            currentSchema?.metadata?.columns?.firstOrNull { normalizeKeyName(it.name) == normalized }
+                        val nextSchemaAndResolver: DbTable? = if (col?.component != null) {
+                            val compTable = resolveComponentTableName(col.component, dbSchema)
+                            compTable?.let { contentTypeMappingByTable[it] }
+                        } else null
+
+                        val processedValue: JsonElement = if (nextSchemaAndResolver != null) {
+
+                            val isRepeatable = col?.repeatable == true
+                            when {
+                                isRepeatable && value is JsonObject -> {
+                                    // Wrap single object into array for repeatable component fields
+                                    buildJsonArray {
+                                        add(
+                                            processJsonElementNew(
+                                                comparisonDataMap,
+                                                value,
+                                                nextSchemaAndResolver,
+                                                dbSchema,
+                                                contentTypeMappingByTable,
+                                                nestedLinkToProcess,
+                                                allTargetFileIdByDoc,
+                                                mappingMap
+                                            )
+                                        )
+                                    }
+                                }
+
+                                isRepeatable && value is JsonArray -> {
+                                    buildJsonArray {
+                                        value.forEach {
+                                            add(
+                                                processJsonElementNew(
+                                                    comparisonDataMap,
+                                                    it,
+                                                    nextSchemaAndResolver,
+                                                    dbSchema,
+                                                    contentTypeMappingByTable,
+                                                    nestedLinkToProcess,
+                                                    allTargetFileIdByDoc,
+                                                    mappingMap
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+
+                                value is JsonArray -> {
+
+                                    processJsonElementNew(
+                                        comparisonDataMap,
+                                        value.first(),
+                                        nextSchemaAndResolver,
+                                        dbSchema,
+                                        contentTypeMappingByTable,
+                                        nestedLinkToProcess,
+                                        allTargetFileIdByDoc,
+                                        mappingMap
+                                    )
+                                }
+
+                                value is JsonObject -> {
+                                    processJsonElementNew(
+                                        comparisonDataMap,
+                                        value,
+                                        nextSchemaAndResolver,
+                                        dbSchema,
+                                        contentTypeMappingByTable,
+                                        nestedLinkToProcess,
+                                        allTargetFileIdByDoc,
+                                        mappingMap
+                                    )
+                                }
+
+                                else -> value
+                            }
+                        } else {
+                            // Not a component field: keep current resolver
+                            when (value) {
+                                is JsonArray -> buildJsonArray {
+                                    value.forEach {
+                                        add(
+                                            processJsonElementNew(
+                                                comparisonDataMap,
+                                                it,
+                                                nextSchemaAndResolver,
+                                                dbSchema,
+                                                contentTypeMappingByTable,
+                                                nestedLinkToProcess,
+                                                allTargetFileIdByDoc,
+                                                mappingMap
+                                            )
+                                        )
+                                    }
+                                }
+
+                                is JsonObject -> processJsonElementNew(
+                                    comparisonDataMap,
+                                    value,
+                                    nextSchemaAndResolver,
+                                    dbSchema,
+                                    contentTypeMappingByTable,
+                                    nestedLinkToProcess,
+                                    allTargetFileIdByDoc,
+                                    mappingMap
+                                )
+
+                                else -> value
+                            }
+                        }
+                        put(mappedKey, processedValue)
+                    }
+
+
+                }
+            }
+
+            is JsonArray -> buildJsonArray {
+                element.forEach {
+                    add(
+                        processJsonElementNew(
+                            comparisonDataMap,
+                            it,
+                            currentSchema,
+                            dbSchema,
+                            contentTypeMappingByTable,
+                            linkToProcess,
+                            allTargetFileIdByDoc,
+                            mappingMap
+                        )
+                    )
+                }
+            }
+
+            else -> element
+        }
+    }
 
     // New overload: resolve field names contextually, switching resolver when traversing into components
-    fun prepareDataForCreation(
-        sourceData: JsonObject,
-        rootSchema: DbTable,
-        dbSchema: DbSchema,
-        contentTypeMappingByTable: Map<String, DbTable>
-    ): JsonObject {
-        val rootResolver = buildFieldNameResolver(rootSchema)
-        return processJsonElement(
-            element = sourceData,
-            currentResolver = rootResolver,
-            currentSchema = rootSchema,
-            dbSchema = dbSchema,
-            contentTypeMappingByTable = contentTypeMappingByTable
-        ) as JsonObject
-    }
+//    fun prepareDataForCreation(
+//        sourceData: JsonObject,
+//        rootSchema: DbTable,
+//        dbSchema: DbSchema,
+//        contentTypeMappingByTable: Map<String, DbTable>
+//    ): JsonObject {
+//        val rootResolver = buildFieldNameResolver(rootSchema)
+//        return processJsonElement(
+//            element = sourceData,
+//            currentResolver = rootResolver,
+//            currentSchema = rootSchema,
+//            dbSchema = dbSchema,
+//            contentTypeMappingByTable = contentTypeMappingByTable
+//        ) as JsonObject
+//    }
 
     fun processJsonElement(element: JsonElement, fieldNameResolver: Map<String, String>): JsonElement {
         return when (element) {
@@ -49,73 +302,138 @@ object ContentJsonUtils {
     }
 
     // Overload that changes resolver when navigating into component fields
-    fun processJsonElement(
-        element: JsonElement,
-        currentResolver: Map<String, String>,
-        currentSchema: DbTable?,
-        dbSchema: DbSchema,
-        contentTypeMappingByTable: Map<String, DbTable>
-    ): JsonElement {
-        return when (element) {
-            is JsonObject -> {
-                buildJsonObject {
-                    for ((key, value) in element) {
-                        if (key == "document_id" || key == "__order" || key == "__links" || key == "id") continue
-                        val normalized = normalizeKeyName(key)
-                        val mappedKey = currentResolver[normalized] ?: convertToCamelCase(key)
-
-                        // Determine if this field is a component of the current schema
-                        val col = currentSchema?.metadata?.columns?.firstOrNull { normalizeKeyName(it.name) == normalized }
-                        val nextSchemaAndResolver = if (col?.component != null) {
-                            val compTable = resolveComponentTableName(col.component, dbSchema)
-                            val compSchema = compTable?.let { contentTypeMappingByTable[it] }
-                            if (compSchema != null) buildFieldNameResolver(compSchema) to compSchema else null
-                        } else null
-
-                        val processedValue: JsonElement = if (nextSchemaAndResolver != null) {
-                            val (subResolver, subSchema) = nextSchemaAndResolver
-                            val isRepeatable = col?.repeatable == true
-                            when {
-                                isRepeatable && value is JsonObject -> {
-                                    // Wrap single object into array for repeatable component fields
-                                    buildJsonArray {
-                                        add(processJsonElement(value, subResolver, subSchema, dbSchema, contentTypeMappingByTable))
-                                    }
-                                }
-                                isRepeatable && value is JsonArray -> {
-                                    buildJsonArray {
-                                        value.forEach { add(processJsonElement(it, subResolver, subSchema, dbSchema, contentTypeMappingByTable)) }
-                                    }
-                                }
-                                value is JsonArray -> {
-
-                                    processJsonElement(value.first(), subResolver, subSchema, dbSchema, contentTypeMappingByTable)
-                                }
-                                value is JsonObject -> {
-                                    processJsonElement(value, subResolver, subSchema, dbSchema, contentTypeMappingByTable)
-                                }
-                                else -> value
-                            }
-                        } else {
-                            // Not a component field: keep current resolver
-                            when (value) {
-                                is JsonArray -> buildJsonArray {
-                                    value.forEach { add(processJsonElement(it, currentResolver, currentSchema, dbSchema, contentTypeMappingByTable)) }
-                                }
-                                is JsonObject -> processJsonElement(value, currentResolver, currentSchema, dbSchema, contentTypeMappingByTable)
-                                else -> value
-                            }
-                        }
-                        put(mappedKey, processedValue)
-                    }
-                }
-            }
-            is JsonArray -> buildJsonArray {
-                element.forEach { add(processJsonElement(it, currentResolver, currentSchema, dbSchema, contentTypeMappingByTable)) }
-            }
-            else -> element
-        }
-    }
+//    fun processJsonElement(
+//        element: JsonElement,
+//        currentResolver: Map<String, String>,
+//        currentSchema: DbTable?,
+//        dbSchema: DbSchema,
+//        contentTypeMappingByTable: Map<String, DbTable>
+//    ): JsonElement {
+//        return when (element) {
+//            is JsonObject -> {
+//                buildJsonObject {
+//                    for ((key, value) in element) {
+//                        if (key == "document_id" || key == "__order" || key == "__links" || key == "id") continue
+//                        val normalized = normalizeKeyName(key)
+//                        val mappedKey = currentResolver[normalized] ?: convertToCamelCase(key)
+//
+//                        // Determine if this field is a component of the current schema
+//                        val col =
+//                            currentSchema?.metadata?.columns?.firstOrNull { normalizeKeyName(it.name) == normalized }
+//                        val nextSchemaAndResolver = if (col?.component != null) {
+//                            val compTable = resolveComponentTableName(col.component, dbSchema)
+//                            val compSchema = compTable?.let { contentTypeMappingByTable[it] }
+//                            if (compSchema != null) buildFieldNameResolver(compSchema) to compSchema else null
+//                        } else null
+//
+//                        val processedValue: JsonElement = if (nextSchemaAndResolver != null) {
+//                            val (subResolver, subSchema) = nextSchemaAndResolver
+//                            val isRepeatable = col?.repeatable == true
+//                            when {
+//                                isRepeatable && value is JsonObject -> {
+//                                    // Wrap single object into array for repeatable component fields
+//                                    buildJsonArray {
+//                                        add(
+//                                            processJsonElement(
+//                                                value,
+//                                                subResolver,
+//                                                subSchema,
+//                                                dbSchema,
+//                                                contentTypeMappingByTable
+//                                            )
+//                                        )
+//                                    }
+//                                }
+//
+//                                isRepeatable && value is JsonArray -> {
+//                                    buildJsonArray {
+//                                        value.forEach {
+//                                            add(
+//                                                processJsonElement(
+//                                                    it,
+//                                                    subResolver,
+//                                                    subSchema,
+//                                                    dbSchema,
+//                                                    contentTypeMappingByTable
+//                                                )
+//                                            )
+//                                        }
+//                                    }
+//                                }
+//
+//                                value is JsonArray -> {
+//
+//                                    processJsonElement(
+//                                        value.first(),
+//                                        subResolver,
+//                                        subSchema,
+//                                        dbSchema,
+//                                        contentTypeMappingByTable
+//                                    )
+//                                }
+//
+//                                value is JsonObject -> {
+//                                    processJsonElement(
+//                                        value,
+//                                        subResolver,
+//                                        subSchema,
+//                                        dbSchema,
+//                                        contentTypeMappingByTable
+//                                    )
+//                                }
+//
+//                                else -> value
+//                            }
+//                        } else {
+//                            // Not a component field: keep current resolver
+//                            when (value) {
+//                                is JsonArray -> buildJsonArray {
+//                                    value.forEach {
+//                                        add(
+//                                            processJsonElement(
+//                                                it,
+//                                                currentResolver,
+//                                                currentSchema,
+//                                                dbSchema,
+//                                                contentTypeMappingByTable
+//                                            )
+//                                        )
+//                                    }
+//                                }
+//
+//                                is JsonObject -> processJsonElement(
+//                                    value,
+//                                    currentResolver,
+//                                    currentSchema,
+//                                    dbSchema,
+//                                    contentTypeMappingByTable
+//                                )
+//
+//                                else -> value
+//                            }
+//                        }
+//                        put(mappedKey, processedValue)
+//                    }
+//                }
+//            }
+//
+//            is JsonArray -> buildJsonArray {
+//                element.forEach {
+//                    add(
+//                        processJsonElement(
+//                            it,
+//                            currentResolver,
+//                            currentSchema,
+//                            dbSchema,
+//                            contentTypeMappingByTable
+//                        )
+//                    )
+//                }
+//            }
+//
+//            else -> element
+//        }
+//    }
 
     fun convertToCamelCase(snakeCase: String): String {
         if (!snakeCase.contains("_")) return snakeCase
@@ -242,7 +560,11 @@ object ContentJsonUtils {
 
             // Determine mapping for this level using the current schema (if available)
             val col = currentSchema?.metadata?.columns?.firstOrNull { normalizeKeyName(it.name) == normalized }
-            val mappedKey = col?.name ?: buildFieldNameResolver(currentSchema ?: return buildJsonObject { put(convertToCamelCase(rawPart), current) })
+            val mappedKey = col?.name ?: buildFieldNameResolver(currentSchema ?: return buildJsonObject {
+                put(
+                    convertToCamelCase(rawPart), current
+                )
+            })
                 .getOrElse(normalized) { convertToCamelCase(rawPart) }
 
             // Wrap if this segment is a repeatable component field

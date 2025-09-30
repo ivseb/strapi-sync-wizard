@@ -428,7 +428,7 @@ suspend fun getfileCompareFromDb(
 }
 
 
-private val TECHNICAL_FIELDS = setOf(
+val TECHNICAL_FIELDS = setOf(
     "id", "created_by_id", "updated_by_id", "created_at", "updated_at", "published_at"
 )
 private val IGNORE_COMPARE_FIELDS = TECHNICAL_FIELDS + setOf("locale")
@@ -1050,7 +1050,9 @@ fun compareSingleType(
     uid: String,
     sourceObj: StrapiContent?,
     targetObj: StrapiContent?,
-    kind: StrapiContentTypeKind
+    kind: StrapiContentTypeKind,
+    fileMapping: Map<String, MergeRequestDocumentMapping>,
+    contentMapping: MutableMap<String, MergeRequestDocumentMapping>
 ): ContentTypeComparisonResultWithRelationships {
     val resultKind: ContentTypeComparisonResultKind = when {
         sourceObj == null && targetObj == null -> ContentTypeComparisonResultKind.IDENTICAL
@@ -1059,11 +1061,20 @@ fun compareSingleType(
         else -> {
             val sourceObjMap = sourceObj!!.cleanData.toMutableMap()
             sourceObjMap.remove("document_id")
-            sourceObjMap.remove("__links")
+
+
             val sourceObjToCompare = JsonObject(sourceObjMap)
             val targetObjMap = targetObj!!.cleanData.toMutableMap()
             targetObjMap.remove("document_id")
-            targetObjMap.remove("__links")
+
+            sourceObjMap["__links"]?.jsonObject?.entries?.map {  fieldValues ->
+                    val mappedValues: List<JsonPrimitive> = fieldValues.value.jsonArray.map { value ->
+                        val id = value.jsonPrimitive.content
+                        JsonPrimitive(fileMapping[id]?.targetDocumentId ?: contentMapping[id]?.targetDocumentId ?: id)
+                    }
+                    fieldValues.key to JsonArray(mappedValues)
+
+            }?.let { sourceObjMap["__links"] = JsonObject(it.toMap()) }
 
 
             val targetObjToCompare = JsonObject(targetObjMap)
@@ -1089,7 +1100,8 @@ fun compareCollectionType(
     sourceList: List<StrapiContent>,
     targetList: List<StrapiContent>,
     kind: StrapiContentTypeKind,
-    idMappings: MutableMap<String, MergeRequestDocumentMapping>
+    idMappings: MutableMap<String, MergeRequestDocumentMapping>,
+    fileMapping: Map<String, MergeRequestDocumentMapping>,
 ): List<ContentTypeComparisonResultWithRelationships> {
 //    val sourceByDoc = sourceList.associateBy { it.metadata.documentId }
     val sourceByUniqueId = sourceList.associateBy {
@@ -1109,7 +1121,7 @@ fun compareCollectionType(
     for (k in allKeys) {
         val s = sourceByUniqueId[k]
         val t = targetByUniqueId[k]
-        compareSingleType(tableName, uid, s, t, kind).also { results.add(it) }
+        compareSingleType(tableName, uid, s, t, kind, fileMapping, idMappings).also { results.add(it) }
     }
     return results
 }

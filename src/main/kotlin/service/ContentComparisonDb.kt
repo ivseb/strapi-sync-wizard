@@ -318,11 +318,11 @@ suspend fun computeComparisonFromPrefetch(
             StrapiContentTypeKind.SingleType -> {
                 val source = sourceRows.maxByOrNull { it.metadata.id ?: 0 }
                 val target = targetRows.maxByOrNull { it.metadata.id ?: 0 }
-                singleTypes[table.name] = compareSingleType(table.name, uid, source, target, kind)
+                singleTypes[table.name] = compareSingleType(table.name, uid, source, target, kind,fileMapping,contentMapping)
             }
             StrapiContentTypeKind.CollectionType -> {
                 collectionTypes[table.name] =
-                    compareCollectionType(table.name, uid, sourceRows, targetRows, kind, contentMapping)
+                    compareCollectionType(table.name, uid, sourceRows, targetRows, kind, contentMapping,fileMapping)
             }
             StrapiContentTypeKind.Files, StrapiContentTypeKind.Component -> {
                 // ignore
