@@ -106,7 +106,7 @@ object ContentJsonUtils {
                         linkToAdd.groupBy { it.field }.forEach { (field, value) ->
                             value.groupBy { it.targetTable }.forEach { (table, links) ->
                                 val normalized = normalizeKeyName(field)
-                                val mappedKey = currentResolver?.get(normalized) ?: convertToCamelCase(field)
+                                val mappedKey = currentResolver?.get(normalized+"s")?: currentResolver?.get(normalized) ?: convertToCamelCase(field)
 
                                 val linkMap: List<JsonElement> = links.mapNotNull { resolveTargetValue(it) }
                                 if(linkMap.isNotEmpty()){
