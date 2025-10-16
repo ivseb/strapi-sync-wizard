@@ -23,7 +23,7 @@ kotlin {
 
 
 group = "it.sebi"
-version = "0.2.8"
+version = "0.2.9"
 
 application {
     mainClass = "io.ktor.server.netty.EngineMain"
@@ -49,6 +49,7 @@ dependencies {
     implementation("org.jetbrains.exposed:exposed-core:$exposed_version")
     implementation("org.jetbrains.exposed:exposed-crypt:$exposed_version")
     implementation("org.jetbrains.exposed:exposed-jdbc:$exposed_version")
+    implementation("org.bouncycastle:bcprov-jdk15on:1.70")
 //    implementation("org.jetbrains.exposed:exposed-r2dbc:$exposed_version")
 //    implementation("org.jetbrains.exposed:exposed-migration-r2dbc:$exposed_version")
 //    implementation("org.jetbrains.exposed:exposed-dao:$exposed_version")

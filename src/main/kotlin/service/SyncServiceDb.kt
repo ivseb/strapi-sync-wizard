@@ -10,6 +10,7 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.json.*
 import org.jetbrains.exposed.v1.core.statements.StatementType
 import org.slf4j.LoggerFactory
+import utils.shortenTableName
 import java.math.BigDecimal
 import java.time.OffsetDateTime
 import java.time.ZoneOffset
@@ -572,7 +573,19 @@ fun resolveComponentTableName(componentType: String?, dbSchema: DbSchema): Strin
     // fallback: best match containing norm
     val best = all.filter { it.startsWith("components_") && it.contains(norm) }
         .maxByOrNull { it.length }
-    return best
+
+    if(best != null) return best
+
+    val candidateA = "components_${norm}"
+
+
+    val shortNameA = shortenTableName(candidateA)
+    val shortNameB = shortenTableName(candidate)
+    val hashA = shortNameA.takeLast(5)
+    val hashB = shortNameB.takeLast(5)
+    val best2 = all.filter { it.startsWith("components_") && (it.endsWith(hashA) || it.endsWith(hashB)) }
+        .maxByOrNull { it.length }
+    return best2
 }
 
 private suspend fun fetchRowsByIds(
@@ -667,6 +680,9 @@ private suspend fun enrichTableRowsWithCmps(
                     // Record relationship contentType/component or component/component via *_cmps
                     val compTable = resolveComponentTableName(r.componentType, dbSchema)
                     if (compTable == null) {
+                        val compTable2 = resolveComponentTableName(r.componentType, dbSchema)
+                        println(compTable2)
+//                        error("Unable to resolve component table for ${r.componentType}")
                         val placeholder = buildJsonObject {
                             put("cmp_id", r.cmpId)
                             if (r.componentType != null) put(
@@ -676,7 +692,8 @@ private suspend fun enrichTableRowsWithCmps(
                             if (r.order != null) put("order", r.order) else put("order", JsonNull)
                         }
                         resultList.add(placeholder)
-                    } else {
+                    }
+                    else {
                         val compRows: List<JsonObject> =
                             fetchRowsByIds(instance, compTable, listOf(r.cmpId), componentTableCache).map { o ->
                                 if (r.order != null)

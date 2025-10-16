@@ -6,6 +6,7 @@ import it.sebi.models.*
 import kotlinx.serialization.json.*
 import org.jetbrains.exposed.v1.core.statements.StatementType
 import org.slf4j.LoggerFactory
+import utils.shortenTableName
 import java.sql.DriverManager
 
 /**
@@ -261,7 +262,19 @@ private fun parseDbSchemaModel(
             )
         }
 
-        val componentMetaData = componentMetas[name]?.let { cm ->
+        val _meta = componentMetas[name] ?: componentMetas.entries.find {(k,_) ->
+
+            val shortName = shortenTableName(k)
+            val isCmps = name.endsWith("_cmps")
+            val nameIn = name.replace("_cmps", "")
+            val nameInHash = nameIn.split("_").takeLast(1).first().takeLast(5)
+            val shortNamePrefix = shortName.split("_").dropLast(1).joinToString("_")
+            val shortHash = shortName.split("_").takeLast(1).first().takeLast(5)
+            nameIn.startsWith(shortNamePrefix) &&  nameInHash == shortHash && !isCmps
+
+        }?.value
+
+        val componentMetaData = _meta?.let { cm ->
 
             val columns: List<DbColumnMeta> = cm.schema.attributes.map { (key, value) ->
                 DbColumnMeta(
