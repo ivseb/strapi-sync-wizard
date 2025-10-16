@@ -62,13 +62,13 @@ fun shortenTableName(name: String): String {
     )
 }
 
-fun main() {
-
-    val tableName = "components_redemption_unitlink_redemption_unitlink_amps"
-    val result = shortenTableName(tableName)
-
-    println("Input: $tableName")
-    println("Output: $result")
-    println("Expected: components_redemption_unitlink_redemption_uni4858f")
-    println("Match: ${result == "components_redemption_unitlink_redemption_uni4858f"}")
-}
+//fun main() {
+//
+//    val tableName = "components_redemption_unitlink_redemption_unitlink_amps"
+//    val result = shortenTableName(tableName)
+//
+//    println("Input: $tableName")
+//    println("Output: $result")
+//    println("Expected: components_redemption_unitlink_redemption_uni4858f")
+//    println("Match: ${result == "components_redemption_unitlink_redemption_uni4858f"}")
+//}
