@@ -52,7 +52,7 @@ object ContentJsonUtils {
         // Step 2: map SOURCE -> TARGET using mappingMap (if present)
         val mappingForType = mappingMap[targetCollectionUID]
         val targetDoc = mappingForType?.get(src)?.targetDocumentId
-        return targetDoc ?: src
+        return targetDoc ?: error("Missing mapping for $src -> $targetCollectionUID")
     }
 
     fun processJsonElementNew(

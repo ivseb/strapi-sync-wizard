@@ -233,7 +233,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                 if (comparisonDataMap.singleTypes.containsKey(tableName)) {
                     val cmp = comparisonDataMap.singleTypes[tableName]!!
                     val targetEntry = cmp.targetContent
-                    val targetId = targetEntry?.metadata?.id
+                    val targetId = targetEntry?.metadata?.documentId
                     if (targetId != null) {
                         targetClient.deleteContentEntry(
                             queryName,
@@ -251,7 +251,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                                 it.targetContent?.metadata?.documentId == selection.documentId
                     } ?: list.find { it.targetContent?.metadata?.documentId == selection.documentId }
 
-                    val targetId = entry?.targetContent?.metadata?.id
+                    val targetId = entry?.targetContent?.metadata?.documentId
                     if (targetId != null) {
                         targetClient.deleteContentEntry(
                             queryName,

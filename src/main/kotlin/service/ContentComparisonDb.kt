@@ -10,6 +10,7 @@ import org.jetbrains.exposed.v1.core.inList
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
+import org.jetbrains.exposed.v1.jdbc.insert
 import org.slf4j.LoggerFactory
 
 
@@ -40,7 +41,8 @@ private fun keyOf(documentId: String, locale: String?): String {
 
 private fun keyOfTarget(m: StrapiImageMetadata): String = keyOf(m.documentId, m.locale)
 
-private fun compareFilesFromPrefetch(
+private suspend fun compareFilesFromPrefetch(
+    mergeRequest: MergeRequestWithInstancesDTO,
     pre: ComparisonPrefetch,
     currentFileMapping: Map<String, MergeRequestDocumentMapping>
 ): List<ContentTypeFileComparisonResult> {
@@ -103,6 +105,18 @@ private fun compareFilesFromPrefetch(
                     if (anyOther != null) {
                         t = anyOther
                         usedTargetIds.add(anyOther.metadata.id)
+                        dbQuery {
+                            MergeRequestDocumentMappingTable.insert {
+                                it[MergeRequestDocumentMappingTable.sourceStrapiId] = mergeRequest.sourceInstance.id
+                                it[MergeRequestDocumentMappingTable.targetStrapiId] = mergeRequest.targetInstance.id
+                                it[MergeRequestDocumentMappingTable.contentType] = STRAPI_FILE_CONTENT_TYPE_NAME
+                                it[MergeRequestDocumentMappingTable.sourceId] = s.metadata.id
+                                it[MergeRequestDocumentMappingTable.sourceDocumentId] = s.metadata.documentId
+                                it[MergeRequestDocumentMappingTable.targetId] = t.metadata.id
+                                it[MergeRequestDocumentMappingTable.targetDocumentId] = t.metadata.documentId
+                                it[MergeRequestDocumentMappingTable.locale] = t.metadata.locale
+                            }
+                        }
                     }
                 }
             }
@@ -348,7 +362,7 @@ suspend fun computeComparisonFromPrefetch(
 
     val fileMapping: Map<String, MergeRequestDocumentMapping> = idMappings[STRAPI_FILE_CONTENT_TYPE_NAME] ?: mapOf()
 
-    val filesResult: List<ContentTypeFileComparisonResult> = compareFilesFromPrefetch(prefetch, fileMapping)
+    val filesResult: List<ContentTypeFileComparisonResult> = compareFilesFromPrefetch(mergeRequest,prefetch, fileMapping)
 
     val contentMapping: MutableMap<String, MergeRequestDocumentMapping> =
         idMappings.filterKeys { it != STRAPI_FILE_CONTENT_TYPE_NAME }.values.fold(mutableMapOf<String, MergeRequestDocumentMapping>()) { acc, v ->
