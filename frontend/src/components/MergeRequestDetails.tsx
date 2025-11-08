@@ -218,6 +218,15 @@ const MergeRequestDetails: React.FC = () => {
             const updatedMergeRequest = await axios.get(`/api/merge-requests/${id}`);
             setMergeRequestDetail(updatedMergeRequest.data);
 
+            if (updatedMergeRequest.data.mergeRequest.status !== 'COMPARED') {
+                setMergeRequestDetail(prev => prev ? {
+                    ...prev,
+                    mergeRequest: {
+                        ...prev.mergeRequest,
+                        status: 'COMPARED'
+                    }
+                } : null);
+            }
             // Show success message
             toast.current?.show({
                 severity: 'success',

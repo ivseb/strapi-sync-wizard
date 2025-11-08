@@ -730,11 +730,16 @@ private suspend fun enrichTableRowsWithCmps(
         }
     }
 
-    // 4) Find *_lnk tables referencing this table (relations to other content types)
+
     val relatedLnkTables = dbSchema.tables.filter { t ->
-        t.name.startsWith(tableName.split("_").take(4).joinToString("_").dropLast(4) ) &&
-                t.name.endsWith("_lnk") && t.foreignKeys.any { fk -> fk.referencedTable == tableName }
+                t.name.endsWith("_lnk") && t.foreignKeys.firstOrNull()?.referencedTable == tableName
     }
+
+//    val relatedLnkTablesUndirect = dbSchema.tables.filter { t ->
+//        t.name.endsWith("_lnk") && t.foreignKeys.lastOrNull()?.referencedTable == tableName
+//    }
+
+
 
     data class LnkRow(
         val entityId: Int,

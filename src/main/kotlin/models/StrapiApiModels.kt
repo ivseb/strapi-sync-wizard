@@ -49,7 +49,8 @@ data class StrapiLinkRef(
     val targetId: Int?,
     val order: Double? = null,
     val id: Int? = null,
-    val lnkTable: String? = null
+    val lnkTable: String? = null,
+    val isInverse: Boolean = false
 )
 
 @Serializable

@@ -51,7 +51,7 @@ object ContentJsonUtils {
         val src = sourceDocId ?: return null
         // Step 2: map SOURCE -> TARGET using mappingMap (if present)
         val mappingForType = mappingMap[targetCollectionUID]
-        val targetDoc = mappingForType?.get(src)?.targetDocumentId
+        val targetDoc = mappingForType?.get(src)?.targetDocumentId?: comparisonDataMap.singleTypes[table]?.targetContent?.metadata?.documentId
         return targetDoc ?: error("Missing mapping for $src -> $targetCollectionUID")
     }
 
