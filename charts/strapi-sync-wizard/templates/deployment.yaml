@@ -51,13 +51,23 @@ spec:
             - name: JDBC_DATABASE_USERNAME
               valueFrom:
                 secretKeyRef:
+                  {{- if and .Values.database.existingSecret.enabled .Values.database.existingSecret.name }}
+                  name: {{ .Values.database.existingSecret.name }}
+                  key: {{ .Values.database.existingSecret.usernameKey | default "username" }}
+                  {{- else }}
                   name: {{ include "strapi-sync-wizard.fullname" . }}
                   key: database-username
+                  {{- end }}
             - name: JDBC_DATABASE_PASSWORD
               valueFrom:
                 secretKeyRef:
+                  {{- if and .Values.database.existingSecret.enabled .Values.database.existingSecret.name }}
+                  name: {{ .Values.database.existingSecret.name }}
+                  key: {{ .Values.database.existingSecret.passwordKey | default "password" }}
+                  {{- else }}
                   name: {{ include "strapi-sync-wizard.fullname" . }}
                   key: database-password
+                  {{- end }}
             - name: JDBC_MAXIMUM_POOL_SIZE
               value: "{{ .Values.database.maximumPoolSize }}"
             - name: DB_SALT

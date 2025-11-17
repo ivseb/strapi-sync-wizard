@@ -128,6 +128,18 @@ database:
   # External database (set to true if using an external database)
   external: false
 
+  # Use an existing external Secret for DB credentials (username/password)
+  # When enabled, the Deployment will read JDBC_DATABASE_USERNAME and
+  # JDBC_DATABASE_PASSWORD from this Secret instead of the chart-managed one.
+  # Only username and password are affected; the chart still manages the salt Secret key.
+  existingSecret:
+    enabled: false
+    # Name of the existing Secret containing credentials
+    name: ""
+    # Keys inside the Secret
+    usernameKey: "username"
+    passwordKey: "password"
+
   # If using an internal database, configure the PostgreSQL deployment
   postgresql:
     enabled: true
