@@ -11,9 +11,14 @@ import it.sebi.tables.MergeRequestDocumentMappingTable
 import org.jetbrains.exposed.v1.core.*
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.insertAndGetId
 import org.jetbrains.exposed.v1.jdbc.update
+import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 
 class FileMergeProcessor(private val mergeRequestSelectionsRepository: MergeRequestSelectionsRepository) {
+    private val maxParallelOperations = 4
     private val logger = LoggerFactory.getLogger(FileMergeProcessor::class.java)
 
     suspend fun processFiles(
@@ -22,11 +27,24 @@ class FileMergeProcessor(private val mergeRequestSelectionsRepository: MergeRequ
         sourceStrapiInstance: StrapiInstance,
         targetStrapiInstance: StrapiInstance,
         mergeRequestFiles: List<MergeRequestSelection>,
-        comparisonData: List<ContentTypeFileComparisonResult>
-    ): Map<String, Int> {
-        val sourceFolders = sourceClient.getFolders()
+        comparisonData: List<ContentTypeFileComparisonResult>,
+        mergeMapping: MutableMap<String, MergeRequestDocumentMapping>,
+        // Optional: folders snapshots from prefetch cache (used to avoid live calls on source)
+        sourceFoldersFromCache: List<StrapiFolder>? = null,
+        targetFoldersFromCache: List<StrapiFolder>? = null
+    ): List<MergeRequestDocumentMapping> {
+        // Prefer cached folders for source; if missing and instance is virtual, fail with a clear message
+        val sourceFolders = when {
+            !sourceFoldersFromCache.isNullOrEmpty() -> sourceFoldersFromCache
+            sourceStrapiInstance.isVirtual -> throw IllegalStateException("Source instance is virtual: folders must be provided in prefetch cache to run complete")
+            else -> sourceClient.getFolders()
+        }
         val sourceFoldersMap = sourceFolders.associateBy { it.path }
-        val targetFolders = targetClient.getFolders()
+        // For target we can still fetch live; allow override from cache if given
+        val targetFolders = when {
+            !targetFoldersFromCache.isNullOrEmpty() -> targetFoldersFromCache
+            else -> targetClient.getFolders()
+        }
         val targetFolderPaths = targetFolders.map { it.pathFull }.toSet()
         val targetFolderMap = targetFolders.associateBy { it.pathFull }.toMutableMap()
         val requiredFolderPaths = mutableSetOf<String>()
@@ -102,11 +120,15 @@ class FileMergeProcessor(private val mergeRequestSelectionsRepository: MergeRequ
                 }
             }
         }
-        return filesToProcess.mapNotNull { (file, direction) ->
-            mergeRequestFiles.find { it.documentId == file.metadata.documentId && (it.direction == Direction.TO_CREATE || it.direction == Direction.TO_UPDATE) }
-                ?.let { selection ->
+        return coroutineScope {
+            val semaphore = Semaphore(maxParallelOperations)
+            filesToProcess.map { (file, direction) ->
+                async {
+                    semaphore.withPermit {
+                        mergeRequestFiles.find { it.documentId == file.metadata.documentId && (it.direction == Direction.TO_CREATE || it.direction == Direction.TO_UPDATE) }
+                            ?.let { selection ->
 
-                    try {
+                            try {
                         val sourceFile = sourceClient.downloadFile(file)
                         val folder =
                             sourceFoldersMap[file.metadata.folderPath]?.let { targetFolderMap[it.pathFull]?.id }
@@ -123,19 +145,15 @@ class FileMergeProcessor(private val mergeRequestSelectionsRepository: MergeRequ
                             folder
                         )
                         // Save mapping between source and target instead of updating target DB document_id
-                        dbQuery {
+                        val record =  dbQuery {
                             val sourceDocId = file.metadata.documentId
                             val targetDocId = uploadResponse.documentId
                             val sourceId: Int? = comparisonData.find { it.sourceImage?.metadata?.documentId == sourceDocId }?.sourceImage?.metadata?.id
-                            val existing = MergeRequestDocumentMappingTable.selectAll().where {
-                                (MergeRequestDocumentMappingTable.sourceStrapiId eq sourceStrapiInstance.id) and
-                                (MergeRequestDocumentMappingTable.targetStrapiId eq targetStrapiInstance.id) and
-                                (MergeRequestDocumentMappingTable.contentType eq STRAPI_FILE_CONTENT_TYPE_NAME) and
-                                (MergeRequestDocumentMappingTable.sourceDocumentId eq sourceDocId)
-                            }.toList()
+                            val existing = mergeMapping[sourceDocId]
 
-                            if (existing.isEmpty()) {
-                                MergeRequestDocumentMappingTable.insert {
+
+                            if (existing == null) {
+                                val res = MergeRequestDocumentMappingTable.insertAndGetId {
                                     it[MergeRequestDocumentMappingTable.sourceStrapiId] = sourceStrapiInstance.id
                                     it[MergeRequestDocumentMappingTable.targetStrapiId] = targetStrapiInstance.id
                                     it[MergeRequestDocumentMappingTable.contentType] = STRAPI_FILE_CONTENT_TYPE_NAME
@@ -144,17 +162,35 @@ class FileMergeProcessor(private val mergeRequestSelectionsRepository: MergeRequ
                                     it[MergeRequestDocumentMappingTable.targetId] = uploadResponse.id
                                     it[MergeRequestDocumentMappingTable.targetDocumentId] = targetDocId
                                 }
+                                val newValue = MergeRequestDocumentMapping(
+                                    id = res.value,
+                                    sourceStrapiInstanceId = sourceStrapiInstance.id,
+                                    targetStrapiInstanceId = targetStrapiInstance.id,
+                                    contentType = STRAPI_FILE_CONTENT_TYPE_NAME,
+                                    sourceId = sourceId,
+                                    sourceDocumentId = sourceDocId,
+                                    targetId = uploadResponse.id,
+                                    targetDocumentId = targetDocId
+                                )
+                                mergeMapping[sourceDocId] = newValue
+                                newValue
                             } else {
-                                val exId = existing.first()[MergeRequestDocumentMappingTable.id].value
+                                val exId = existing.id
                                 MergeRequestDocumentMappingTable.update({ MergeRequestDocumentMappingTable.id eq exId }) {
                                     it[MergeRequestDocumentMappingTable.targetId] = uploadResponse.id
                                     it[MergeRequestDocumentMappingTable.targetDocumentId] = targetDocId
                                 }
+                                val newValue = existing.copy(
+                                    targetId = uploadResponse.id,
+                                    targetDocumentId = targetDocId
+                                )
+                                mergeMapping[sourceDocId] = newValue
+                                newValue
                             }
                         }
                         sourceFile.delete()
                         mergeRequestSelectionsRepository.updateSyncStatus(selection.id, true, null)
-                        file.metadata.documentId to uploadResponse.id
+                        record
                     } catch (e: Exception) {
                         logger.error("Error ${if (direction == Direction.TO_CREATE) "creating" else "updating"} file ${file.metadata.name}: ${e.message}")
                         mergeRequestSelectionsRepository.updateSyncStatus(
@@ -164,7 +200,11 @@ class FileMergeProcessor(private val mergeRequestSelectionsRepository: MergeRequ
                         )
                         null
                     }
+                            }
+                    }
                 }
-        }.toMap()
+            }.awaitAll().filterNotNull()
+        }
+
     }
 }

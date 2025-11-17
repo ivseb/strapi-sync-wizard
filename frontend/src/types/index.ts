@@ -42,6 +42,7 @@ export interface StrapiInstance {
     name: string;
     url: string;
     username: string;
+    isVirtual?: boolean;
     // Optional DB connection metadata (secure list includes these except passwords)
     dbHost?: string | null;
     dbPort?: number | null;
@@ -62,6 +63,7 @@ export interface FormData {
     username: string;
     password: string;  // Can be empty when editing (id is present)
     apiKey: string;    // Can be empty when editing (id is present)
+    isVirtual?: boolean; // virtual placeholder instance (relaxes validation)
     // DB connection fields
     dbHost?: string;
     dbPort?: number | null; // store as number for payload; null if empty

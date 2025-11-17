@@ -32,6 +32,9 @@ enum class CompareMode { Full, Compare, Cache }
 data class ComparisonPrefetchCache(
     val sourceFiles: List<StrapiImage>,
     val targetFiles: List<StrapiImage>,
+    // New: include folders snapshot to avoid live calls during async sync
+    val sourceFolders: List<StrapiFolder> = emptyList(),
+    val targetFolders: List<StrapiFolder> = emptyList(),
     val sourceRowsByUid: Map<String, List<StrapiContent>>,
     val targetRowsByUid: Map<String, List<StrapiContent>>,
     val collectedRelationships: List<ContentRelationship>
@@ -221,7 +224,7 @@ class MergeRequestService(
         val mergeData = getAllMergeRequestDataIfCompared(id, false)
         val schemaCompatibility = dataFileUtils.getSchemaCompatibilityFile(id)?.isCompatible
 
-        return MergeRequestDetail(mergeRequest, schemaCompatibility,mergeData)
+        return MergeRequestDetail(mergeRequest, schemaCompatibility, mergeData)
     }
 
     /**
@@ -764,6 +767,8 @@ class MergeRequestService(
         val sanitized = ComparisonPrefetchCache(
             sourceFiles = cache.sourceFiles,
             targetFiles = emptyList(),
+            sourceFolders = cache.sourceFolders, // keep uploaded source folders if present
+            targetFolders = emptyList(),
             sourceRowsByUid = cache.sourceRowsByUid,
             targetRowsByUid = emptyMap(),
             collectedRelationships = cache.collectedRelationships
@@ -829,7 +834,10 @@ class MergeRequestService(
                         // Build target side live and merge with cached source
                         val dbSchema = schemas.extractedSchema!!
                         // Fetch target-only data
-                        val tgtFiles = computeFingerprints(mergeRequest.targetInstance, fetchFilesFromDb(mergeRequest.targetInstance))
+                        val tgtFiles = computeFingerprints(
+                            mergeRequest.targetInstance,
+                            fetchFilesFromDb(mergeRequest.targetInstance)
+                        )
                         val tgtRel = fetchFilesRelatedMph(mergeRequest.targetInstance)
                         val tgtCmps = fetchCMPS(mergeRequest.targetInstance, dbSchema)
                         val tgtTables = fetchTables(mergeRequest.targetInstance, dbSchema)
@@ -878,9 +886,58 @@ class MergeRequestService(
 
         return when (mode) {
             CompareMode.Full -> {
-                val prefetch = prefetchComparisonData(mergeRequest, schemas.extractedSchema!!)
-                dataFileUtils.savePrefetchCache(mergeRequest.id, toCache(prefetch))
-                computeAndPersist(prefetch)
+                if (mergeRequest.sourceInstance.isVirtual) {
+                    val cached = dataFileUtils.getPrefetchCache(mergeRequest.id)
+                        ?: error("Virtual source instances cannot be compared in Full mode")
+
+                    val pre = fromCache(cached)
+
+                    val dbSchema = schemas.extractedSchema!!
+                    val tgtFiles =
+                        computeFingerprints(mergeRequest.targetInstance, fetchFilesFromDb(mergeRequest.targetInstance))
+                    val tgtRel = fetchFilesRelatedMph(mergeRequest.targetInstance)
+                    val tgtCmps = fetchCMPS(mergeRequest.targetInstance, dbSchema)
+                    val tgtTables = fetchTables(mergeRequest.targetInstance, dbSchema)
+                    val tgtCompDef = fetchComponents(mergeRequest.targetInstance, dbSchema)
+                    val targetRowsByUid = mutableMapOf<String, List<StrapiContent>>()
+                    for (table in dbSchema.tables) {
+                        val meta = table.metadata ?: continue
+                        val uid = meta.apiUid
+                        if (!uid.startsWith("api::")) continue
+                        val rows = fetchPublishedRowsAsJson(
+                            mergeRequest.targetInstance,
+                            table.name,
+                            dbSchema,
+                            fileRelations = tgtRel,
+                            cmpsMap = tgtCmps,
+                            componentTableCache = tgtCompDef,
+                            tableMap = tgtTables,
+                            fileCache = tgtFiles.associate { it.metadata.id to it.metadata.documentId }
+                        ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata) }
+                        targetRowsByUid[uid] = rows
+                    }
+                    val prefetch = ComparisonPrefetch(
+                        sourceFiles = pre.sourceFiles,
+                        targetFiles = tgtFiles,
+                        sourceFileRelations = emptyList(),
+                        targetFileRelations = tgtRel,
+                        sourceCMPSMap = mutableMapOf(),
+                        targetCMPSMap = tgtCmps,
+                        sourceTableMap = mutableMapOf(),
+                        targetTableMap = tgtTables,
+                        srcCompDef = mutableMapOf(),
+                        tgtCompDef = tgtCompDef,
+                        sourceRowsByUid = pre.sourceRowsByUid,
+                        targetRowsByUid = targetRowsByUid,
+                        collectedRelationships = pre.collectedRelationships
+                    )
+
+                    computeAndPersist(prefetch)
+                } else {
+                    val prefetch = prefetchComparisonData(mergeRequest, schemas.extractedSchema!!)
+                    dataFileUtils.savePrefetchCache(mergeRequest.id, toCache(prefetch))
+                    computeAndPersist(prefetch)
+                }
             }
 
             CompareMode.Compare, CompareMode.Cache -> {
@@ -890,7 +947,10 @@ class MergeRequestService(
                     val needsTarget = pre.targetFiles.isEmpty() && pre.targetRowsByUid.isEmpty()
                     if (needsTarget) {
                         val dbSchema = schemas.extractedSchema!!
-                        val tgtFiles = computeFingerprints(mergeRequest.targetInstance, fetchFilesFromDb(mergeRequest.targetInstance))
+                        val tgtFiles = computeFingerprints(
+                            mergeRequest.targetInstance,
+                            fetchFilesFromDb(mergeRequest.targetInstance)
+                        )
                         val tgtRel = fetchFilesRelatedMph(mergeRequest.targetInstance)
                         val tgtCmps = fetchCMPS(mergeRequest.targetInstance, dbSchema)
                         val tgtTables = fetchTables(mergeRequest.targetInstance, dbSchema)
@@ -1056,25 +1116,26 @@ class MergeRequestService(
             val targetFileMap: MutableMap<String, Int> =
                 comparisonDataMap.files.mapNotNull { f -> f.targetImage?.metadata?.documentId?.let { it to f.targetImage.metadata.id } }
                     .toMap().toMutableMap()
-            val processedFiles: MutableMap<String, Int> =
-                mergeRequestFiles.fold(mutableMapOf<String, Int>()) { acc, file ->
-                    // Process the file
-                    val fileList = listOf(file)
-                    acc.apply {
-                        putAll(
-                            fileMergeProcessor.processFiles(
-                                sourceClient,
-                                targetClient,
-                                mergeRequest.sourceInstance,
-                                mergeRequest.targetInstance,
-                                fileList,
-                                comparisonDataMap.files
-                            )
-                        )
-                    }
-                }
 
-            val allTargetMap = targetFileMap + processedFiles
+            if(mappingMap[STRAPI_FILE_CONTENT_TYPE_NAME] == null){
+                mappingMap[STRAPI_FILE_CONTENT_TYPE_NAME] = mutableMapOf<String, MergeRequestDocumentMapping>()
+            }
+
+            val newMappingFile = fileMergeProcessor.processFiles(
+                sourceClient,
+                targetClient,
+                mergeRequest.sourceInstance,
+                mergeRequest.targetInstance,
+                mergeRequestFiles,
+                comparisonDataMap.files,
+                // folders from prefetch cache to avoid live calls on source
+                mappingMap[STRAPI_FILE_CONTENT_TYPE_NAME]!!,
+                sourceFoldersFromCache = dataFileUtils.getPrefetchCache(id)?.sourceFolders,
+                targetFoldersFromCache = null
+            )
+
+
+            val allTargetMap = targetFileMap + newMappingFile.mapNotNull { x -> x.targetDocumentId?.let { it to  x.targetId!! } }
 
             // Calcola l'ordine di sincronizzazione dei contenuti in base alle dipendenze
             val syncOrderResult: SyncOrderResult = computeContentSyncOrder(

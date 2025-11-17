@@ -12,6 +12,7 @@ import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.slf4j.LoggerFactory
+import it.sebi.client.StrapiClient
 
 
 typealias CmpsMap = MutableMap<String, MutableMap<Int, MutableMap<String, MutableList<CmpRow>>>>
@@ -255,6 +256,16 @@ suspend fun exportSourcePrefetch(
     val cmpsDef: Deferred<CmpsMap> = async { fetchCMPS(instance, dbSchema) }
     val tablesDef: Deferred<TableMap> = async { fetchTables(instance, dbSchema) }
     val compDef: Deferred<MutableMap<String, MutableMap<Int, JsonObject>>> = async { fetchComponents(instance, dbSchema) }
+    // New: folders snapshot from source Strapi (via HTTP API)
+    val foldersDef: Deferred<List<StrapiFolder>> = async {
+        try {
+            val client = StrapiClient(instance)
+            client.getFolders()
+        } catch (e: Exception) {
+            logger.warn("Could not fetch folders from source '${instance.name}': ${'$'}{e.message}. Proceeding with empty list.")
+            emptyList()
+        }
+    }
 
     val files = filesDef.await()
     val filesWithFp = computeFingerprints(instance, files)
@@ -262,6 +273,7 @@ suspend fun exportSourcePrefetch(
     val cmpsMap = cmpsDef.await()
     val tableMap = tablesDef.await()
     val compMap = compDef.await()
+    val sourceFolders = foldersDef.await()
 
     val relationshipsCollected = mutableSetOf<ContentRelationship>()
     val sourceRowsByUid = mutableMapOf<String, List<StrapiContent>>()
@@ -288,6 +300,8 @@ suspend fun exportSourcePrefetch(
     ComparisonPrefetchCache(
         sourceFiles = filesWithFp,
         targetFiles = emptyList(),
+        sourceFolders = sourceFolders,
+        targetFolders = emptyList(),
         sourceRowsByUid = sourceRowsByUid,
         targetRowsByUid = emptyMap(),
         collectedRelationships = relationshipsCollected.toList()

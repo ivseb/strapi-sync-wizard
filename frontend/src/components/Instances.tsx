@@ -115,6 +115,63 @@ const Instances: React.FC = () => {
                       console.error(e)
                     }
                   }} />
+                  <Button label="Export bundle (zip)" icon="pi pi-file-zip" onClick={async ()=>{
+                    if(!instance.id) return;
+                    try {
+                      const resp = await fetch(`/api/instances/${instance.id}/export/bundle`)
+                      if(!resp.ok) throw new Error(await resp.text())
+                      const blob = await resp.blob()
+                      const url = URL.createObjectURL(blob)
+                      const a = document.createElement('a')
+                      a.href = url
+                      a.download = `instance_${instance.id}_bundle.zip`
+                      a.click()
+                      URL.revokeObjectURL(url)
+                    } catch (e:any) {
+                      console.error(e)
+                      instanceToast.current?.show({severity:'error', summary:'Export bundle failed', detail: e?.message || 'Error', life: 3000})
+                    }
+                  }} />
+
+                  <Button 
+                    label="Test DB" 
+                    className="p-button-outlined p-button-help p-button-sm" 
+                    onClick={async ()=>{
+                      try {
+                        const resp = await fetch(`/api/instances/${instance.id}/test-db`, {method:'POST'})
+                        const data = await resp.json();
+                        instanceToast.current?.show({severity: data.connected? 'success':'warn', summary:'DB Test', detail: data.message, life: 3000})
+                      } catch (e:any) {
+                        instanceToast.current?.show({severity:'error', summary:'DB Test', detail: e?.message || 'Error', life: 3000})
+                      }
+                    }}
+                  />
+                  <Button 
+                    label="Test Login" 
+                    className="p-button-outlined p-button-success p-button-sm" 
+                    onClick={async ()=>{
+                      try {
+                        const resp = await fetch(`/api/instances/${instance.id}/test-login`, {method:'POST'})
+                        const data = await resp.json();
+                        instanceToast.current?.show({severity: data.connected? 'success':'warn', summary:'Login Test', detail: data.message, life: 3000})
+                      } catch (e:any) {
+                        instanceToast.current?.show({severity:'error', summary:'Login Test', detail: e?.message || 'Error', life: 3000})
+                      }
+                    }}
+                  />
+                  <Button 
+                    label="Test Token" 
+                    className="p-button-outlined p-button-warning p-button-sm" 
+                    onClick={async ()=>{
+                      try {
+                        const resp = await fetch(`/api/instances/${instance.id}/test-token`, {method:'POST'})
+                        const data = await resp.json();
+                        instanceToast.current?.show({severity: data.connected? 'success':'warn', summary:'Token Test', detail: data.message, life: 3000})
+                      } catch (e:any) {
+                        instanceToast.current?.show({severity:'error', summary:'Token Test', detail: e?.message || 'Error', life: 3000})
+                      }
+                    }}
+                  />
                 </div>
               )} header="Actions" />
             </DataTable>

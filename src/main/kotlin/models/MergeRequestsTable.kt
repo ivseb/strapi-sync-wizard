@@ -49,7 +49,7 @@ data class MergeRequest(
 data class MergeRequestDTO(
     val id: Int? = null,
     val name: String,
-    val description: String,
+    val description: String? = null,
     val sourceInstanceId: Int,
     val targetInstanceId: Int,
     val status: MergeRequestStatus? = null

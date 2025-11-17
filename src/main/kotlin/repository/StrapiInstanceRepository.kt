@@ -7,12 +7,13 @@ import it.sebi.models.StrapiInstanceDTO
 import it.sebi.models.StrapiInstanceSecure
 import it.sebi.tables.StrapiInstancesTable
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.singleOrNull
-import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.withContext
-import org.jetbrains.exposed.v1.core.*
-import org.jetbrains.exposed.v1.jdbc.*
+import org.jetbrains.exposed.v1.core.ResultRow
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.jdbc.deleteWhere
+import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.update
 import org.slf4j.LoggerFactory
 import java.time.OffsetDateTime
 
@@ -64,6 +65,7 @@ class StrapiInstanceRepository {
             it[username] = instance.username
             it[password] = instance.password
             it[apiKey] = instance.apiKey
+            it[isVirtual] = instance.isVirtual
             // DB connection optional fields
             it[dbHost] = instance.dbHost
             it[dbPort] = instance.dbPort
@@ -87,13 +89,15 @@ class StrapiInstanceRepository {
                 it[password] = instance.password
             if (instance.apiKey.trim().isNotEmpty())
                 it[apiKey] = instance.apiKey
+            it[isVirtual] = instance.isVirtual
             // DB connection optional fields: update if provided (including empty can mean null?)
             it[dbHost] = instance.dbHost
             it[dbPort] = instance.dbPort
             it[dbName] = instance.dbName
             it[dbSchema] = instance.dbSchema
             it[dbUser] = instance.dbUser
-            it[dbPassword] = instance.dbPassword
+            if (instance.dbPassword != null && instance.dbPassword.trim().isNotEmpty())
+                it[dbPassword] = instance.dbPassword
             it[dbSslMode] = instance.dbSslMode
             it[updatedAt] = OffsetDateTime.now()
         } > 0
@@ -151,6 +155,7 @@ class StrapiInstanceRepository {
         username = this[StrapiInstancesTable.username],
         password = this[StrapiInstancesTable.password],
         apiKey = this[StrapiInstancesTable.apiKey],
+        isVirtual = this[StrapiInstancesTable.isVirtual],
         dbHost = this[StrapiInstancesTable.dbHost],
         dbPort = this[StrapiInstancesTable.dbPort],
         dbName = this[StrapiInstancesTable.dbName],
@@ -170,6 +175,7 @@ class StrapiInstanceRepository {
         name = this[StrapiInstancesTable.name],
         url = this[StrapiInstancesTable.url],
         username = this[StrapiInstancesTable.username],
+        isVirtual = this[StrapiInstancesTable.isVirtual],
         dbHost = this[StrapiInstancesTable.dbHost],
         dbPort = this[StrapiInstancesTable.dbPort],
         dbName = this[StrapiInstancesTable.dbName],

@@ -4,6 +4,7 @@ import { Button } from 'primereact/button';
 import { InputText } from 'primereact/inputtext';
 import { Password } from 'primereact/password';
 import { Message } from 'primereact/message';
+import { Checkbox } from 'primereact/checkbox';
 import { FormData } from '../../types';
 
 interface InstanceFormDialogProps {
@@ -39,9 +40,9 @@ const InstanceFormDialog: React.FC<InstanceFormDialogProps> = ({
         disabled={
           !formData.name || 
           !formData.url || 
-          !formData.username || 
-          (!isEditing && (!formData.password || !formData.apiKey)) ||
-          (!isEditing && (!formData.dbHost || !formData.dbPort || !formData.dbName || !formData.dbUser || !formData.dbPassword))
+          (!formData.isVirtual && !formData.username) || 
+          (!formData.isVirtual && !isEditing && (!formData.password || !formData.apiKey)) ||
+          (!formData.isVirtual && !isEditing && (!formData.dbHost || !formData.dbPort || !formData.dbName || !formData.dbUser || !formData.dbPassword))
         }
         onClick={onSubmit}
       />
@@ -57,6 +58,13 @@ const InstanceFormDialog: React.FC<InstanceFormDialogProps> = ({
       footer={modalFooter}
     >
       <div className="p-fluid">
+        <div className="field mb-3">
+          <div className="flex align-items-center gap-2">
+            <Checkbox inputId="isVirtual" checked={!!formData.isVirtual} onChange={(e) => onInputChange({ target: { name: 'isVirtual', value: e.checked } as any } as any)} />
+            <label htmlFor="isVirtual" className="mb-0">Istanza virtuale (placeholder, campi di connessione non obbligatori)</label>
+          </div>
+        </div>
+
         <div className="field mb-3">
           <label htmlFor="name" className="block mb-2">Instance Name</label>
           <InputText
@@ -89,7 +97,7 @@ const InstanceFormDialog: React.FC<InstanceFormDialogProps> = ({
             value={formData.username}
             onChange={onInputChange}
             placeholder="Username for authentication"
-            required
+            required={!formData.isVirtual}
           />
         </div>
 
@@ -105,7 +113,7 @@ const InstanceFormDialog: React.FC<InstanceFormDialogProps> = ({
             placeholder={isEditing ? "Leave empty to keep current password" : "Password for authentication"}
             feedback={false}
             toggleMask
-            required={!isEditing}
+            required={!formData.isVirtual && !isEditing}
           />
         </div>
 
@@ -121,43 +129,43 @@ const InstanceFormDialog: React.FC<InstanceFormDialogProps> = ({
             placeholder={isEditing ? "Leave empty to keep current API key" : "Your Strapi API Key"}
             feedback={false}
             toggleMask
-            required={!isEditing}
+            required={!formData.isVirtual && !isEditing}
           />
         </div>
 
         <hr />
         <h3>Postgres connection (per-instance)</h3>
         <div className="field mb-3">
-          <label htmlFor="dbHost" className="block mb-2">DB Host{!isEditing && ' *'}</label>
+          <label htmlFor="dbHost" className="block mb-2">DB Host{(!formData.isVirtual && !isEditing) && ' *'}</label>
           <InputText
             id="dbHost"
             name="dbHost"
             value={formData.dbHost || ''}
             onChange={onInputChange}
             placeholder="e.g. mydb.example.com"
-            required={!isEditing}
+            required={!formData.isVirtual && !isEditing}
           />
         </div>
         <div className="field mb-3">
-          <label htmlFor="dbPort" className="block mb-2">DB Port{!isEditing && ' *'}</label>
+          <label htmlFor="dbPort" className="block mb-2">DB Port{(!formData.isVirtual && !isEditing) && ' *'}</label>
           <InputText
             id="dbPort"
             name="dbPort"
             value={(formData.dbPort ?? '').toString()}
             onChange={onInputChange}
             placeholder="5432"
-            required={!isEditing}
+            required={!formData.isVirtual && !isEditing}
           />
         </div>
         <div className="field mb-3">
-          <label htmlFor="dbName" className="block mb-2">DB Name{!isEditing && ' *'}</label>
+          <label htmlFor="dbName" className="block mb-2">DB Name{(!formData.isVirtual && !isEditing) && ' *'}</label>
           <InputText
             id="dbName"
             name="dbName"
             value={formData.dbName || ''}
             onChange={onInputChange}
             placeholder="database name"
-            required={!isEditing}
+            required={!formData.isVirtual && !isEditing}
           />
         </div>
         <div className="field mb-3">
@@ -171,14 +179,14 @@ const InstanceFormDialog: React.FC<InstanceFormDialogProps> = ({
           />
         </div>
         <div className="field mb-3">
-          <label htmlFor="dbUser" className="block mb-2">DB User{!isEditing && ' *'}</label>
+          <label htmlFor="dbUser" className="block mb-2">DB User{(!formData.isVirtual && !isEditing) && ' *'}</label>
           <InputText
             id="dbUser"
             name="dbUser"
             value={formData.dbUser || ''}
             onChange={onInputChange}
             placeholder="db username"
-            required={!isEditing}
+            required={!formData.isVirtual && !isEditing}
           />
         </div>
         <div className="field mb-3">
@@ -191,7 +199,7 @@ const InstanceFormDialog: React.FC<InstanceFormDialogProps> = ({
             placeholder={isEditing ? "Leave empty to keep current DB password" : "DB password"}
             feedback={false}
             toggleMask
-            required={!isEditing}
+            required={!formData.isVirtual && !isEditing}
           />
         </div>
         <div className="field mb-3">
@@ -214,12 +222,10 @@ const InstanceFormDialog: React.FC<InstanceFormDialogProps> = ({
             disabled={
               testingConnection || 
               !formData.url || 
-              !formData.username || 
-              !formData.password || 
-              !formData.apiKey
+              (!formData.isVirtual && (!formData.username || !formData.password || !formData.apiKey))
             }
             tooltip={
-              isEditing && (!formData.password || !formData.apiKey) 
+              !formData.isVirtual && isEditing && (!formData.password || !formData.apiKey) 
                 ? "Please enter password and API key to test connection" 
                 : undefined
             }

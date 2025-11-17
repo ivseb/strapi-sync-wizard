@@ -9,6 +9,7 @@ const initialFormData: FormData = {
   username: '',
   password: '',
   apiKey: '',
+  isVirtual: false,
   dbHost: '',
   dbPort: null,
   dbName: '',
@@ -70,6 +71,7 @@ export const useInstanceManagement = () => {
         username: instance.username,
         password: '',
         apiKey: '',
+        isVirtual: instance.isVirtual ?? false,
         dbHost: instance.dbHost ?? '',
         dbPort: instance.dbPort ?? null,
         dbName: instance.dbName ?? '',
@@ -87,7 +89,7 @@ export const useInstanceManagement = () => {
     setConnectionStatus(null);
   };
 
-  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement> | { target: { name: string, value: any } }) => {
     const { name, value } = e.target;
     setFormData(prev => ({
       ...prev,
@@ -132,6 +134,7 @@ export const useInstanceManagement = () => {
       username: formData.username,
       password: formData.password,
       apiKey: formData.apiKey,
+      isVirtual: !!formData.isVirtual,
       dbHost: formData.dbHost && formData.dbHost.trim() !== '' ? formData.dbHost : null,
       dbPort: typeof formData.dbPort === 'number' ? formData.dbPort : null,
       dbName: formData.dbName && formData.dbName.trim() !== '' ? formData.dbName : null,

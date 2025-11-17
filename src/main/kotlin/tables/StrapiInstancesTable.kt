@@ -26,6 +26,9 @@ object StrapiInstancesTable : IntIdTable("strapi_instances") {
     val apiKey =
         encryptedVarchar("api_key", 2000, crypto)
 
+    // Virtual instance flag (placeholder instance without enforced connectivity)
+    val isVirtual = bool("is_virtual").default(false)
+
     // Optional Postgres connection settings per instance (nullable for existing records)
     val dbHost = varchar("db_host", 255).nullable()
     val dbPort = integer("db_port").nullable()

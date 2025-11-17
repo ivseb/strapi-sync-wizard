@@ -16,6 +16,7 @@ import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.isNull
 import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.insertAndGetId
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.update
 import org.slf4j.LoggerFactory
@@ -329,7 +330,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                             if (locale != null) predicate and (MergeRequestDocumentMappingTable.locale eq locale) else predicate and MergeRequestDocumentMappingTable.locale.isNull()
                         val existing = MergeRequestDocumentMappingTable.selectAll().where { predicate }.toList()
                         if (existing.isEmpty()) {
-                            MergeRequestDocumentMappingTable.insert {
+                             MergeRequestDocumentMappingTable.insert {
                                 it[MergeRequestDocumentMappingTable.sourceStrapiId] = sourceStrapiInstance.id
                                 it[MergeRequestDocumentMappingTable.targetStrapiId] = targetStrapiInstance.id
                                 it[MergeRequestDocumentMappingTable.contentType] = contentTypeUid
@@ -339,6 +340,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                                 it[MergeRequestDocumentMappingTable.targetDocumentId] = targetDocumentId
                                 it[MergeRequestDocumentMappingTable.locale] = locale
                             }
+
                         } else {
                             val exId = existing.first()[MergeRequestDocumentMappingTable.id].value
                             MergeRequestDocumentMappingTable.update({ MergeRequestDocumentMappingTable.id eq exId }) {

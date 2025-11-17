@@ -4,6 +4,7 @@ import kotlinx.serialization.Contextual
 import kotlinx.serialization.Serializable
 import org.jetbrains.exposed.v1.core.DatabaseConfig
 import org.jetbrains.exposed.v1.jdbc.Database
+import org.slf4j.LoggerFactory
 import java.time.OffsetDateTime
 
 @Serializable
@@ -14,6 +15,8 @@ data class StrapiInstance(
     val username: String,
     val password: String,
     val apiKey: String,
+    // This instance can be a virtual placeholder (no remote connectivity enforced)
+    val isVirtual: Boolean = false,
     // Optional Postgres connection settings per instance
     val dbHost: String? = null,
     val dbPort: Int? = null,
@@ -26,12 +29,23 @@ data class StrapiInstance(
     @Contextual val updatedAt: OffsetDateTime = OffsetDateTime.now()
 ) {
 
+    companion object {
+        val logger = LoggerFactory.getLogger(StrapiInstance::class.java)
+    }
 
     val database by lazy {
         if (dbHost == null || dbPort == null || dbName == null || dbUser == null || dbPassword == null) {
+            logger.warn("Missing DB connection data for instance '$name'; returning null")
             null
         } else {
             val dbUrl = "jdbc:postgresql://$dbHost:$dbPort/$dbName?currentSchema=$dbSchema"
+            logger.info(
+                "Connecting to DB at $dbUrl with user $dbUser and schema $dbSchema and SSL mode $dbSslMode and password ${
+                    dbPassword.take(
+                        5
+                    )
+                }........."
+            )
             Database.connect(
                 url = dbUrl,
                 user = dbUser,
@@ -53,6 +67,7 @@ data class StrapiInstanceSecure(
     val name: String,
     val url: String,
     val username: String,
+    val isVirtual: Boolean = false,
     // Optional Postgres connection settings are safe to expose except passwords
     val dbHost: String? = null,
     val dbPort: Int? = null,
@@ -72,6 +87,7 @@ data class StrapiInstanceDTO(
     val username: String,
     val password: String,
     val apiKey: String,
+    val isVirtual: Boolean = false,
     // Optional Postgres connection settings per instance for create/update
     val dbHost: String? = null,
     val dbPort: Int? = null,

@@ -148,7 +148,7 @@ class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepos
     suspend fun createMergeRequest(mergeRequestDTO: MergeRequestDTO): MergeRequest = dbQuery {
         val insertStatement = MergeRequestsTable.insert {
             it[name] = mergeRequestDTO.name
-            it[description] = mergeRequestDTO.description
+            it[description] = mergeRequestDTO.description ?: ""
             it[sourceInstanceId] = mergeRequestDTO.sourceInstanceId
             it[targetInstanceId] = mergeRequestDTO.targetInstanceId
             it[status] = mergeRequestDTO.status ?: MergeRequestStatus.CREATED
@@ -161,7 +161,7 @@ class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepos
     suspend fun updateMergeRequest(id: Int, mergeRequestDTO: MergeRequestDTO): Boolean = dbQuery {
         MergeRequestsTable.update({ MergeRequestsTable.id eq id }) {
             mergeRequestDTO.name.let { name -> it[MergeRequestsTable.name] = name }
-            mergeRequestDTO.description.let { desc -> it[description] = desc }
+            (mergeRequestDTO.description ?: "").let { desc -> it[description] = desc }
             mergeRequestDTO.sourceInstanceId.let { srcId -> it[sourceInstanceId] = srcId }
             mergeRequestDTO.targetInstanceId.let { tgtId -> it[targetInstanceId] = tgtId }
             mergeRequestDTO.status?.let { status -> it[MergeRequestsTable.status] = status }

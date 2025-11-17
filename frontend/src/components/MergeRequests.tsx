@@ -132,9 +132,7 @@ const MergeRequests: React.FC = () => {
       errors.name = 'Name is required';
     }
 
-    if (!formData.description.trim()) {
-      errors.description = 'Description is required';
-    }
+    // Description is optional
 
     if (formData.sourceInstanceId === null) {
       errors.sourceInstanceId = 'Source instance is required';
@@ -159,7 +157,11 @@ const MergeRequests: React.FC = () => {
     try {
       setSubmitting(true);
 
-      const response = await axios.post('/api/merge-requests', formData);
+      const response = await axios.post('/api/merge-requests', {
+        ...formData,
+        // ensure backend receives empty string when description omitted
+        description: (formData.description || '').trim()
+      });
 
       // Show success message
       toast.current?.show({

@@ -13,6 +13,12 @@ import it.sebi.repository.StrapiInstanceRepository
 import kotlinx.serialization.Serializable
 import it.sebi.models.*
 import it.sebi.service.exportSourcePrefetch
+import java.io.ByteArrayOutputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+import it.sebi.JsonParser
+import it.sebi.client.StrapiClient
+import java.sql.DriverManager
 
 @Serializable
 data class ConnectionTestResponse(val connected: Boolean, val message: String)
@@ -171,6 +177,98 @@ fun Route.configureInstanceRoutes(
                 call.respond(HttpStatusCode.OK, cache)
             } catch (e: Exception) {
                 call.respond(HttpStatusCode.InternalServerError, e.message ?: "Error exporting prefetch")
+            }
+        }
+
+        // Export bundle (schema + prefetch) as a single ZIP file
+        get("/{id}/export/bundle") {
+            val id = call.parameters["id"]?.toIntOrNull()
+            if (id == null) { call.respond(HttpStatusCode.BadRequest, "Invalid ID format"); return@get }
+            val instance = repository.getInstance(id)
+            if (instance == null) { call.respond(HttpStatusCode.NotFound, "Instance not found"); return@get }
+            try {
+                val dbSchema = it.sebi.service.buildDbSchemaForInstance(instance)
+                if (dbSchema == null) { call.respond(HttpStatusCode.BadRequest, "Schema not available for this instance"); return@get }
+                val cache = exportSourcePrefetch(instance, dbSchema)
+
+                val baos = ByteArrayOutputStream()
+                ZipOutputStream(baos).use { zos ->
+                    // schema.json
+                    run {
+                        val json = JsonParser.encodeToString(InstanceSchemaExport.serializer(), InstanceSchemaExport(schema = dbSchema))
+                        val entry = ZipEntry("schema.json")
+                        zos.putNextEntry(entry)
+                        zos.write(json.toByteArray())
+                        zos.closeEntry()
+                    }
+                    // prefetch.json
+                    run {
+                        val json = JsonParser.encodeToString(it.sebi.service.ComparisonPrefetchCache.serializer(), cache)
+                        val entry = ZipEntry("prefetch.json")
+                        zos.putNextEntry(entry)
+                        zos.write(json.toByteArray())
+                        zos.closeEntry()
+                    }
+                }
+
+                val bytes = baos.toByteArray()
+                call.response.header(HttpHeaders.ContentDisposition, "attachment; filename=instance_${id}_bundle.zip")
+                call.respondBytes(bytes, ContentType.Application.Zip)
+            } catch (e: Exception) {
+                call.respond(HttpStatusCode.InternalServerError, e.message ?: "Error exporting bundle")
+            }
+        }
+
+        // Test DB connection for an instance
+        post("/{id}/test-db") {
+            val id = call.parameters["id"]?.toIntOrNull()
+            if (id == null) { call.respond(HttpStatusCode.BadRequest, "Invalid ID format"); return@post }
+            val instance = repository.getInstance(id)
+            if (instance == null) { call.respond(HttpStatusCode.NotFound, "Instance not found"); return@post }
+
+            if (instance.dbHost == null || instance.dbPort == null || instance.dbName == null || instance.dbUser == null || instance.dbPassword == null) {
+                call.respond(HttpStatusCode.OK, ConnectionTestResponse(false, "DB settings are incomplete for this instance"))
+                return@post
+            }
+            val dbUrl = "jdbc:postgresql://${instance.dbHost}:${instance.dbPort}/${instance.dbName}?${if (!instance.dbSchema.isNullOrBlank()) "currentSchema=${instance.dbSchema}" else ""}${if (!instance.dbSslMode.isNullOrBlank()) "&sslmode=${instance.dbSslMode}" else ""}"
+            try {
+                DriverManager.getConnection(dbUrl, instance.dbUser, instance.dbPassword).use { conn ->
+                    val ok = conn.isValid(2)
+                    if (ok) call.respond(HttpStatusCode.OK, ConnectionTestResponse(true, "DB connection successful"))
+                    else call.respond(HttpStatusCode.OK, ConnectionTestResponse(false, "DB connection failed"))
+                }
+            } catch (e: Exception) {
+                call.respond(HttpStatusCode.OK, ConnectionTestResponse(false, "DB connection error: ${e.message}"))
+            }
+        }
+
+        // Test Strapi login with username/password
+        post("/{id}/test-login") {
+            val id = call.parameters["id"]?.toIntOrNull()
+            if (id == null) { call.respond(HttpStatusCode.BadRequest, "Invalid ID format"); return@post }
+            val instance = repository.getInstance(id)
+            if (instance == null) { call.respond(HttpStatusCode.NotFound, "Instance not found"); return@post }
+            try {
+                val client = StrapiClient(instance)
+                client.getLoginToken()
+                call.respond(HttpStatusCode.OK, ConnectionTestResponse(true, "Login successful"))
+            } catch (e: Exception) {
+                call.respond(HttpStatusCode.OK, ConnectionTestResponse(false, "Login failed: ${e.message}"))
+            }
+        }
+
+        // Test API access via Access Token (apiKey)
+        post("/{id}/test-token") {
+            val id = call.parameters["id"]?.toIntOrNull()
+            if (id == null) { call.respond(HttpStatusCode.BadRequest, "Invalid ID format"); return@post }
+            val instance = repository.getInstance(id)
+            if (instance == null) { call.respond(HttpStatusCode.NotFound, "Instance not found"); return@post }
+            try {
+                val client = StrapiClient(instance)
+                client.getContentTypes()
+                call.respond(HttpStatusCode.OK, ConnectionTestResponse(true, "API token works"))
+            } catch (e: Exception) {
+                call.respond(HttpStatusCode.OK, ConnectionTestResponse(false, "API token failed: ${e.message}"))
             }
         }
 
