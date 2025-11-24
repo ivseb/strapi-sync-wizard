@@ -451,7 +451,12 @@ private fun cleanArray(arr: JsonArray): JsonArray = JsonArray(
     arr.map { cleanValue(it) }
         .let { items ->
             if (items.any { it is JsonObject && it.containsKey("__order") }) {
-                items.sortedBy { (it as? JsonObject)?.get("__order")?.jsonPrimitive?.doubleOrNull ?: Double.MAX_VALUE }
+                items.sortedBy { (it as? JsonObject)?.get("__order")?.jsonPrimitive?.intOrNull ?: Int.MAX_VALUE }.map {
+                    val o = it.jsonObject.toMutableMap()
+                    val order = o["__order"]?.jsonPrimitive
+                    o["__order"] = JsonPrimitive(order?.intOrNull?:order?.doubleOrNull?.toInt())
+                    JsonObject(o)
+                }
             } else {
                 items
             }
@@ -1085,8 +1090,8 @@ fun compareSingleType(
             sourceObjMap.remove("document_id")
 
 
-            val sourceObjToCompare = JsonObject(sourceObjMap)
-            val targetObjMap = targetObj!!.cleanData.toMutableMap()
+
+            val targetObjMap = cleanObject(targetObj!!.cleanData).toMutableMap()
             targetObjMap.remove("document_id")
 
             sourceObjMap["__links"]?.jsonObject?.entries?.map {  fieldValues ->
@@ -1098,7 +1103,7 @@ fun compareSingleType(
 
             }?.let { sourceObjMap["__links"] = JsonObject(it.toMap()) }
 
-
+            val sourceObjToCompare =  cleanObject(JsonObject(sourceObjMap))
             val targetObjToCompare = JsonObject(targetObjMap)
             if (sourceObjToCompare == targetObjToCompare) ContentTypeComparisonResultKind.IDENTICAL else ContentTypeComparisonResultKind.DIFFERENT
         }
