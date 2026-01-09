@@ -3,6 +3,7 @@ import {Card} from 'primereact/card';
 import {DataTable} from 'primereact/datatable';
 import {Column} from 'primereact/column';
 import {Badge} from 'primereact/badge';
+import {InputText} from 'primereact/inputtext';
 import {
     ContentTypeComparisonResultKind,
     ContentTypeComparisonResultWithRelationships,
@@ -27,6 +28,7 @@ interface SummaryUtils {
     differenceSelected: number;
     differenceCount: number;
     identical: number;
+    excluded: number;
 }
 
 const ContentTypesSummaryTable: React.FC<Props> = ({
@@ -36,7 +38,7 @@ const ContentTypesSummaryTable: React.FC<Props> = ({
                                                        selections,
                                                    }) => {
 
-
+    const [globalFilter, setGlobalFilter] = React.useState<string>('');
     const state:SummaryUtils[] = Object.keys(collectionTypes).map(contentType => {
         const items = collectionTypes[contentType];
 
@@ -49,7 +51,8 @@ const ContentTypesSummaryTable: React.FC<Props> = ({
                 onlyInTargetCount: 0,
                 differenceSelected: 0,
                 differenceCount: 0,
-                identical: 0
+                identical: 0,
+                excluded: 0
             }
         }
         const tableSelections = selections.find(x => x.tableName === items[0].tableName)?.selections;
@@ -66,6 +69,7 @@ const ContentTypesSummaryTable: React.FC<Props> = ({
             return difference.includes(x.documentId)
         }).length || 0
         const identical = items.filter(i => i.compareState === ContentTypeComparisonResultKind.IDENTICAL).map(i => i.id);
+        const excluded = items.filter(i => i.compareState === ContentTypeComparisonResultKind.EXCLUDED).map(i => i.id);
 
 
         return {
@@ -76,14 +80,26 @@ const ContentTypesSummaryTable: React.FC<Props> = ({
             onlyInTargetCount: onlyInTarget.length,
             differenceSelected: differenceSelectionCount,
             differenceCount: difference.length,
-            identical: identical.length
+            identical: identical.length,
+            excluded: excluded.length
         } as SummaryUtils;
     })
 
     return (
         <div className="mb-4">
             <Card>
-                <h4>Content Types</h4>
+                <div className="flex justify-content-between align-items-center mb-3">
+                    <h4 className="m-0">Content Types</h4>
+                    <span className="p-input-icon-left">
+                        <i className="pi pi-search" />
+                        <InputText
+                            type="search"
+                            value={globalFilter}
+                            onChange={(e) => setGlobalFilter(e.target.value)}
+                            placeholder="Cerca..."
+                        />
+                    </span>
+                </div>
                 <DataTable
                     value={state}
                     selectionMode="single"
@@ -92,6 +108,8 @@ const ContentTypesSummaryTable: React.FC<Props> = ({
                     dataKey="contentType"
                     className="mb-3"
                     paginator
+                    globalFilter={globalFilter}
+                    globalFilterFields={['contentType']}
                     rows={5}
                     rowsPerPageOptions={[5, 10, 25, 50]}
                 >
@@ -133,6 +151,8 @@ const ContentTypesSummaryTable: React.FC<Props> = ({
                     />
                     <Column header="Identical"
                             body={(rowData: SummaryUtils) => <Badge value={rowData.identical} severity="success"/>}/>
+                    <Column header="Excluded"
+                            body={(rowData: SummaryUtils) => <Badge value={rowData.excluded} severity="info"/>}/>
                 </DataTable>
             </Card>
         </div>

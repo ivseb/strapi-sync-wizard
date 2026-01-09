@@ -85,7 +85,8 @@ export enum ContentTypeComparisonResultKind {
     ONLY_IN_SOURCE = "ONLY_IN_SOURCE",
     ONLY_IN_TARGET = "ONLY_IN_TARGET",
     DIFFERENT = "DIFFERENT",
-    IDENTICAL = "IDENTICAL"
+    IDENTICAL = "IDENTICAL",
+    EXCLUDED = "EXCLUDED"
 }
 
 // File-related types for merge requests

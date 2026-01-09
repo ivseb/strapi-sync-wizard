@@ -85,6 +85,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                     schemaTable.metadata!!.queryName,
                     dataToCreate,
                     entry.kind,
+                    sourceContent.metadata.documentId,
                     targetDocumentId
                 )
                 // No status change on success; already marked earlier
@@ -310,6 +311,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                         contentTypeSchema.metadata!!.queryName,
                         dataToCreate,
                         StrapiContentTypeKind.SingleType,
+                        sourceEntry.metadata.documentId,
                         comparisonResult.targetContent?.metadata?.documentId
                     )
                     val data = response["data"]?.jsonObject
@@ -449,6 +451,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                         contentTypeSchema.metadata!!.queryName,
                         dataToCreate,
                         StrapiContentTypeKind.CollectionType,
+                        sourceContent.metadata.documentId,
                         entry.targetContent?.metadata?.documentId
                     )
                     val data = response["data"]?.jsonObject

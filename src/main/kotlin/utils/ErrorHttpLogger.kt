@@ -13,7 +13,7 @@ object ErrorHttpLogger {
     private val dateFolderFmt = DateTimeFormatter.ofPattern("yyyy-MM-dd")
     private val tsFmt = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss_SSS")
 
-    fun writeHttpError(
+    fun writeHttpLog(
         dataRootFolder: String,
         mergeRequestId: Int,
         role: String, // "source" | "target"
@@ -26,16 +26,20 @@ object ErrorHttpLogger {
         responseStatus: String? = null, // e.g. "400 Bad Request"
         responseHeaders: Map<String, String>? = null,
         responseBody: String? = null,
-        errorMessage: String? = null
+        errorMessage: String? = null,
+        identifier: String? = null // e.g. documentId
     ) {
         try {
             val now = LocalDateTime.now()
             val dateFolder = now.format(dateFolderFmt)
             val ts = now.format(tsFmt)
             val mrFolder = File(dataRootFolder, "merge_request_$mergeRequestId")
-            val outDir = File(mrFolder, "errors/${role.lowercase()}/${callType.lowercase()}/$dateFolder")
+            
+            // Structure: merge_request_<id>/logs/<role>/<identifier or call_type>/<yyyy-MM-dd>/<timestamp>_<method>.http
+            val idDir = identifier?.replace(":", "_") ?: callType.lowercase()
+            val outDir = File(mrFolder, "logs/${role.lowercase()}/$idDir/$dateFolder")
             if (!outDir.exists()) outDir.mkdirs()
-            val outFile = File(outDir, "${ts}_${callType.lowercase()}.http")
+            val outFile = File(outDir, "${ts}_${method.lowercase()}.http")
 
             val sb = StringBuilder()
             // Request section

@@ -19,9 +19,12 @@ import {groupByToArray, GroupEntry} from '../../utils/arrayGroupingUtilities';
 import {DataTable} from "primereact/datatable";
 import {Column} from "primereact/column";
 import {Badge} from "primereact/badge";
+import {InputText} from "primereact/inputtext";
 import RelationshipCard from "../common/RelationshipCard";
 import {buildRelationshipsFromLinks, isComparisonItemResolved, RelationshipStatus} from "../../utils/entryUtils";
 import ManualCollectionMapper from './components/ManualCollectionMapper';
+import ExclusionsManager from './components/ExclusionsManager';
+import axios from 'axios';
 
 
 interface MergeSingleTypesStepProps {
@@ -65,6 +68,7 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
 
     const [contentTypes, setContentTypes] = useState<ContentTypeWithRelationStatus[]>([]);
     const [activeTabIndex, setActiveTabIndex] = useState<number>(0);
+    const [globalFilter, setGlobalFilter] = useState<string>('');
     // Removed modal-related state variables
 
     // State for expanded rows
@@ -84,9 +88,12 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
     const [originalContent, setOriginalContent] = useState<any>(null);
     const [modifiedContent, setModifiedContent] = useState<any>(null);
     const [editorDialogHeader, setEditorDialogHeader] = useState<string>("View Content");
+    const [editorTargetInfo, setEditorTargetInfo] = useState<{contentType: string, documentId: string} | null>(null);
+    const [httpLogs, setHttpLogs] = useState<{fileName: string, content: string, timestamp: string}[] | undefined>(undefined);
 
     // Manual mapping dialog visibility (for collections)
     const [showManualMapper, setShowManualMapper] = useState<boolean>(false);
+    const [showExclusionsManager, setShowExclusionsManager] = useState<boolean>(false);
 
     // Use refs to track the latest values for the cleanup function
     const errorRef = useRef(error);
@@ -212,14 +219,29 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
 
 
     // Function to open the editor dialog
-    const openEditorDialog = (content: any, isDiff: boolean = false, source: any = null, target: any = null, header: string = "View Content") => {
+    const openEditorDialog = (content: any, isDiff: boolean = false, source: any = null, target: any = null, header: string = "View Content", contentType?: string, documentId?: string) => {
+        const id = documentId || source?.metadata?.documentId || target?.metadata?.documentId;
+        if (id) {
+            axios.get(`/api/merge-requests/${mergeRequestId}/logs?identifier=${id}`)
+                .then(res => setHttpLogs(res.data))
+                .catch(err => console.error("Error fetching logs", err));
+        } else {
+            setHttpLogs(undefined);
+        }
+
         if (isDiff) {
             setIsDiffEditor(true);
             setOriginalContent(source);
             setModifiedContent(target);
+            if (contentType && documentId) {
+                setEditorTargetInfo({contentType, documentId});
+            } else {
+                setEditorTargetInfo(null);
+            }
         } else {
             setIsDiffEditor(false);
             setEditorContent(content);
+            setEditorTargetInfo(null);
         }
         setEditorDialogHeader(header);
         setEditorDialogVisible(true);
@@ -313,8 +335,11 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
 
 
     const updateTabHeader = (options: any, kind: ContentTypeComparisonResultKind, size: number, selectionSize: number) => {
+        let color = '';
+        if (kind === ContentTypeComparisonResultKind.EXCLUDED) color = 'var(--blue-500)';
+        
         return (
-            <div className="flex align-items-center gap-2 p-3" style={{cursor: 'pointer'}} onClick={options.onClick}>
+            <div className="flex align-items-center gap-2 p-3" style={{cursor: 'pointer', color: color}} onClick={options.onClick}>
                 {selectionSize > 0 && <Badge
                     value={selectionSize}
                     severity="warning" className="ml-2"/>}
@@ -347,15 +372,33 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
             </p>
             <Message severity="info" className="mb-3" content={messageContent}/>
 
-            {kind === StrapiContentTypeKind.CollectionType && (
-                <div className="flex justify-content-end mb-3">
-                    <Button
-                        label="Associa manualmente"
-                        icon="pi pi-link"
-                        onClick={() => setShowManualMapper(true)}
+            <div className="flex justify-content-between align-items-center mb-3">
+                <span className="p-input-icon-left w-20rem">
+                    <i className="pi pi-search" />
+                    <InputText
+                        type="search"
+                        value={globalFilter}
+                        onChange={(e) => setGlobalFilter(e.target.value)}
+                        placeholder="Ricerca globale..."
+                        className="w-full"
+                    />
+                </span>
+                <div className="flex gap-2">
+                    {kind === StrapiContentTypeKind.CollectionType && (
+                        <Button
+                            label="Associa manualmente"
+                            icon="pi pi-link"
+                            onClick={() => setShowManualMapper(true)}
+                        />
+                    )}
+                    <Button 
+                        label="Gestisci vincoli"
+                        icon="pi pi-ban"
+                        severity="warning"
+                        onClick={() => setShowExclusionsManager(true)}
                     />
                 </div>
-            )}
+            </div>
 
             <TabView activeIndex={activeTabIndex} onTabChange={(e) => setActiveTabIndex(e.index)}>
                 {groupedElements.map((group: GroupEntry<ContentTypeComparisonResultKind, ContentTypeWithRelationStatus>) => {
@@ -426,6 +469,14 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
                             }}
                             dataKey="content.id"
                             paginator
+                            globalFilter={globalFilter}
+                            globalFilterFields={[
+                                'content.tableName',
+                                'content.sourceContent.metadata.documentId',
+                                'content.targetContent.metadata.documentId',
+                                'content.sourceContent.metadata.uniqueId',
+                                'content.targetContent.metadata.uniqueId'
+                            ]}
                             rows={5}
                             rowsPerPageOptions={[5, 10, 25, 50]}
                             emptyMessage="No content types to update"
@@ -466,9 +517,37 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
                                     label="View Differences"
                                     icon="pi pi-eye"
                                     className="p-button-text"
-                                    onClick={() => openEditorDialog(null, true, rowData.content.sourceContent?.cleanData, rowData.content.targetContent?.cleanData, "View Differences")}
+                                    onClick={() => {
+                                        const docId = rowData.content.sourceContent?.metadata?.documentId || rowData.content.targetContent?.metadata?.documentId;
+                                        openEditorDialog(null, true, rowData.content.sourceContent?.cleanData, rowData.content.targetContent?.cleanData, "View Differences", rowData.content.contentType, docId);
+                                    }}
                                 />
                             )} style={{width: '12rem'}}/>
+                            <Column header="Azioni" body={(rowData: ContentTypeWithRelationStatus) => (
+                                <Button 
+                                    icon="pi pi-ban" 
+                                    className="p-button-text p-button-warning"
+                                    tooltip="Escludi questa entità dalla sincronizzazione (vincolo ambientale)"
+                                    onClick={async () => {
+                                        const docId = rowData.content.sourceContent?.metadata?.documentId || rowData.content.targetContent?.metadata?.documentId;
+                                        if (!docId) return;
+                                        if (!window.confirm(`Vuoi escludere l'entità ${docId} dalla sincronizzazione per sempre?`)) return;
+                                        try {
+                                            setUpdateTableLoading(true);
+                                            await axios.post(`/api/merge-requests/${mergeRequestId}/exclusions`, {
+                                                contentType: rowData.content.contentType,
+                                                documentId: docId
+                                            });
+                                            if (onSaved) await onSaved();
+                                        } catch (e) {
+                                            console.error('Errore durante l\'esclusione dell\'entità', e);
+                                            alert("Errore durante l'esclusione dell'entità");
+                                        } finally {
+                                            setUpdateTableLoading(false);
+                                        }
+                                    }}
+                                />
+                            )} style={{width: '5rem'}} />
                         </DataTable>
                     </TabPanel>
                 })}
@@ -487,12 +566,34 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
             {/* Editor Dialog */}
             <EditorDialog
                 visible={editorDialogVisible}
-                onHide={() => setEditorDialogVisible(false)}
+                onHide={() => {
+                    setEditorDialogVisible(false);
+                    setHttpLogs(undefined);
+                }}
                 header={editorDialogHeader}
                 content={editorContent}
                 isDiff={isDiffEditor}
                 originalContent={originalContent}
                 modifiedContent={modifiedContent}
+                httpLogs={httpLogs}
+                onExcludePath={async (path) => {
+                    if (!editorTargetInfo) return;
+                    if (!window.confirm(`Vuoi escludere il campo '${path}' per questa entità?`)) return;
+                    try {
+                        setUpdateTableLoading(true);
+                        await axios.post(`/api/merge-requests/${mergeRequestId}/exclusions`, {
+                            contentType: editorTargetInfo.contentType,
+                            documentId: editorTargetInfo.documentId,
+                            fieldPath: path
+                        });
+                        if (onSaved) await onSaved();
+                    } catch (e) {
+                        console.error('Errore durante l\'esclusione del path', e);
+                        alert("Errore durante l'esclusione del path");
+                    } finally {
+                        setUpdateTableLoading(false);
+                    }
+                }}
             />
 
             {/* Manual mapper for collections */}
@@ -507,6 +608,13 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
                     onSaved={onSaved}
                 />
             )}
+
+            <ExclusionsManager 
+                visible={showExclusionsManager}
+                onHide={() => setShowExclusionsManager(false)}
+                mergeRequestId={mergeRequestId}
+                onExclusionsChanged={() => onSaved && onSaved()}
+            />
 
             {/* Modals removed to simplify workflow */}
         </div>

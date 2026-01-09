@@ -57,6 +57,8 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
     const [selectedTable, setSelectedTable] = useState<string | null>(null);
     const [sourceFilter, setSourceFilter] = useState('');
     const [targetFilter, setTargetFilter] = useState('');
+    const [globalFilter, setGlobalFilter] = useState<string>('');
+    const [savedGlobalFilter, setSavedGlobalFilter] = useState<string>('');
 
     const [selectedSource, setSelectedSource] = useState<ContentTypeComparisonResultWithRelationships | null>(null);
     const [selectedTarget, setSelectedTarget] = useState<ContentTypeComparisonResultWithRelationships | null>(null);
@@ -193,6 +195,7 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
         try {
             setSaving(true);
 
+
             const items: {
                 contentType: string;
                 sourceDocumentId: string;
@@ -201,7 +204,7 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
                 targetId:number
                 locale: string | null | undefined
             }[] = queue.map(p => ({
-                contentType: p.contentTypeUid,
+                contentType: p.contentTypeUid === 'files' ?   'plugin::upload.file' : p.contentTypeUid,
                 sourceDocumentId: p.sourceDocumentId,
                 targetDocumentId: p.targetDocumentId,
                 sourceId: p.sourceId,
@@ -257,6 +260,16 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
                               placeholder="Select a collection" className="w-20rem"/>
                 )}
                 <span className="text-500">Abbina record ONLY_IN_SOURCE con record ONLY_IN_TARGET.</span>
+                <div className="ml-auto">
+                    <span className="p-input-icon-left">
+                        <i className="pi pi-search" />
+                        <InputText 
+                            value={activeTab === 0 ? globalFilter : savedGlobalFilter} 
+                            onChange={(e) => activeTab === 0 ? setGlobalFilter(e.target.value) : setSavedGlobalFilter(e.target.value)} 
+                            placeholder="Ricerca globale..." 
+                        />
+                    </span>
+                </div>
             </div>
 
             <TabView activeIndex={activeTab} onTabChange={(e) => setActiveTab(e.index)}>
@@ -273,6 +286,14 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
                             </span>
                             <DataTable value={sourceCandidates} selectionMode="single" selection={selectedSource}
                                        onSelectionChange={(e) => setSelectedSource(e.value as ContentTypeComparisonResultWithRelationships | null)} dataKey="id" paginator rows={5}
+                                       globalFilter={globalFilter}
+                                       globalFilterFields={[
+                                           'sourceContent.metadata.documentId',
+                                           'sourceContent.metadata.uniqueId',
+                                           'sourceContent.rawData.name',
+                                           'sourceContent.rawData.title',
+                                           'sourceContent.rawData.filename'
+                                       ]}
                                        className="text-sm">
                                 <Column field="id" header="Doc ID" body={(r: any) => r.sourceContent?.metadata?.documentId}/>
                                 <Column header="Preview" body={repAttrsBody}/>
@@ -291,6 +312,14 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
                             </span>
                             <DataTable value={targetCandidates} selectionMode="single" selection={selectedTarget}
                                        onSelectionChange={(e) => setSelectedTarget(e.value as ContentTypeComparisonResultWithRelationships | null)} dataKey="id" paginator rows={5}
+                                       globalFilter={globalFilter}
+                                       globalFilterFields={[
+                                           'targetContent.metadata.documentId',
+                                           'targetContent.metadata.uniqueId',
+                                           'targetContent.rawData.name',
+                                           'targetContent.rawData.title',
+                                           'targetContent.rawData.filename'
+                                       ]}
                                        className="text-sm">
                                 <Column field="id" header="Doc ID" body={(r: any) => r.targetContent?.metadata?.documentId}/>
                                 <Column header="Preview" body={repAttrsBody}/>
@@ -342,7 +371,10 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
                     </div>
                 </TabPanel>
                 <TabPanel header="Associazioni salvate">
-                    <DataTable value={savedMappings} loading={loadingSaved} emptyMessage="Nessuna associazione salvata" className="text-sm">
+                    <DataTable value={savedMappings} loading={loadingSaved} emptyMessage="Nessuna associazione salvata" 
+                               paginator rows={5} globalFilter={savedGlobalFilter}
+                               globalFilterFields={['sourceDocumentId', 'targetDocumentId']}
+                               className="text-sm">
                         <Column field="sourceDocumentId" header="Source Doc" body={(r: SavedMappingDTO) => (
                             <span className="flex align-items-center gap-2"><Badge value="S" severity="info"/>{r.sourceDocumentId}</span>
                         )}/>

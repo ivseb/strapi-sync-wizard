@@ -44,32 +44,54 @@ object FileFingerprintUtil {
         .digest(bytes)
         .joinToString("") { "%02x".format(it) }
 
+    fun hammingDistance(h1: String, h2: String): Int {
+        val hex1 = h1.takeWhile { it != '-' }
+        val hex2 = h2.takeWhile { it != '-' }
+        if (hex1.length != hex2.length) return Int.MAX_VALUE
+        
+        var distance = 0
+        for (i in hex1.indices) {
+            val v1 = hex1[i].digitToInt(16)
+            val v2 = hex2[i].digitToInt(16)
+            distance += Integer.bitCount(v1 xor v2)
+        }
+        return distance
+    }
+
     /**
-     * Compute a 64-bit dHash for image bytes and encode as 16-char hex string.
+     * Compute a 256-bit dHash for image bytes and encode as 64-char hex string.
+     * Increased resolution (17x16) to reduce collisions on simple images.
      */
     private fun dHash64Hex(bytes: ByteArray): String {
         val img = ImageIO.read(ByteArrayInputStream(bytes)) ?: throw IllegalArgumentException("Invalid image")
-        // Scale to 9x8 grayscale
-        val scaled = BufferedImage(9, 8, BufferedImage.TYPE_BYTE_GRAY)
+        val width = img.width
+        val height = img.height
+        
+        // Scale to 17x16 grayscale
+        val scaled = BufferedImage(17, 16, BufferedImage.TYPE_BYTE_GRAY)
         val g = scaled.graphics
         try {
-            g.drawImage(img.getScaledInstance(9, 8, Image.SCALE_SMOOTH), 0, 0, 9, 8, Color(0, 0, 0), null)
+            g.drawImage(img.getScaledInstance(17, 16, Image.SCALE_SMOOTH), 0, 0, 17, 16, Color(0, 0, 0), null)
         } finally {
             g.dispose()
         }
-        var hash = 0UL
-        var bit = 0
-        for (y in 0 until 8) {
-            for (x in 0 until 8) { // compare pixel (x) vs (x+1)
+        
+        val hashBuilder = StringBuilder()
+        for (y in 0 until 16) {
+            var rowHash = 0L
+            for (x in 0 until 16) { // compare pixel (x) vs (x+1)
                 val left = scaled.getRGB(x, y) and 0xFF
                 val right = scaled.getRGB(x + 1, y) and 0xFF
                 if (left > right) {
-                    hash = hash or (1UL shl bit)
+                    rowHash = rowHash or (1L shl x)
                 }
-                bit++
             }
+            hashBuilder.append("%04x".format(rowHash))
         }
-        return hash.toString(16).padStart(16, '0')
+        
+        // Append original dimensions to fingerprint to further distinguish similar images
+        val metadataSuffix = "-${width}x${height}"
+        return hashBuilder.toString() + metadataSuffix
     }
 
     /**

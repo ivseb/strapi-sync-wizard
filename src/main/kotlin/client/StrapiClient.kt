@@ -208,7 +208,7 @@ class StrapiClient(
     var currentMergeRequestId: Int? = null
     var dataRootFolder: String? = null
 
-    private suspend fun logHttpFailure(
+    private suspend fun logHttpRequest(
         callType: String,
         method: String,
         url: String,
@@ -216,22 +216,25 @@ class StrapiClient(
         requestHeaders: Map<String, String> = emptyMap(),
         requestBody: String? = null,
         resp: HttpResponse? = null,
-        error: Throwable? = null
+        error: Throwable? = null,
+        identifier: String? = null,
+        responseStatus: String? = null,
+        responseBody: String? = null
     ) {
         val mrId = currentMergeRequestId
         val dataRoot = dataRootFolder
         if (mrId == null || dataRoot.isNullOrBlank()) return
-        val statusStr = try {
+        val statusStr = responseStatus ?: try {
             resp?.let { "${it.status.value} ${it.status.description}" }
         } catch (_: Exception) { null }
         val respHeaders: Map<String, String>? = try {
             resp?.headers?.entries()?.associate { it.key to it.value.joinToString(",") }
         } catch (_: Exception) { null }
-        val respBody: String? = try {
+        val bodyStr = responseBody ?: try {
             resp?.bodyAsText()
         } catch (_: Exception) { null }
         val errMsg = error?.localizedMessage
-        ErrorHttpLogger.writeHttpError(
+        ErrorHttpLogger.writeHttpLog(
             dataRootFolder = dataRoot,
             mergeRequestId = mrId,
             role = role,
@@ -243,8 +246,9 @@ class StrapiClient(
             requestBody = requestBody,
             responseStatus = statusStr,
             responseHeaders = respHeaders,
-            responseBody = respBody,
-            errorMessage = errMsg
+            responseBody = bodyStr,
+            errorMessage = errMsg,
+            identifier = identifier
         )
     }
 
@@ -275,7 +279,7 @@ class StrapiClient(
             StrapiClientTokenCache.setCacheForClient(clientHash, response.data, now)
             return response.data
         } catch (e: ClientRequestException) {
-            logHttpFailure(
+            logHttpRequest(
                 callType = "admin_login",
                 method = "POST",
                 url = url,
@@ -287,7 +291,7 @@ class StrapiClient(
             )
             throw e
         } catch (e: ServerResponseException) {
-            logHttpFailure(
+            logHttpRequest(
                 callType = "admin_login",
                 method = "POST",
                 url = url,
@@ -341,7 +345,7 @@ class StrapiClient(
                     parameter("pageSize", 50)
                 }.body()
             } catch (e: ClientRequestException) {
-                logHttpFailure(
+                logHttpRequest(
                     callType = "get_files",
                     method = "GET",
                     url = url,
@@ -351,7 +355,7 @@ class StrapiClient(
                 )
                 throw e
             } catch (e: ServerResponseException) {
-                logHttpFailure(
+                logHttpRequest(
                     callType = "get_files",
                     method = "GET",
                     url = url,
@@ -388,7 +392,7 @@ class StrapiClient(
                 headers { append(HttpHeaders.Authorization, "Bearer $token") }
             }.body()
         } catch (e: ClientRequestException) {
-            logHttpFailure(
+            logHttpRequest(
                 callType = "get_folders",
                 method = "GET",
                 url = url,
@@ -398,7 +402,7 @@ class StrapiClient(
             )
             throw e
         } catch (e: ServerResponseException) {
-            logHttpFailure(
+            logHttpRequest(
                 callType = "get_folders",
                 method = "GET",
                 url = url,
@@ -455,7 +459,7 @@ class StrapiClient(
                 setBody(bodyObj)
             }.body<JsonObject>()
         } catch (e: ClientRequestException) {
-            logHttpFailure(
+            logHttpRequest(
                 callType = "folder_create",
                 method = "POST",
                 url = url,
@@ -467,7 +471,7 @@ class StrapiClient(
             )
             throw e
         } catch (e: ServerResponseException) {
-            logHttpFailure(
+            logHttpRequest(
                 callType = "folder_create",
                 method = "POST",
                 url = url,
@@ -513,7 +517,7 @@ class StrapiClient(
             return file
         } catch (e: ClientRequestException) {
             val dlUrl = if (url.startsWith("http")) url else strapiImage.downloadUrl(baseUrl)
-            logHttpFailure(
+            logHttpRequest(
                 callType = "file_download",
                 method = "GET",
                 url = dlUrl,
@@ -524,7 +528,7 @@ class StrapiClient(
             throw e
         } catch (e: ServerResponseException) {
             val dlUrl = if (url.startsWith("http")) url else strapiImage.downloadUrl(baseUrl)
-            logHttpFailure(
+            logHttpRequest(
                 callType = "file_download",
                 method = "GET",
                 url = dlUrl,
@@ -572,7 +576,7 @@ class StrapiClient(
                 headers { append(HttpHeaders.Authorization, "Bearer $token") }
             }
         } catch (e: ClientRequestException) {
-            logHttpFailure(
+            logHttpRequest(
                 callType = "file_upload",
                 method = "POST",
                 url = url,
@@ -584,7 +588,7 @@ class StrapiClient(
             )
             throw e
         } catch (e: ServerResponseException) {
-            logHttpFailure(
+            logHttpRequest(
                 callType = "file_upload",
                 method = "POST",
                 url = url,
@@ -628,7 +632,7 @@ class StrapiClient(
             if (e.response.status == HttpStatusCode.NotFound) {
                 JsonObject(emptyMap())
             } else {
-                logHttpFailure(
+                logHttpRequest(
                     callType = "file_delete",
                     method = "DELETE",
                     url = "$baseUrl/api/upload/files/$fileId",
@@ -639,7 +643,7 @@ class StrapiClient(
                 throw e
             }
         } catch (e: ServerResponseException) {
-            logHttpFailure(
+            logHttpRequest(
                 callType = "file_delete",
                 method = "DELETE",
                 url = "$baseUrl/api/upload/files/$fileId",
@@ -709,7 +713,7 @@ class StrapiClient(
                 setBody(bodyStr)
             }.body<JsonObject>()
         } catch (e: ClientRequestException) {
-            logHttpFailure(
+            logHttpRequest(
                 callType = "content_create",
                 method = method.value,
                 url = url,
@@ -721,7 +725,7 @@ class StrapiClient(
             )
             throw e
         } catch (e: ServerResponseException) {
-            logHttpFailure(
+            logHttpRequest(
                 callType = "content_create",
                 method = method.value,
                 url = url,
@@ -767,6 +771,7 @@ class StrapiClient(
         contentType: String,
         data: JsonObject,
         kind: StrapiContentTypeKind,
+        sourceDocumentId:String,
         targetDocumentId:String? = null
     ): JsonObject {
         val url = if (kind == StrapiContentTypeKind.SingleType) {
@@ -782,7 +787,7 @@ class StrapiClient(
 
         val method = if (kind == StrapiContentTypeKind.SingleType || targetDocumentId != null) HttpMethod.Put else HttpMethod.Post
         val bodyStr = buildJsonObject { put("data", data) }.toString()
-        return try {
+        val response: JsonObject = try {
             selector.getClientForUrl(url).request(url) {
                 this.method = method
                 headers {
@@ -792,7 +797,7 @@ class StrapiClient(
                 setBody(bodyStr)
             }.body()
         } catch (e: ClientRequestException) {
-            logHttpFailure(
+            logHttpRequest(
                 callType = "content_upsert",
                 method = method.value,
                 url = url,
@@ -800,11 +805,12 @@ class StrapiClient(
                 requestHeaders = mapOf("Content-Type" to "application/json"),
                 requestBody = bodyStr,
                 resp = e.response,
-                error = e
+                error = e,
+                identifier = sourceDocumentId
             )
             throw e
         } catch (e: ServerResponseException) {
-            logHttpFailure(
+            logHttpRequest(
                 callType = "content_upsert",
                 method = method.value,
                 url = url,
@@ -812,10 +818,25 @@ class StrapiClient(
                 requestHeaders = mapOf("Content-Type" to "application/json"),
                 requestBody = bodyStr,
                 resp = e.response,
-                error = e
+                error = e,
+                identifier = sourceDocumentId
             )
             throw e
         }
+
+        // Log successful request
+        logHttpRequest(
+            callType = "content_upsert",
+            method = method.value,
+            url = url,
+            authHeader = "Bearer $apiKey",
+            requestHeaders = mapOf("Content-Type" to "application/json"),
+            requestBody = bodyStr,
+            responseBody = response.toString(),
+            responseStatus = "200 OK", 
+            identifier = sourceDocumentId
+        )
+        return response
     }
 
     suspend fun deleteContentEntry(contentType: String, id: String, kind: String = "collectionType"): Boolean {
@@ -825,31 +846,46 @@ class StrapiClient(
             "$baseUrl/api/$contentType/$id"
         }
 
-        return try {
+        val success = try {
             selector.getClientForUrl(url).delete(url) {
                 headers { append(HttpHeaders.Authorization, "Bearer $apiKey") }
             }.status.isSuccess()
         } catch (e: ClientRequestException) {
-            logHttpFailure(
+            logHttpRequest(
                 callType = "content_delete",
                 method = "DELETE",
                 url = url,
                 authHeader = "Bearer $apiKey",
                 resp = e.response,
-                error = e
+                error = e,
+                identifier = id // Per i DELETE l'id è tipicamente il documentId o l'id numerico a seconda di come viene chiamato
             )
             throw e
         } catch (e: ServerResponseException) {
-            logHttpFailure(
+            logHttpRequest(
                 callType = "content_delete",
                 method = "DELETE",
                 url = url,
                 authHeader = "Bearer $apiKey",
                 resp = e.response,
-                error = e
+                error = e,
+                identifier = id
             )
             throw e
         }
+        
+        // Log successful deletion
+        if (success) {
+            logHttpRequest(
+                callType = "content_delete",
+                method = "DELETE",
+                url = url,
+                authHeader = "Bearer $apiKey",
+                responseStatus = "200 OK",
+                identifier = id
+            )
+        }
+        return success
     }
 
 

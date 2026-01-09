@@ -65,7 +65,10 @@ enum class ContentTypeComparisonResultKind {
     DIFFERENT,
 
     @SerialName("IDENTICAL")
-    IDENTICAL
+    IDENTICAL,
+
+    @SerialName("EXCLUDED")
+    EXCLUDED
 }
 
 
@@ -185,7 +188,8 @@ data class ContentTypeComparisonResultMapWithRelationships(
     val files: List<ContentTypeFileComparisonResult> = listOf(),
     val singleTypes: Map<String, ContentTypeComparisonResultWithRelationships> = emptyMap(),
     val collectionTypes: Map<String, List<ContentTypeComparisonResultWithRelationships>> = emptyMap(),
-    val contentTypeRelationships: List<ContentRelationship> = emptyList()
+    val contentTypeRelationships: List<ContentRelationship> = emptyList(),
+    val exclusions: List<MergeRequestExclusion> = emptyList()
 )
 
 

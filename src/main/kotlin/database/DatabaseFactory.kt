@@ -6,10 +6,7 @@ import com.zaxxer.hikari.HikariDataSource
 import io.ktor.server.application.*
 import io.ktor.server.config.*
 import io.ktor.util.logging.*
-import it.sebi.tables.MergeRequestDocumentMappingTable
-import it.sebi.tables.MergeRequestSelectionsTable
-import it.sebi.tables.MergeRequestsTable
-import it.sebi.tables.StrapiInstancesTable
+import it.sebi.tables.*
 import kotlinx.coroutines.Dispatchers
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
@@ -32,7 +29,9 @@ object DatabaseFactory {
                     StrapiInstancesTable,
                     MergeRequestsTable,
                     MergeRequestDocumentMappingTable,
-                    MergeRequestSelectionsTable
+                    MergeRequestSelectionsTable,
+                    MergeRequestExclusionTable,
+                    FileAnalysisCacheTable
                 )
             }
         }
@@ -55,7 +54,9 @@ fun Application.initDatabaseConnection() {
             StrapiInstancesTable,
             MergeRequestsTable,
             MergeRequestDocumentMappingTable,
-            MergeRequestSelectionsTable
+            MergeRequestSelectionsTable,
+            MergeRequestExclusionTable,
+            FileAnalysisCacheTable
         )
     }
 }

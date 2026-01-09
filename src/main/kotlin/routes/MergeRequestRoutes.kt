@@ -209,6 +209,45 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
             }
         }
 
+        // Exclusions management
+        route("/{id}/exclusions") {
+            get {
+                val id = call.parameters["id"]?.toIntOrNull()
+                    ?: return@get call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+                try {
+                    val res = mergeRequestService.getExclusionsList(id)
+                    call.respond(HttpStatusCode.OK, res)
+                } catch (e: Exception) {
+                    call.respond(HttpStatusCode.InternalServerError, ExclusionResponseDTO(success = false, message = e.message))
+                }
+            }
+
+            post {
+                val id = call.parameters["id"]?.toIntOrNull()
+                    ?: return@post call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+                val req = call.receive<ExclusionRequestDTO>()
+                try {
+                    val data = mergeRequestService.addExclusion(id, req)
+                    call.respond(HttpStatusCode.OK, ExclusionResponseDTO(success = true, data = emptyList()))
+                } catch (e: Exception) {
+                    call.respond(HttpStatusCode.InternalServerError, ExclusionResponseDTO(success = false, message = e.message))
+                }
+            }
+
+            delete("/{exclusionId}") {
+                val id = call.parameters["id"]?.toIntOrNull()
+                    ?: return@delete call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+                val exclusionId = call.parameters["exclusionId"]?.toIntOrNull()
+                    ?: return@delete call.respond(HttpStatusCode.BadRequest, "Invalid exclusion ID format")
+                try {
+                    val data = mergeRequestService.deleteExclusion(id, exclusionId)
+                    call.respond(HttpStatusCode.OK, ExclusionResponseDTO(success = true))
+                } catch (e: Exception) {
+                    call.respond(HttpStatusCode.InternalServerError, ExclusionResponseDTO(success = false, message = e.message))
+                }
+            }
+        }
+
         // Delete a single manual mapping by id
         delete("/{id}/mappings/{mappingId}") {
             val id = call.parameters["id"]?.toIntOrNull()
@@ -304,6 +343,34 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
                     HttpStatusCode.InternalServerError,
                     MergeResponse(success = false, message = e.message ?: "An error occurred while computing sync plan")
                 )
+            }
+        }
+
+        // Get HTTP logs for an entity
+        get("/{id}/logs") {
+            val id = call.parameters["id"]?.toIntOrNull()
+                ?: return@get call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+            val identifier = call.request.queryParameters["identifier"]
+                ?: return@get call.respond(HttpStatusCode.BadRequest, "Missing identifier")
+            val role = call.request.queryParameters["role"] ?: "target"
+            
+            try {
+                val logs = mergeRequestService.getHttpLogs(id, identifier, role)
+                call.respond(HttpStatusCode.OK, logs)
+            } catch (e: Exception) {
+                logger.error("Error fetching logs for merge request $id", e)
+                call.respond(HttpStatusCode.InternalServerError, "Error fetching logs: ${e.message}")
+            }
+        }
+
+        // Clear file analysis cache
+        post("/clear-file-cache") {
+            try {
+                mergeRequestService.clearFileAnalysisCache()
+                call.respond(HttpStatusCode.OK, mapOf("success" to true))
+            } catch (e: Exception) {
+                logger.error("Error clearing file analysis cache", e)
+                call.respond(HttpStatusCode.InternalServerError, mapOf("success" to false, "message" to e.message))
             }
         }
 

@@ -102,17 +102,33 @@ object ContentJsonUtils {
                 buildJsonObject {
                     val currentId = element["id"]?.jsonPrimitive?.intOrNull
                     val linkToAdd = linkToProcess.filter { !it.field.contains('.') && it.sourceId == (currentId ?: 0) }
+                    
+                    // Handle empty relations: find relation fields in schema that are NOT in linkToAdd
+                    currentSchema?.metadata?.columns?.filter { it.type == "relation" || it.type == "media" }?.forEach { col ->
+                        val normalizedColName = normalizeKeyName(col.name)
+                        val hasLinks = linkToAdd.any { normalizeKeyName(it.field) == normalizedColName }
+                        if (!hasLinks) {
+                            val mappedKey = currentResolver?.get(col.name) ?: convertToCamelCase(col.name)
+                            put(mappedKey, buildJsonObject { put("set", JsonArray(emptyList())) })
+                        }
+                    }
+
                     if (linkToAdd.isNotEmpty()) {
                         linkToAdd.groupBy { it.field }.forEach { (field, value) ->
-                            value.groupBy { it.targetTable }.forEach { (table, links) ->
-                                val normalized = normalizeKeyName(field)
-                                val mappedKey = currentResolver?.get(normalized+"s")?: currentResolver?.get(normalized) ?: convertToCamelCase(field)
+                            val normalized = normalizeKeyName(field)
+                            // IMPORTANT: Only add links for fields that actually exist in the Strapi metadata
+                            // to avoid "Invalid key" errors from Strapi for inverse or technical relations.
+                            val metadataCol = currentSchema?.metadata?.columns?.firstOrNull { normalizeKeyName(it.name) == normalized }
+                            
+                            if (metadataCol != null) {
+                                value.groupBy { it.targetTable }.forEach { (table, links) ->
+                                    val mappedKey = currentResolver?.get(normalized + "s") ?: currentResolver?.get(normalized) ?: convertToCamelCase(field)
 
-                                val linkMap: List<JsonElement> = links.mapNotNull { resolveTargetValue(it) }
-                                if(linkMap.isNotEmpty()){
-                                    put(mappedKey, buildJsonObject { put("set", JsonArray(linkMap))})
+                                    val linkMap: List<JsonElement> = links.mapNotNull { resolveTargetValue(it) }
+                                    if (linkMap.isNotEmpty()) {
+                                        put(mappedKey, buildJsonObject { put("set", JsonArray(linkMap)) })
+                                    }
                                 }
-
                             }
                         }
                     }

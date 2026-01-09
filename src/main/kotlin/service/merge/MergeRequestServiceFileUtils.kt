@@ -256,5 +256,90 @@ class MergeRequestServiceFileUtils(
         }
     }
 
+    suspend fun cleanupOldMergeRequests(keepCount: Int = 10) {
+        withContext(Dispatchers.IO) {
+            try {
+                val folder = File(dataFolder)
+                if (!folder.exists()) return@withContext
+                
+                val mrFolders = folder.listFiles { file -> 
+                    file.isDirectory && file.name.startsWith("merge_request_")
+                } ?: return@withContext
+                
+                if (mrFolders.size <= keepCount) return@withContext
+                
+                // Sort by ID (assuming ID reflects creation order)
+                val sortedFolders = mrFolders.sortedByDescending { folder ->
+                    folder.name.removePrefix("merge_request_").toIntOrNull() ?: 0
+                }
+                
+                val toDelete = sortedFolders.drop(keepCount)
+                toDelete.forEach { 
+                    logger.info("Cleaning up old merge request folder: ${it.name}")
+                    it.deleteRecursively() 
+                }
+            } catch (e: Exception) {
+                logger.error("Error cleaning up old merge requests: ${e.message}", e)
+            }
+        }
+    }
+
+    suspend fun getHttpLogs(id: Int, identifier: String, role: String): List<HttpLogEntry> {
+        return withContext(Dispatchers.IO) {
+            val mrFolder = File(dataFolder, "merge_request_$id")
+            val idDirName = identifier.replace(":", "_")
+            val roleDir = File(mrFolder, "logs/${role.lowercase()}")
+            
+            if (!roleDir.exists()) return@withContext emptyList<HttpLogEntry>()
+            
+            val result = mutableListOf<HttpLogEntry>()
+            
+            // Search in the specific identifier directory
+            val specificDir = File(roleDir, idDirName)
+            if (specificDir.exists()) {
+                collectLogsFromDir(specificDir, result)
+            }
+            
+            // Search also in generic directories like content_upsert and content_delete
+            // as some logs might be stored there if the identifier was not available at the time of logging
+            // or if the identifier passed doesn't match exactly.
+            val genericDirs = listOf("content_upsert", "content_delete")
+            genericDirs.forEach { dirName ->
+                val genericDir = File(roleDir, dirName)
+                if (genericDir.exists()) {
+                    collectLogsFromDir(genericDir, result, identifier)
+                }
+            }
+            
+            result.distinctBy { it.fileName }.sortedBy { it.timestamp }
+        }
+    }
+
+    private fun collectLogsFromDir(dir: File, result: MutableList<HttpLogEntry>, identifierToMatch: String? = null) {
+        dir.listFiles()?.forEach { dateDir ->
+            if (dateDir.isDirectory) {
+                dateDir.listFiles()?.forEach { logFile ->
+                    if (logFile.isFile && logFile.name.endsWith(".http")) {
+                        val content = logFile.readText()
+                        if (identifierToMatch == null || content.contains(identifierToMatch)) {
+                            result.add(HttpLogEntry(
+                                fileName = logFile.name,
+                                content = content,
+                                timestamp = logFile.name.substringBefore("_")
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 
 }
+
+@kotlinx.serialization.Serializable
+data class HttpLogEntry(
+    val fileName: String,
+    val content: String,
+    val timestamp: String
+)

@@ -8,7 +8,7 @@ import it.sebi.repository.MergeRequestRepository
 import it.sebi.repository.MergeRequestSelectionsRepository
 import it.sebi.service.merge.ContentMergeProcessor
 import it.sebi.service.merge.FileMergeProcessor
-import it.sebi.tables.MergeRequestDocumentMappingTable
+import it.sebi.tables.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -17,10 +17,9 @@ import org.jetbrains.exposed.v1.core.Op
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.isNull
-import org.jetbrains.exposed.v1.jdbc.deleteWhere
-import org.jetbrains.exposed.v1.jdbc.insert
-import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.*
 import org.slf4j.LoggerFactory
+import service.merge.HttpLogEntry
 import service.merge.MergeRequestServiceFileUtils
 
 /**
@@ -178,6 +177,62 @@ class MergeRequestService(
         return getAllMergeRequestData(mergeRequestId, false)
     }
 
+    // List exclusions for a merge request
+    suspend fun getExclusionsList(mergeRequestId: Int): ExclusionResponseDTO {
+        val mr = mergeRequestRepository.getMergeRequestWithInstances(mergeRequestId)
+            ?: throw IllegalArgumentException("Merge request not found")
+        val exclusions = MergeRequestExclusionTable.fetchExclusions(mr)
+        return ExclusionResponseDTO(success = true, data = exclusions)
+    }
+
+    // Add a new exclusion and recompute comparison
+    suspend fun addExclusion(mergeRequestId: Int, req: ExclusionRequestDTO): MergeRequestData? {
+        val mr = mergeRequestRepository.getMergeRequestWithInstances(mergeRequestId)
+            ?: throw IllegalArgumentException("Merge request not found")
+
+        dbQuery {
+            // Check if already exists
+            val existing = MergeRequestExclusionTable.selectAll().where {
+                (MergeRequestExclusionTable.sourceStrapiId eq mr.sourceInstance.id) and
+                        (MergeRequestExclusionTable.targetStrapiId eq mr.targetInstance.id) and
+                        (MergeRequestExclusionTable.contentType eq req.contentType) and
+                        (if (req.documentId != null) MergeRequestExclusionTable.documentId eq req.documentId else MergeRequestExclusionTable.documentId.isNull()) and
+                        (if (req.fieldPath != null) MergeRequestExclusionTable.fieldPath eq req.fieldPath else MergeRequestExclusionTable.fieldPath.isNull())
+            }.count()
+
+            if (existing == 0L) {
+                MergeRequestExclusionTable.insert {
+                    it[sourceStrapiId] = mr.sourceInstance.id
+                    it[targetStrapiId] = mr.targetInstance.id
+                    it[contentType] = req.contentType
+                    it[documentId] = req.documentId
+                    it[fieldPath] = req.fieldPath
+                }
+            }
+        }
+
+        // Recompute comparison to apply exclusions
+        compareContent(mr, CompareMode.Compare)
+        return getAllMergeRequestData(mergeRequestId, false)
+    }
+
+    // Remove an exclusion and recompute comparison
+    suspend fun deleteExclusion(mergeRequestId: Int, exclusionId: Int): MergeRequestData? {
+        val mr = mergeRequestRepository.getMergeRequestWithInstances(mergeRequestId)
+            ?: throw IllegalArgumentException("Merge request not found")
+
+        dbQuery {
+            MergeRequestExclusionTable.deleteWhere {
+                (MergeRequestExclusionTable.id eq exclusionId) and
+                        (MergeRequestExclusionTable.sourceStrapiId eq mr.sourceInstance.id) and
+                        (MergeRequestExclusionTable.targetStrapiId eq mr.targetInstance.id)
+            }
+        }
+
+        compareContent(mr, CompareMode.Compare)
+        return getAllMergeRequestData(mergeRequestId, false)
+    }
+
     // Load application configuration
 
 
@@ -315,13 +370,15 @@ class MergeRequestService(
                 Direction.TO_UPDATE
             }
 
-            ContentTypeComparisonResultKind.IDENTICAL -> return emptyList()
+            ContentTypeComparisonResultKind.IDENTICAL,
+            ContentTypeComparisonResultKind.EXCLUDED -> return emptyList()
         }
         val doc = when (e.compareState) {
             ContentTypeComparisonResultKind.ONLY_IN_SOURCE -> e.sourceContent?.metadata?.documentId
             ContentTypeComparisonResultKind.ONLY_IN_TARGET -> e.targetContent?.metadata?.documentId
             ContentTypeComparisonResultKind.DIFFERENT -> e.sourceContent?.metadata?.documentId
-            ContentTypeComparisonResultKind.IDENTICAL -> null
+            ContentTypeComparisonResultKind.IDENTICAL,
+            ContentTypeComparisonResultKind.EXCLUDED -> null
         } ?: return emptyList()
 
         val key = e.tableName to doc
@@ -816,9 +873,10 @@ class MergeRequestService(
 
         suspend fun computeAndPersist(prefetch: ComparisonPrefetch): ContentTypeComparisonResultMapWithRelationships {
             val comp = computeComparisonFromPrefetch(mergeRequest, schemas.extractedSchema!!, prefetch)
+            val finalComp = comp.copy(exclusions = prefetch.exclusions)
             mergeRequestRepository.updateComparisonData(mergeRequest.id)
-            dataFileUtils.saveContentComparisonFile(mergeRequest.id, comp)
-            return comp
+            dataFileUtils.saveContentComparisonFile(mergeRequest.id, finalComp)
+            return finalComp
         }
 
         when (mode) {
@@ -1059,7 +1117,20 @@ class MergeRequestService(
      * @param id Merge request ID
      * @return true if the merge request was completed successfully, false otherwise
      */
+    suspend fun getHttpLogs(id: Int, identifier: String, role: String): List<HttpLogEntry> {
+        return dataFileUtils.getHttpLogs(id, identifier, role)
+    }
+
+    suspend fun clearFileAnalysisCache(): Boolean {
+        return dbQuery {
+            FileAnalysisCacheTable.deleteWhere { Op.TRUE } > 0
+        }
+    }
+
     suspend fun completeMergeRequest(id: Int): Boolean {
+        // Run cleanup of old merge requests before starting
+        dataFileUtils.cleanupOldMergeRequests()
+
         // 1. Retrieve the merge request
         val mergeRequest = mergeRequestRepository.getMergeRequestWithInstances(id)
             ?: throw IllegalArgumentException("Merge request not found")

@@ -3,6 +3,7 @@ package it.sebi.service
 import it.sebi.database.dbQuery
 import it.sebi.models.*
 import it.sebi.tables.MergeRequestDocumentMappingTable
+import it.sebi.tables.MergeRequestExclusionTable
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.JsonObject
 import org.jetbrains.exposed.v1.core.and
@@ -32,7 +33,8 @@ data class ComparisonPrefetch(
     val tgtCompDef: MutableMap<String, MutableMap<Int, JsonObject>>,
     val sourceRowsByUid: Map<String, List<StrapiContent>>, // apiUid -> rows
     val targetRowsByUid: Map<String, List<StrapiContent>>, // apiUid -> rows
-    val collectedRelationships: Set<ContentRelationship>
+    val collectedRelationships: Set<ContentRelationship>,
+    val exclusions: List<MergeRequestExclusion> = emptyList()
 )
 
 private fun keyOf(documentId: String, locale: String?): String {
@@ -60,6 +62,15 @@ private suspend fun compareFilesFromPrefetch(
     val usedTargetIds = mutableSetOf<Int>()
 
     fun compareStateOf(s: StrapiImage?, t: StrapiImage?): ContentTypeComparisonResultKind {
+        if (s != null) {
+            val isExcluded = pre.exclusions.any { it.contentType == STRAPI_FILE_CONTENT_TYPE_NAME && it.documentId == s.metadata.documentId }
+            if (isExcluded) return ContentTypeComparisonResultKind.EXCLUDED
+        }
+        if (t != null) {
+            val isExcluded = pre.exclusions.any { it.contentType == STRAPI_FILE_CONTENT_TYPE_NAME && it.documentId == t.metadata.documentId }
+            if (isExcluded) return ContentTypeComparisonResultKind.EXCLUDED
+        }
+
         return when {
             s != null && t == null -> ContentTypeComparisonResultKind.ONLY_IN_SOURCE
             s == null && t != null -> ContentTypeComparisonResultKind.ONLY_IN_TARGET
@@ -68,22 +79,64 @@ private suspend fun compareFilesFromPrefetch(
                 val tm = t.metadata
                 val sourceFp = sm.calculatedHash
                 val targetFp = tm.calculatedHash
-                if (!sourceFp.isNullOrBlank() && sourceFp == targetFp) {
-                    ContentTypeComparisonResultKind.IDENTICAL
-                } else {
+                
+                val isIdentical = if (!sourceFp.isNullOrBlank() && !targetFp.isNullOrBlank()) {
+                    if (sourceFp == targetFp) {
+                        true
+                    } else {
+                        // Check Hamming distance for dHash (256 bits). 
+                        // A distance of 10-15 bits is usually safe for "almost identical" images.
+                        val dist = it.sebi.utils.FileFingerprintUtil.hammingDistance(sourceFp, targetFp)
+                        dist <= 12 // approx 4.7% of 256 bits
+                    }
+                } else false
+
+                if (isIdentical) {
+                    // Even if the fingerprint is "identical", if metadata is very different, mark as DIFFERENT
+                    // This prevents collisions on very simple images like black logos on white background.
                     val sourceSize = sm.calculatedSizeBytes ?: sm.size.toLong()
                     val targetSize = tm.calculatedSizeBytes ?: tm.size.toLong()
-                    val sourceSizeKB = (sourceSize + 512) / 1024
-                    val targetSizeKB = (targetSize + 512) / 1024
-                    val isDifferent = when {
-                        (sourceSizeKB != targetSizeKB) -> true
-                        (sm.folderPath != tm.folderPath) -> true
-                        (sm.name != tm.name) -> true
-                        (sm.alternativeText != tm.alternativeText) -> true
-                        (sm.caption != tm.caption) -> true
-                        else -> false
+                    val sizeDiff = Math.abs(sourceSize - targetSize).toDouble()
+                    val maxSize = Math.max(sourceSize, targetSize).toDouble()
+                    val sizeToleranceOk = if (maxSize > 0) (sizeDiff / maxSize) < 0.25 else true
+                    
+                    val nameSimilarityOk = sm.name.equals(tm.name, ignoreCase = true) || 
+                                          sm.name.contains(tm.name, ignoreCase = true) || 
+                                          tm.name.contains(sm.name, ignoreCase = true)
+
+                    if (!sizeToleranceOk && !nameSimilarityOk) {
+                        ContentTypeComparisonResultKind.DIFFERENT
+                    } else {
+                        ContentTypeComparisonResultKind.IDENTICAL
                     }
-                    if (isDifferent) ContentTypeComparisonResultKind.DIFFERENT else ContentTypeComparisonResultKind.IDENTICAL
+                } else {
+                    // Robust check: if fingerprints differ but they are mapped, or if we want to check other metadata
+                    val sourceSize = sm.calculatedSizeBytes ?: sm.size.toLong()
+                    val targetSize = tm.calculatedSizeBytes ?: tm.size.toLong()
+                    
+                    // If fingerprints are both present and they are still considered different after Hamming check
+                    if (!sourceFp.isNullOrBlank() && !targetFp.isNullOrBlank()) {
+                        ContentTypeComparisonResultKind.DIFFERENT
+                    } else {
+                        // Fallback to metadata if fingerprints are missing
+                        val sourceSizeKB = (sourceSize + 512) / 1024
+                        val targetSizeKB = (targetSize + 512) / 1024
+                        
+                        // Introduce a tolerance for size comparison (e.g. 20%)
+                        val sizeDiff = Math.abs(sourceSize - targetSize).toDouble()
+                        val maxSize = Math.max(sourceSize, targetSize).toDouble()
+                        val sizeToleranceOk = if (maxSize > 0) (sizeDiff / maxSize) < 0.20 else true
+
+                        val isDifferent = when {
+                            (!sizeToleranceOk) -> true
+                            (sm.folderPath != tm.folderPath) -> true
+                            (sm.name != tm.name) -> true
+                            (sm.alternativeText != tm.alternativeText) -> true
+                            (sm.caption != tm.caption) -> true
+                            else -> false
+                        }
+                        if (isDifferent) ContentTypeComparisonResultKind.DIFFERENT else ContentTypeComparisonResultKind.IDENTICAL
+                    }
                 }
             }
             else -> ContentTypeComparisonResultKind.IDENTICAL
@@ -101,8 +154,30 @@ private suspend fun compareFilesFromPrefetch(
             if (!fp.isNullOrBlank()) {
                 val candidates = targetByFp[fp]
                 if (!candidates.isNullOrEmpty()) {
-                    val preferred = candidates.firstOrNull { it.metadata.locale == sm.locale && !usedTargetIds.contains(it.metadata.id) }
-                    val anyOther = preferred ?: candidates.firstOrNull { !usedTargetIds.contains(it.metadata.id) }
+                    // Safety check before pairing: fingerprints match, but do metadata and size also match within reason?
+                    // This prevents auto-pairing very different images that happen to have same dHash (like black logos).
+                    val sourceSize = sm.calculatedSizeBytes ?: sm.size.toLong()
+                    
+                    val filteredCandidates = candidates.filter { cand ->
+                        if (usedTargetIds.contains(cand.metadata.id)) return@filter false
+                        
+                        val targetSize = cand.metadata.calculatedSizeBytes ?: cand.metadata.size.toLong()
+                        val sizeDiff = Math.abs(sourceSize - targetSize).toDouble()
+                        val maxSize = Math.max(sourceSize, targetSize).toDouble()
+                        val sizeToleranceOk = if (maxSize > 0) (sizeDiff / maxSize) < 0.25 else true
+                        
+                        val nameSimilarityOk = sm.name.equals(cand.metadata.name, ignoreCase = true) || 
+                                              sm.name.contains(cand.metadata.name, ignoreCase = true) || 
+                                              cand.metadata.name.contains(sm.name, ignoreCase = true)
+                        
+                        // Accept if either size is similar OR name is similar. 
+                        // If both are very different, it's likely a collision.
+                        sizeToleranceOk || nameSimilarityOk
+                    }
+
+                    val preferred = filteredCandidates.firstOrNull { it.metadata.locale == sm.locale }
+                    val anyOther = preferred ?: filteredCandidates.firstOrNull()
+                    
                     if (anyOther != null) {
                         t = anyOther
                         usedTargetIds.add(anyOther.metadata.id)
@@ -162,6 +237,8 @@ suspend fun prefetchComparisonData(
     val tgtCompDef: Deferred<MutableMap<String, MutableMap<Int, JsonObject>>> =
         async { fetchComponents(mergeRequest.targetInstance, dbSchema) }
 
+    val exclusionsDef = async { MergeRequestExclusionTable.fetchExclusions(mergeRequest) }
+
     // compute fingerprints for files (still part of prefetch, since it interacts with Strapi)
     val srcFiles = srcFilesDef.await()
     val tgtFiles = tgtFilesDef.await()
@@ -178,6 +255,7 @@ suspend fun prefetchComparisonData(
     val targetTableMap = tgtTablesDef.await()
     val srcCompMap = srcCompDef.await()
     val tgtCompMap = tgtCompDef.await()
+    val sourceExclusions = exclusionsDef.await()
 
     // Collect relationships during source fetch to avoid duplicate traversals
     val relationshipsCollected = mutableSetOf<ContentRelationship>()
@@ -191,6 +269,12 @@ suspend fun prefetchComparisonData(
         val uid = meta.apiUid
         if (!uid.startsWith("api::")) continue
 
+        // Prepare excluded fields for this UID
+        val excludedFields = sourceExclusions
+            .filter { it.contentType == uid && it.documentId == null && it.fieldPath != null }
+            .mapNotNull { it.fieldPath }
+            .toSet()
+
         val sourceRowsDef = async(Dispatchers.IO) {
             fetchPublishedRowsAsJson(
                 mergeRequest.sourceInstance,
@@ -203,7 +287,7 @@ suspend fun prefetchComparisonData(
                 componentTableCache = srcCompMap,
                 tableMap = sourceTableMap,
                 fileCache = sourceFiles.associate { it.metadata.id to it.metadata.documentId }
-            ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata) }
+            ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata, excludedFields) }
         }
 
         val targetRowsDef = async(Dispatchers.IO) {
@@ -216,7 +300,7 @@ suspend fun prefetchComparisonData(
                 componentTableCache = tgtCompMap,
                 tableMap = targetTableMap,
                 fileCache = targetFiles.associate { it.metadata.id to it.metadata.documentId }
-            ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata) }
+            ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata, excludedFields) }
         }
 
         val (sourceRows, targetRows) = awaitAll(sourceRowsDef, targetRowsDef)
@@ -237,7 +321,8 @@ suspend fun prefetchComparisonData(
         tgtCompDef = tgtCompMap,
         sourceRowsByUid = sourceRowsByUid,
         targetRowsByUid = targetRowsByUid,
-        collectedRelationships = relationshipsCollected
+        collectedRelationships = relationshipsCollected,
+        exclusions = sourceExclusions
     )
 }
 
@@ -348,26 +433,23 @@ suspend fun computeComparisonFromPrefetch(
 
 
 
-        idMappingsList = idMappingsList.mapNotNull { map ->
+        idMappingsList = idMappingsList.map { map ->
                 val validSource = map.sourceDocumentId != null && map.sourceId != null &&   sourceData.contains(map.sourceDocumentId to map.sourceId)
                 val validTarget = map.targetDocumentId != null && map.targetId != null && targetData.contains(map.targetDocumentId to map.targetId)
                 if (validSource && validTarget) {
                   map
                 } else {
-                    invalidIds.add(map.id)
-                    null
+                    // Se non è valido, non lo cancelliamo fisicamente dal DB ora,
+                    // perché potrebbe essere un'entità non ancora sincronizzata in questa sessione
+                    // o filtrata per altri motivi (es. non pubblicata).
+                    // Invece lo teniamo ma lo loggeremo se vogliamo fare cleanup.
+                    // Per ora, lo carichiamo comunque per permettere l'associazione se ricompare.
+                    map
                 }
             }
 
-        if (invalidIds.isNotEmpty()) {
-            logger.info("Found ${invalidIds.size} invalid mappings for MR ${mergeRequest.id}; deleting from DB…")
-            // Physically delete rows one-by-one to avoid dialect issues with id column
-            dbQuery {
-                invalidIds.forEach { mid ->
-                    MergeRequestDocumentMappingTable.deleteWhere { MergeRequestDocumentMappingTable.id eq mid }
-                }
-            }
-        }
+        // idMappingsList already contains all mappings. 
+        // No physical deletion for now to be safe.
 
         // Rebuild idMappings map to reflect deletions
         idMappingsList.groupBy { it.contentType }
@@ -400,11 +482,11 @@ suspend fun computeComparisonFromPrefetch(
             StrapiContentTypeKind.SingleType -> {
                 val source = sourceRows.maxByOrNull { it.metadata.id ?: 0 }
                 val target = targetRows.maxByOrNull { it.metadata.id ?: 0 }
-                singleTypes[table.name] = compareSingleType(table.name, uid, source, target, kind,fileMapping,contentMapping)
+                singleTypes[table.name] = compareSingleType(table.name, uid, source, target, kind, fileMapping, contentMapping, prefetch.exclusions)
             }
             StrapiContentTypeKind.CollectionType -> {
                 collectionTypes[table.name] =
-                    compareCollectionType(table.name, uid, sourceRows, targetRows, kind, contentMapping,fileMapping)
+                    compareCollectionType(table.name, uid, sourceRows, targetRows, kind, contentMapping, fileMapping, prefetch.exclusions)
             }
             StrapiContentTypeKind.Files, StrapiContentTypeKind.Component -> {
                 // ignore

@@ -4,11 +4,17 @@ import it.sebi.client.StrapiClient
 import it.sebi.database.dbQuery
 import it.sebi.models.*
 import it.sebi.utils.FileFingerprintUtil
+import it.sebi.tables.FileAnalysisCacheTable
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.json.*
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.statements.StatementType
+import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.update
 import org.slf4j.LoggerFactory
 import utils.shortenTableName
 import java.math.BigDecimal
@@ -29,14 +35,15 @@ suspend fun fetchFilesFromDb(instance: StrapiInstance): List<StrapiImage> = with
 
         val sql = """
             WITH RECURSIVE folder_hierarchy AS (
-                -- Caso base: cartelle radice (path contiene solo il proprio ID)
+                -- Caso base: cartelle radice (quelle senza parent nella tabella di link)
                 SELECT
-                    id,
-                    path,
-                    name,
-                    ('/' || name)::text as full_path
-                FROM upload_folders
-                WHERE path = '/' || id::text
+                    uf.id,
+                    uf.path,
+                    uf.name,
+                    ('/' || uf.name)::text as full_path
+                FROM upload_folders uf
+                LEFT JOIN upload_folders_parent_lnk l ON uf.id = l.folder_id
+                WHERE l.inv_folder_id IS NULL
 
                 UNION ALL
 
@@ -47,8 +54,8 @@ suspend fun fetchFilesFromDb(instance: StrapiInstance): List<StrapiImage> = with
                     uf.name,
                     (fh.full_path || '/' || uf.name)::text as full_path
                 FROM upload_folders uf
-                         JOIN folder_hierarchy fh ON uf.path LIKE fh.path || '/%'
-                WHERE uf.path != '/' || uf.id::text
+                JOIN upload_folders_parent_lnk l ON uf.id = l.folder_id
+                JOIN folder_hierarchy fh ON l.inv_folder_id = fh.id
             )
             SELECT
                 f.id,
@@ -83,6 +90,7 @@ suspend fun fetchFilesFromDb(instance: StrapiInstance): List<StrapiImage> = with
                     val ts = rs.getTimestamp("updated_at")
                     val updatedAt = ts?.toInstant()?.atOffset(ZoneOffset.UTC)
                     val folderPath = rs.getString("folder_path") ?: "/"
+                    val folderName = rs.getString("folder_name") ?: "/"
                     val meta = StrapiImageMetadata(
                         id = rs.getInt("id"),
                         documentId = rs.getString("document_id"),
@@ -97,7 +105,7 @@ suspend fun fetchFilesFromDb(instance: StrapiInstance): List<StrapiImage> = with
                         previewUrl = rs.getString("preview_url"),
                         provider = rs.getString("provider") ?: "local",
                         folderPath = folderPath,
-                        folder = rs.getString("folder_name"),
+                        folder = folderName,
                         locale = rs.getString("locale"),
                         updatedAt = updatedAt ?: OffsetDateTime.now()
                     )
@@ -115,6 +123,7 @@ suspend fun fetchFilesFromDb(instance: StrapiInstance): List<StrapiImage> = with
                         put("previewUrl", meta.previewUrl)
                         put("provider", meta.provider)
                         put("folderPath", meta.folderPath)
+                        put("folder", folderName)
                         put("locale", meta.locale)
                         put("updatedAt", meta.updatedAt.toString())
                     }
@@ -361,23 +370,61 @@ suspend fun getfileCompareFromDb(
 
                 val sourceFp = sm.calculatedHash
                 val targetFp = tm.calculatedHash
-                if (!sourceFp.isNullOrBlank() && sourceFp == targetFp) {
-                    ContentTypeComparisonResultKind.IDENTICAL
+                
+                val isIdentical = if (!sourceFp.isNullOrBlank() && !targetFp.isNullOrBlank()) {
+                    if (sourceFp == targetFp) {
+                        true
+                    } else {
+                        // Check Hamming distance for dHash (256 bits). 
+                        // A distance of 10-15 bits is usually safe for "almost identical" images.
+                        val dist = FileFingerprintUtil.hammingDistance(sourceFp, targetFp)
+                        dist <= 12 // approx 4.7% of 256 bits
+                    }
+                } else false
+
+                if (isIdentical) {
+                    // Even if the fingerprint is "identical", if metadata is very different, mark as DIFFERENT
+                    // This prevents collisions on very simple images like black logos on white background.
+                    val sourceSize = sm.calculatedSizeBytes ?: sm.size.toLong()
+                    val targetSize = tm.calculatedSizeBytes ?: tm.size.toLong()
+                    val sizeDiff = Math.abs(sourceSize - targetSize).toDouble()
+                    val maxSize = Math.max(sourceSize, targetSize).toDouble()
+                    val sizeToleranceOk = if (maxSize > 0) (sizeDiff / maxSize) < 0.25 else true
+
+                    val nameSimilarityOk = sm.name.equals(tm.name, ignoreCase = true) ||
+                            sm.name.contains(tm.name, ignoreCase = true) ||
+                            tm.name.contains(sm.name, ignoreCase = true)
+
+                    if (!sizeToleranceOk && !nameSimilarityOk) {
+                        ContentTypeComparisonResultKind.DIFFERENT
+                    } else {
+                        ContentTypeComparisonResultKind.IDENTICAL
+                    }
                 } else {
                     val sourceSize = sm.calculatedSizeBytes ?: sm.size.toLong()
                     val targetSize = tm.calculatedSizeBytes ?: tm.size.toLong()
-                    val sourceSizeKB = (sourceSize + 512) / 1024
-                    val targetSizeKB = (targetSize + 512) / 1024
 
-                    val isDifferent = when {
-                        (sourceSizeKB != targetSizeKB) -> true
-                        (sm.folderPath != tm.folderPath) -> true
-                        (sm.name != tm.name) -> true
-                        (sm.alternativeText != tm.alternativeText) -> true
-                        (sm.caption != tm.caption) -> true
-                        else -> false
+                    if (!sourceFp.isNullOrBlank() && !targetFp.isNullOrBlank()) {
+                        ContentTypeComparisonResultKind.DIFFERENT
+                    } else {
+                        val sourceSizeKB = (sourceSize + 512) / 1024
+                        val targetSizeKB = (targetSize + 512) / 1024
+
+                        // Introduce a tolerance for size comparison (e.g. 20%)
+                        val sizeDiff = Math.abs(sourceSize - targetSize).toDouble()
+                        val maxSize = Math.max(sourceSize, targetSize).toDouble()
+                        val sizeToleranceOk = if (maxSize > 0) (sizeDiff / maxSize) < 0.20 else true
+
+                        val isDifferent = when {
+                            (!sizeToleranceOk) -> true
+                            (sm.folderPath != tm.folderPath) -> true
+                            (sm.name != tm.name) -> true
+                            (sm.alternativeText != tm.alternativeText) -> true
+                            (sm.caption != tm.caption) -> true
+                            else -> false
+                        }
+                        if (isDifferent) ContentTypeComparisonResultKind.DIFFERENT else ContentTypeComparisonResultKind.IDENTICAL
                     }
-                    if (isDifferent) ContentTypeComparisonResultKind.DIFFERENT else ContentTypeComparisonResultKind.IDENTICAL
                 }
             }
 
@@ -396,10 +443,31 @@ suspend fun getfileCompareFromDb(
             if (!fp.isNullOrBlank()) {
                 val candidates = targetByFp[fp]
                 if (!candidates.isNullOrEmpty()) {
+                    // Safety check before pairing: fingerprints match, but do metadata and size also match within reason?
+                    // This prevents auto-pairing very different images that happen to have same dHash (like black logos).
+                    val sourceSize = sm.calculatedSizeBytes ?: sm.size.toLong()
+
+                    val filteredCandidates = candidates.filter { cand ->
+                        if (usedTargetIds.contains(cand.metadata.id)) return@filter false
+
+                        val targetSize = cand.metadata.calculatedSizeBytes ?: cand.metadata.size.toLong()
+                        val sizeDiff = Math.abs(sourceSize - targetSize).toDouble()
+                        val maxSize = Math.max(sourceSize, targetSize).toDouble()
+                        val sizeToleranceOk = if (maxSize > 0) (sizeDiff / maxSize) < 0.25 else true
+
+                        val nameSimilarityOk = sm.name.equals(cand.metadata.name, ignoreCase = true) ||
+                                sm.name.contains(cand.metadata.name, ignoreCase = true) ||
+                                cand.metadata.name.contains(sm.name, ignoreCase = true)
+
+                        // Accept if either size is similar OR name is similar.
+                        // If both are very different, it's likely a collision.
+                        sizeToleranceOk || nameSimilarityOk
+                    }
+
                     // Prefer same locale
                     val preferred =
-                        candidates.firstOrNull { it.metadata.locale == sm.locale && !usedTargetIds.contains(it.metadata.id) }
-                    val anyOther = preferred ?: candidates.firstOrNull { !usedTargetIds.contains(it.metadata.id) }
+                        filteredCandidates.firstOrNull { it.metadata.locale == sm.locale }
+                    val anyOther = preferred ?: filteredCandidates.firstOrNull()
                     if (anyOther != null) {
                         t = anyOther
                         usedTargetIds.add(anyOther.metadata.id)
@@ -436,25 +504,31 @@ private val IGNORE_COMPARE_FIELDS = TECHNICAL_FIELDS + setOf("locale")
 
 private fun parseJsonObject(json: String): JsonObject = Json.parseToJsonElement(json).jsonObject
 
-fun cleanObject(o: JsonObject): JsonObject {
+fun cleanObject(o: JsonObject, excludedFields: Set<String> = emptySet(), currentPath: String = ""): JsonObject {
     val sortedMap = o.entries
-        .filter { (key, _) -> !IGNORE_COMPARE_FIELDS.contains(key) }
+        .filter { (key, _) ->
+            val fullPath = if (currentPath.isEmpty()) key else "$currentPath.$key"
+            !IGNORE_COMPARE_FIELDS.contains(key) && !excludedFields.contains(fullPath)
+        }
         .sortedBy { it.key }
-        .associate { (key, value) -> key to cleanValue(value) }
+        .associate { (key, value) ->
+            val fullPath = if (currentPath.isEmpty()) key else "$currentPath.$key"
+            key to cleanValue(value, excludedFields, fullPath)
+        }
 
     // Usa LinkedHashMap per preservare l'ordine
     return JsonObject(LinkedHashMap(sortedMap))
 
 }
 
-private fun cleanArray(arr: JsonArray): JsonArray = JsonArray(
-    arr.map { cleanValue(it) }
+private fun cleanArray(arr: JsonArray, excludedFields: Set<String> = emptySet(), currentPath: String = ""): JsonArray = JsonArray(
+    arr.map { cleanValue(it, excludedFields, currentPath) }
         .let { items ->
             if (items.any { it is JsonObject && it.containsKey("__order") }) {
                 items.sortedBy { (it as? JsonObject)?.get("__order")?.jsonPrimitive?.intOrNull ?: Int.MAX_VALUE }.map {
                     val o = it.jsonObject.toMutableMap()
                     val order = o["__order"]?.jsonPrimitive
-                    o["__order"] = JsonPrimitive(order?.intOrNull?:order?.doubleOrNull?.toInt())
+                    o["__order"] = JsonPrimitive(order?.intOrNull ?: order?.doubleOrNull?.toInt())
                     JsonObject(o)
                 }
             } else {
@@ -463,9 +537,9 @@ private fun cleanArray(arr: JsonArray): JsonArray = JsonArray(
         }
 )
 
-private fun cleanValue(element: JsonElement): JsonElement = when (element) {
-    is JsonObject -> cleanObject(element)
-    is JsonArray -> cleanArray(element)
+private fun cleanValue(element: JsonElement, excludedFields: Set<String> = emptySet(), currentPath: String = ""): JsonElement = when (element) {
+    is JsonObject -> cleanObject(element, excludedFields, currentPath)
+    is JsonArray -> cleanArray(element, excludedFields, currentPath)
     else -> element
 }
 
@@ -776,7 +850,7 @@ private suspend fun enrichTableRowsWithCmps(
 
                 for (lnk in relatedLnkTables) {
                     // Parent FK column (points to current base table)
-                    val parentFk = lnk.foreignKeys.firstOrNull { it.referencedTable == tableName } ?: continue
+                    val parentFk = lnk.foreignKeys.find { it.referencedTable == tableName } ?: continue
                     val parentCol = parentFk.columns.firstOrNull() ?: continue
                     val targetFks = lnk.foreignKeys.filter { it.referencedTable != tableName }
                     if (targetFks.isEmpty()) continue
@@ -960,7 +1034,12 @@ fun String.camelToSnakeCase(): String {
 }
 
 
-fun toStrapiContent(o: JsonObject, links: List<StrapiLinkRef> = emptyList(), metadata: DbTableMetadata): StrapiContent {
+fun toStrapiContent(
+    o: JsonObject,
+    links: List<StrapiLinkRef> = emptyList(),
+    metadata: DbTableMetadata,
+    excludedFields: Set<String> = emptySet()
+): StrapiContent {
     val id = o["id"]?.jsonPrimitive?.intOrNull
     val documentId = o["document_id"]?.jsonPrimitive?.content ?: ""
     val locale = o["locale"]?.jsonPrimitive?.content
@@ -968,7 +1047,7 @@ fun toStrapiContent(o: JsonObject, links: List<StrapiLinkRef> = emptyList(), met
     val uniqueId = metadata.columns.filter { it.unique }
         .mapNotNull { raw[it.name.camelToSnakeCase()]?.toString()?.removeSurrounding("\"") }.joinToString("_")
         .ifEmpty { documentId }
-    val clean = cleanObject(o)
+    val clean = cleanObject(o, excludedFields)
     return StrapiContent(
         metadata = StrapiContentMetadata(id = id, documentId = documentId, uniqueId, locale),
         rawData = raw,
@@ -1079,38 +1158,48 @@ fun compareSingleType(
     targetObj: StrapiContent?,
     kind: StrapiContentTypeKind,
     fileMapping: Map<String, MergeRequestDocumentMapping>,
-    contentMapping: MutableMap<String, MergeRequestDocumentMapping>
+    contentMapping: MutableMap<String, MergeRequestDocumentMapping>,
+    exclusions: List<MergeRequestExclusion> = emptyList()
 ): ContentTypeComparisonResultWithRelationships {
+    val documentId = sourceObj?.metadata?.documentId ?: targetObj?.metadata?.documentId
+    val isExcluded = exclusions.any { it.contentType == uid && (it.documentId == null || it.documentId == documentId) && it.fieldPath == null }
+
     val resultKind: ContentTypeComparisonResultKind = when {
+        isExcluded -> ContentTypeComparisonResultKind.EXCLUDED
         sourceObj == null && targetObj == null -> ContentTypeComparisonResultKind.IDENTICAL
         sourceObj != null && targetObj == null -> ContentTypeComparisonResultKind.ONLY_IN_SOURCE
         sourceObj == null && targetObj != null -> ContentTypeComparisonResultKind.ONLY_IN_TARGET
         else -> {
+            val excludedFields = exclusions
+                .filter { it.contentType == uid && (it.documentId == null || it.documentId == documentId) && it.fieldPath != null }
+                .mapNotNull { it.fieldPath }
+                .toSet()
+
             val sourceObjMap = sourceObj!!.cleanData.toMutableMap()
             sourceObjMap.remove("document_id")
 
 
 
-            val targetObjMap = cleanObject(targetObj!!.cleanData).toMutableMap()
+            val targetObjMap = cleanObject(targetObj!!.cleanData, excludedFields).toMutableMap()
             targetObjMap.remove("document_id")
 
-            sourceObjMap["__links"]?.jsonObject?.entries?.map {  fieldValues ->
-                    val mappedValues: List<JsonPrimitive> = fieldValues.value.jsonArray.map { value ->
-                        val id = value.jsonPrimitive.content
-                        JsonPrimitive(fileMapping[id]?.targetDocumentId ?: contentMapping[id]?.targetDocumentId ?: id)
-                    }
-                    fieldValues.key to JsonArray(mappedValues)
+            sourceObjMap["__links"]?.jsonObject?.entries?.map { fieldValues ->
+                val mappedValues: List<JsonPrimitive> = fieldValues.value.jsonArray.map { value ->
+                    val id = value.jsonPrimitive.content
+                    JsonPrimitive(fileMapping[id]?.targetDocumentId ?: contentMapping[id]?.targetDocumentId ?: id)
+                }
+                fieldValues.key to JsonArray(mappedValues)
 
             }?.let { sourceObjMap["__links"] = JsonObject(it.toMap()) }
 
-            val sourceObjToCompare =  cleanObject(JsonObject(sourceObjMap))
+            val sourceObjToCompare = cleanObject(JsonObject(sourceObjMap), excludedFields)
             val targetObjToCompare = JsonObject(targetObjMap)
             if (sourceObjToCompare == targetObjToCompare) ContentTypeComparisonResultKind.IDENTICAL else ContentTypeComparisonResultKind.DIFFERENT
         }
     }
 
     return ContentTypeComparisonResultWithRelationships(
-        id = sourceObj?.metadata?.documentId ?: targetObj?.metadata?.documentId ?: Uuid.random().toString(),
+        id = documentId ?: Uuid.random().toString(),
         tableName = tableName,
         contentType = uid,
         sourceContent = sourceObj,
@@ -1129,27 +1218,60 @@ fun compareCollectionType(
     kind: StrapiContentTypeKind,
     idMappings: MutableMap<String, MergeRequestDocumentMapping>,
     fileMapping: Map<String, MergeRequestDocumentMapping>,
+    exclusions: List<MergeRequestExclusion> = emptyList()
 ): List<ContentTypeComparisonResultWithRelationships> {
-//    val sourceByDoc = sourceList.associateBy { it.metadata.documentId }
-    val sourceByUniqueId = sourceList.associateBy {
-        if (idMappings.contains(it.metadata.documentId))
-            it.metadata.documentId
-        else
-            it.metadata.uniqueKey
-    }
-//    val targetByDoc = targetList.associateBy { it.metadata.documentId }
-    val targetByUniqueId = targetList.associateBy { t ->
-        idMappings.filter { it.value.targetDocumentId == t.metadata.documentId }.map { it.key }.firstOrNull()
-            ?: t.metadata.uniqueKey
-    }
+    val sourceByDoc = sourceList.associateBy { it.metadata.documentId }
+    val targetByDoc = targetList.associateBy { it.metadata.documentId }
+
+    // Map contentMappings for this specific UID
+    // computeComparisonFromPrefetch passed all non-file mappings in one flat map.
+    // We should be careful to only use mappings that belong to this contentType if possible.
+    // However, idMappings passed here already filtered by contentType indirectly via the loop in computeComparisonFromPrefetch?
+    // Let's check computeComparisonFromPrefetch again.
+
+    val mappedSourceToTarget = idMappings.filterValues { it.contentType == uid }
+        .mapValues { it.value.targetDocumentId }
+
+    val mappedTargetToSource = idMappings.filterValues { it.contentType == uid }
+        .entries.associate { it.value.targetDocumentId!! to it.key }
 
     val results = mutableListOf<ContentTypeComparisonResultWithRelationships>()
-    val allKeys = sourceByUniqueId.keys union targetByUniqueId.keys
-    for (k in allKeys) {
-        val s = sourceByUniqueId[k]
-        val t = targetByUniqueId[k]
-        compareSingleType(tableName, uid, s, t, kind, fileMapping, idMappings).also { results.add(it) }
+    val processedSourceDocs = mutableSetOf<String>()
+    val processedTargetDocs = mutableSetOf<String>()
+
+    // 1. First pair by explicit mappings
+    for ((srcDoc, tgtDoc) in mappedSourceToTarget) {
+        val s = sourceByDoc[srcDoc]
+        val t = targetByDoc[tgtDoc]
+        if (s != null || t != null) {
+            results.add(compareSingleType(tableName, uid, s, t, kind, fileMapping, idMappings, exclusions))
+            if (s != null) processedSourceDocs.add(srcDoc)
+            if (t != null) processedTargetDocs.add(tgtDoc!!)
+        }
     }
+
+    // 2. Pair remaining by uniqueKey (automatic matching)
+    val remainingSource = sourceList.filter { it.metadata.documentId !in processedSourceDocs }
+    val remainingTarget = targetList.filter { it.metadata.documentId !in processedTargetDocs }
+
+    val sourceByUniqueKey = remainingSource.groupBy { it.metadata.uniqueKey }
+    val targetByUniqueKey = remainingTarget.groupBy { it.metadata.uniqueKey }
+
+    val allUniqueKeys = sourceByUniqueKey.keys union targetByUniqueKey.keys
+    for (key in allUniqueKeys) {
+        val sList = sourceByUniqueKey[key] ?: emptyList()
+        val tList = targetByUniqueKey[key] ?: emptyList()
+
+        val maxLen = maxOf(sList.size, tList.size)
+        for (i in 0 until maxLen) {
+            val s = sList.getOrNull(i)
+            val t = tList.getOrNull(i)
+            results.add(compareSingleType(tableName, uid, s, t, kind, fileMapping, idMappings, exclusions))
+            if (s != null) processedSourceDocs.add(s.metadata.documentId)
+            if (t != null) processedTargetDocs.add(t.metadata.documentId)
+        }
+    }
+
     return results
 }
 
@@ -1160,17 +1282,86 @@ suspend fun computeFingerprints(instance: StrapiInstance, files: List<StrapiImag
         val logger = LoggerFactory.getLogger("SyncServiceDb")
         val client = StrapiClient(instance)
         val semaphore = Semaphore(6)
+
+        // 1. Fetch existing cache entries for this instance
+        val cacheMap = dbQuery {
+            FileAnalysisCacheTable.selectAll()
+                .where { FileAnalysisCacheTable.instanceId eq instance.id }
+                .associate {
+                    it[FileAnalysisCacheTable.documentId] to (
+                            it[FileAnalysisCacheTable.calculatedHash] to
+                                    it[FileAnalysisCacheTable.calculatedSizeBytes] to
+                                    it[FileAnalysisCacheTable.updatedAtStr]
+                            )
+                }
+        }
+
         files.map { img ->
             async(Dispatchers.IO) {
                 semaphore.withPermit {
                     try {
+                        val docId = img.metadata.documentId
+                        val currentUpdatedAt = img.rawData["updated_at"]?.jsonPrimitive?.contentOrNull
+                            ?: img.rawData["updatedAt"]?.jsonPrimitive?.contentOrNull
+
+                        // 2. Check if we have a valid cache entry
+                        val cached = cacheMap[docId]
+                        if (cached != null) {
+                            val (hashAndSize, cachedUpdatedAt) = cached
+                            val (cachedHash, cachedSize) = hashAndSize
+                            if (currentUpdatedAt == cachedUpdatedAt) {
+                                // Update last used timestamp in background
+                                launch {
+                                    dbQuery {
+                                        FileAnalysisCacheTable.update({ (FileAnalysisCacheTable.instanceId eq instance.id) and (FileAnalysisCacheTable.documentId eq docId) }) {
+                                            it[lastUsedAt] = OffsetDateTime.now()
+                                        }
+                                    }
+                                }
+                                return@withPermit img.copy(
+                                    metadata = img.metadata.copy(
+                                        calculatedHash = cachedHash,
+                                        calculatedSizeBytes = cachedSize
+                                    )
+                                )
+                            }
+                        }
+
+                        // 3. Not in cache or changed -> download and analyze
                         val tmp = client.downloadFile(img)
                         val bytes = tmp.readBytes()
                         tmp.delete()
                         val fp = FileFingerprintUtil.compute(bytes, img.metadata.mime, img.metadata.ext)
+                        val calculatedHash = fp.value
+                        val calculatedSize = bytes.size.toLong()
+
+                        // 4. Update cache
+                        dbQuery {
+                            val existing = FileAnalysisCacheTable.selectAll()
+                                .where { (FileAnalysisCacheTable.instanceId eq instance.id) and (FileAnalysisCacheTable.documentId eq docId) }
+                                .singleOrNull()
+
+                            if (existing == null) {
+                                FileAnalysisCacheTable.insert {
+                                    it[instanceId] = instance.id
+                                    it[documentId] = docId
+                                    it[updatedAtStr] = currentUpdatedAt
+                                    it[FileAnalysisCacheTable.calculatedHash] = calculatedHash
+                                    it[calculatedSizeBytes] = calculatedSize
+                                }
+                            } else {
+                                FileAnalysisCacheTable.update({ (FileAnalysisCacheTable.instanceId eq instance.id) and (FileAnalysisCacheTable.documentId eq docId) }) {
+                                    it[updatedAtStr] = currentUpdatedAt
+                                    it[FileAnalysisCacheTable.calculatedHash] = calculatedHash
+                                    it[calculatedSizeBytes] = calculatedSize
+                                    it[lastUsedAt] = OffsetDateTime.now()
+                                }
+                            }
+                        }
+
                         val newMeta = img.metadata.copy(
-                            calculatedHash = fp.value,
-                            calculatedSizeBytes = bytes.size.toLong()
+                            calculatedHash = calculatedHash,
+                            calculatedSizeBytes = calculatedSize
                         )
                         img.copy(metadata = newMeta)
                     } catch (e: Exception) {

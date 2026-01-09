@@ -6,6 +6,7 @@ import {TabPanel, TabView} from 'primereact/tabview';
 import {ProgressSpinner} from 'primereact/progressspinner';
 import {Tag} from 'primereact/tag';
 import {Badge} from 'primereact/badge';
+import {InputText} from 'primereact/inputtext';
 import {
     ContentTypeComparisonResultKind,
     ContentTypeComparisonResultWithRelationships,
@@ -20,6 +21,8 @@ import {
 import {groupByToArray, GroupEntry} from "../../utils/arrayGroupingUtilities";
 import {Button} from "primereact/button";
 import ManualCollectionMapper from './components/ManualCollectionMapper';
+import axios from 'axios';
+import ExclusionsManager from './components/ExclusionsManager';
 
 
 interface MergeFilesStepProps {
@@ -47,8 +50,15 @@ const MergeFilesStep: React.FC<MergeFilesStepProps> = ({
     const [error, setError] = useState<string | null>(null);
 
     const [showManualMapper, setShowManualMapper] = useState<boolean>(false);
+    const [showExclusionsManager, setShowExclusionsManager] = useState<boolean>(false);
+    const [editorDialogVisible, setEditorDialogVisible] = useState<boolean>(false);
+    const [isDiffEditor, setIsDiffEditor] = useState<boolean>(false);
+    const [originalContent, setOriginalContent] = useState<any>(null);
+    const [modifiedContent, setModifiedContent] = useState<any>(null);
+    const [editorTargetInfo, setEditorTargetInfo] = useState<{contentType: string, documentId: string} | null>(null);
 
     const [activeTabIndex, setActiveTabIndex] = useState<number>(0);
+    const [globalFilter, setGlobalFilter] = useState<string>('');
 
     // Loading states for each table
     const [updateTableLoading, setUpdateTableLoading] = useState<boolean>(false);
@@ -189,24 +199,86 @@ const MergeFilesStep: React.FC<MergeFilesStepProps> = ({
     }
 
     const imageTemplate = (rowData: ContentTypeFileComparisonResult) => {
-
         if (!rowData.sourceImage && !rowData.targetImage) {
             return
         }
 
-        if (!rowData.sourceImage || !rowData.targetImage) {
-            return fileTagTemplate(rowData.sourceImage || rowData.targetImage)
-        }
+        const isAssociated = rowData.sourceImage && rowData.targetImage;
 
-        return <div className="flex flex-row">
-            <div className="mr-4 flex flex-column align-items-center">
-                <Tag severity="info" value="Source" className="mb-2"/>
-                {fileTagTemplate(rowData.sourceImage)}
+        return <div className="flex flex-column gap-2">
+            <div className="flex flex-row">
+                {rowData.sourceImage && (
+                    <div className="mr-4 flex flex-column align-items-center">
+                        <Tag severity="info" value="Source" className="mb-2"/>
+                        {fileTagTemplate(rowData.sourceImage)}
+                    </div>
+                )}
+                {rowData.targetImage && (
+                    <div className="flex flex-column align-items-center">
+                        <Tag severity="warning" value="Target" className="mb-2"/>
+                        {fileTagTemplate(rowData.targetImage)}
+                    </div>
+                )}
             </div>
-            <div className="flex flex-column align-items-center">
-                <Tag severity="warning" value="Target" className="mb-2"/>
-                {fileTagTemplate(rowData.targetImage)}
-            </div>
+            {isAssociated && (
+                <div className="flex justify-content-center">
+                    <Button 
+                        icon="pi pi-link-slash" 
+                        label="Scollega" 
+                        className="p-button-text p-button-danger p-button-sm"
+                        tooltip="Rimuovi questa associazione automatica o manuale"
+                        onClick={async () => {
+                            if (!window.confirm('Vuoi davvero rimuovere questa associazione? Il ricalcolo avverrà automaticamente.')) return;
+                            try {
+                                setUpdateTableLoading(true);
+                                // Cerchiamo il mapping id tra i mapping salvati
+                                const res = await axios.get(`/api/merge-requests/${mergeRequestId}/mappings`, { params: { contentType: 'plugin::upload.file' } });
+                                const mappings = res.data?.data || [];
+                                const mapping = mappings.find((m: any) => 
+                                    m.sourceDocumentId === rowData.sourceImage?.metadata.documentId && 
+                                    m.targetDocumentId === rowData.targetImage?.metadata.documentId
+                                );
+                                
+                                if (mapping) {
+                                    await axios.delete(`/api/merge-requests/${mergeRequestId}/mappings/${mapping.id}`);
+                                    if (onSaved) await onSaved();
+                                } else {
+                                    alert("Associazione persistente non trovata. Potrebbe essere un'associazione temporanea in memoria.");
+                                }
+                            } catch (e) {
+                                console.error('Errore durante la rimozione del mapping', e);
+                                alert("Errore durante la rimozione del mapping");
+                            } finally {
+                                setUpdateTableLoading(false);
+                            }
+                        }}
+                    />
+                    <Button 
+                        icon="pi pi-ban" 
+                        label="Escludi" 
+                        className="p-button-text p-button-warning p-button-sm"
+                        tooltip="Escludi questo file dalla sincronizzazione (vincolo ambientale)"
+                        onClick={async () => {
+                            const docId = rowData.sourceImage?.metadata.documentId || rowData.targetImage?.metadata.documentId;
+                            if (!docId) return;
+                            if (!window.confirm(`Vuoi escludere il file ${docId} dalla sincronizzazione per sempre?`)) return;
+                            try {
+                                setUpdateTableLoading(true);
+                                await axios.post(`/api/merge-requests/${mergeRequestId}/exclusions`, {
+                                    contentType: 'plugin::upload.file',
+                                    documentId: docId
+                                });
+                                if (onSaved) await onSaved();
+                            } catch (e) {
+                                console.error('Errore durante l\'esclusione del file', e);
+                                alert("Errore durante l'esclusione del file");
+                            } finally {
+                                setUpdateTableLoading(false);
+                            }
+                        }}
+                    />
+                </div>
+            )}
         </div>
     }
 
@@ -221,11 +293,28 @@ const MergeFilesStep: React.FC<MergeFilesStepProps> = ({
                 Review the differences and make your selections before proceeding.
             </p>
 
-            <div className="flex justify-content-end mb-3">
+            <div className="flex justify-content-between align-items-center mb-3">
+                <span className="p-input-icon-left w-20rem">
+                    <i className="pi pi-search" />
+                    <InputText
+                        type="search"
+                        value={globalFilter}
+                        onChange={(e) => setGlobalFilter(e.target.value)}
+                        placeholder="Ricerca globale..."
+                        className="w-full"
+                    />
+                </span>
                 <Button
                     label="Associa manualmente (files)"
                     icon="pi pi-link"
+                    className="mr-2"
                     onClick={() => setShowManualMapper(true)}
+                />
+                <Button
+                    label="Gestisci vincoli"
+                    icon="pi pi-ban"
+                    severity="warning"
+                    onClick={() => setShowExclusionsManager(true)}
                 />
             </div>
 
@@ -290,6 +379,14 @@ const MergeFilesStep: React.FC<MergeFilesStepProps> = ({
                                    }}
                                    value={group.items}
                                    paginator
+                                   globalFilter={globalFilter}
+                                   globalFilterFields={[
+                                       'sourceImage.metadata.name', 'targetImage.metadata.name',
+                                       'sourceImage.metadata.documentId', 'targetImage.metadata.documentId',
+                                       'sourceImage.metadata.folder', 'targetImage.metadata.folder',
+                                       'sourceImage.metadata.alternativeText', 'targetImage.metadata.alternativeText',
+                                       'sourceImage.metadata.caption', 'targetImage.metadata.caption'
+                                   ]}
                                    rows={5}
                                    rowsPerPageOptions={[5, 10, 25, 50]}
                                    emptyMessage="No files to update">
@@ -325,6 +422,13 @@ const MergeFilesStep: React.FC<MergeFilesStepProps> = ({
                 allMergeData={allMergeData}
                 fixedTable={'files'}
                 onSaved={onSaved}
+            />
+
+            <ExclusionsManager 
+                visible={showExclusionsManager}
+                onHide={() => setShowExclusionsManager(false)}
+                mergeRequestId={mergeRequestId}
+                onExclusionsChanged={() => onSaved && onSaved()}
             />
         </div>
     );

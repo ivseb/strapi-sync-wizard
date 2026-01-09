@@ -56,6 +56,7 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
     const [modifiedContent, setModifiedContent] = useState<any>(null);
     const [editorDialogHeader, setEditorDialogHeader] = useState<string>("View Content");
     const [editorErrorMessage, setEditorErrorMessage] = useState<string | undefined>(undefined);
+    const [httpLogs, setHttpLogs] = useState<{fileName: string, content: string, timestamp: string}[] | undefined>(undefined);
 
     // State for sync progress
     const [syncProgress, setSyncProgress] = useState<SyncProgressUpdate | null>(null);
@@ -498,6 +499,19 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
         tableName?: string,
         documentId?: string
     ) => {
+        const urlParts = window.location.pathname.split('/');
+        const last = urlParts[urlParts.length - 1];
+        const mergeRequestId = parseInt(last, 10);
+
+        if (!isNaN(mergeRequestId) && documentId) {
+            fetch(`/api/merge-requests/${mergeRequestId}/logs?identifier=${documentId}`)
+                .then(res => res.json())
+                .then(data => setHttpLogs(data))
+                .catch(err => console.error("Error fetching logs", err));
+        } else {
+            setHttpLogs(undefined);
+        }
+
         if (isDiff) {
             setIsDiffEditor(true);
             setOriginalContent(source);
@@ -631,7 +645,7 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                 tooltip="View Details"
                 onClick={() => {
                     if (isUpdate) {
-                        openEditorDialog(null, true, source, target, "View Differences");
+                        openEditorDialog(null, true, source, target, "View Differences", rowData.contentType, rowData.documentId);
                     } else {
                         openEditorDialog(entry, false, null, null, "View Content", rowData.contentType, rowData.documentId);
                     }
@@ -645,7 +659,7 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
         if (!entry) return;
         const diff = isUpdateEntry(tableName, documentId);
         if (diff.isUpdate) {
-            openEditorDialog(null, true, diff.source, diff.target, 'View Differences');
+            openEditorDialog(null, true, diff.source, diff.target, 'View Differences', tableName, documentId);
         } else {
             openEditorDialog(entry, false, null, null, 'View Content', tableName, documentId);
         }
@@ -987,13 +1001,17 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
             {/* Editor Dialog */}
             <EditorDialog
                 visible={editorDialogVisible}
-                onHide={() => setEditorDialogVisible(false)}
+                onHide={() => {
+                    setEditorDialogVisible(false);
+                    setHttpLogs(undefined);
+                }}
                 header={editorDialogHeader}
                 content={editorContent}
                 isDiff={isDiffEditor}
                 originalContent={originalContent}
                 modifiedContent={modifiedContent}
                 errorMessage={editorErrorMessage}
+                httpLogs={httpLogs}
             />
         </div>
     );
