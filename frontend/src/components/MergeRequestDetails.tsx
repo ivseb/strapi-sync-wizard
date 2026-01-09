@@ -254,7 +254,6 @@ const MergeRequestDetails: React.FC = () => {
 
     // Proceed to next step
     const proceedToNextStep = async (nextStep: number) => {
-        debugger
         if (!id) return;
 
         // Only update status when moving forward

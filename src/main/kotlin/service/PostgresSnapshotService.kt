@@ -21,6 +21,22 @@ class PostgresSnapshotService(
 ) {
     private val logger = LoggerFactory.getLogger(PostgresSnapshotService::class.java)
 
+    private val systemTables = listOf(
+        "strapi_database_schema",
+        "strapi_migrations",
+        "strapi_sessions",
+        "strapi_api_tokens",
+        "strapi_api_token_permissions",
+        "strapi_transfer_tokens",
+        "strapi_transfer_token_permissions",
+        "admin_users",
+        "admin_roles",
+        "admin_permissions",
+        "up_users", // Opzionale: dipende se vuoi preservare gli utenti del frontend
+        "up_roles",
+        "up_permissions"
+    )
+
     private suspend fun logActivity(
         mergeRequestId: Int,
         type: String,
@@ -88,7 +104,10 @@ class PostgresSnapshotService(
                 val tables = mutableListOf<String>()
                 exec("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'") { rs ->
                     while (rs.next()) {
-                        tables.add(rs.getString("table_name"))
+                        val tableName = rs.getString("table_name")
+                        if (!systemTables.contains(tableName) && !tableName.startsWith("strapi_")) {
+                            tables.add(tableName)
+                        }
                     }
                 }
 
@@ -145,27 +164,54 @@ class PostgresSnapshotService(
                 exec("SET session_replication_role = 'replica';")
 
                 try {
-                    // 2. Get all tables in public schema
-                    val tables = mutableListOf<String>()
-                    exec("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'") { rs ->
+                    // 2. Get all tables available in the SNAPSHOT schema
+                    val tablesToRestore = mutableListOf<String>()
+                    exec("SELECT table_name FROM information_schema.tables WHERE table_schema = '$targetSnapshot' AND table_type = 'BASE TABLE'") { rs ->
                         while (rs.next()) {
-                            tables.add(rs.getString("table_name"))
+                            tablesToRestore.add(rs.getString("table_name"))
                         }
                     }
 
-                    // 3. Truncate and Restore
-                    tables.forEach { tableName ->
-                        // Truncate public table
+                    tablesToRestore.forEach { tableName ->
+                        if (systemTables.contains(tableName)) return@forEach
                         exec("TRUNCATE TABLE public.\"$tableName\" CASCADE")
-                        // Restore from snapshot
-                        exec("INSERT INTO public.\"$tableName\" SELECT * FROM \"$targetSnapshot\".\"$tableName\"")
-                        logger.debug("Restored table $tableName from schema $targetSnapshot")
+                    }
+
+                    // 3. Truncate and Restore only what is in the snapshot
+                    tablesToRestore.forEach { tableName ->
+                        // Saltiamo comunque le tabelle di sistema per sicurezza, 
+                        // anche se non dovrebbero essere nello snapshot
+                        if (systemTables.contains(tableName)) return@forEach
+
+                        exec("""
+                                INSERT INTO public."$tableName" 
+                                OVERRIDING SYSTEM VALUE 
+                                SELECT * FROM "$targetSnapshot"."$tableName"
+                            """.trimIndent())
+                        
+                        // FIX 1: Reset sequence for each table to avoid ID conflicts
+                        exec("""
+                                DO $$ 
+                                BEGIN
+                                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = '$tableName' AND column_name = 'id' AND table_schema = 'public') THEN
+                                        PERFORM setval(pg_get_serial_sequence('public."$tableName"', 'id'), coalesce(max(id), 1), max(id) IS NOT NULL) FROM public."$tableName";
+                                    END IF;
+                                END $$;
+                            """.trimIndent())
+                        
+                        logger.debug("Restored and re-sequenced table $tableName from schema $targetSnapshot")
                     }
                 } finally {
                     // 4. Re-enable FK checks
                     exec("SET session_replication_role = 'origin';")
                 }
             }
+            
+            // FIX 2: Strapi Refresh (Opzionale ma raccomandato)
+            // Se hai un endpoint di webhook su Strapi per svuotare la cache, chiamalo qui.
+            // In alternativa, Strapi richiede spesso un riavvio se lo schema (CTDs) è cambiato,
+            // ma per i soli dati il reset delle sequenze dovrebbe bastare a renderlo responsivo.
+            
             logActivity(mergeRequestId, "RESTORE_SNAPSHOT", "SUCCESS", targetSnapshot)
         } catch (e: Exception) {
             logActivity(mergeRequestId, "RESTORE_SNAPSHOT", "FAILED", targetSnapshot, e.message)
