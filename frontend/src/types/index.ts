@@ -279,3 +279,20 @@ export interface SyncPlanDTO {
     circularEdges: CircularDependencyEdgeDTO[];
     edges: DependencyEdgeDTO[];
 }
+
+export interface SnapshotDTO {
+    id: number;
+    mergeRequestId: number;
+    snapshotSchemaName: string;
+    createdAt: string;
+}
+
+export interface SnapshotActivityDTO {
+    id: number;
+    mergeRequestId: number;
+    activityType: string;
+    status: string;
+    snapshotSchemaName: string | null;
+    message: string | null;
+    createdAt: string;
+}

@@ -6,6 +6,7 @@ import it.sebi.database.dbQuery
 import it.sebi.models.*
 import it.sebi.repository.MergeRequestRepository
 import it.sebi.repository.MergeRequestSelectionsRepository
+import it.sebi.service.PostgresSnapshotService
 import it.sebi.service.merge.ContentMergeProcessor
 import it.sebi.service.merge.FileMergeProcessor
 import it.sebi.tables.*
@@ -44,7 +45,8 @@ class MergeRequestService(
     applicationConfig: ApplicationConfig,
     private val mergeRequestRepository: MergeRequestRepository,
     private val syncService: SyncService,
-    private val mergeRequestSelectionsRepository: MergeRequestSelectionsRepository
+    private val mergeRequestSelectionsRepository: MergeRequestSelectionsRepository,
+    private val postgresSnapshotService: PostgresSnapshotService = PostgresSnapshotService(mergeRequestRepository)
 ) {
     private val fileMergeProcessor = FileMergeProcessor(mergeRequestSelectionsRepository)
     private val contentMergeProcessor = ContentMergeProcessor(mergeRequestSelectionsRepository)
@@ -1127,6 +1129,34 @@ class MergeRequestService(
         }
     }
 
+    suspend fun getMergeRequestSnapshots(id: Int): List<SnapshotDTO> {
+        return postgresSnapshotService.getSnapshotsForMergeRequest(id)
+    }
+
+    suspend fun getMergeRequestSnapshotHistory(id: Int): List<SnapshotActivityDTO> {
+        return postgresSnapshotService.getSnapshotActivityHistory(id)
+    }
+
+    suspend fun takeManualSnapshot(id: Int): Boolean {
+        return try {
+            postgresSnapshotService.takeSnapshot(id)
+            true
+        } catch (e: Exception) {
+            logger.error("Manual snapshot failed for MR $id: ${e.message}", e)
+            false
+        }
+    }
+
+    suspend fun restoreManualSnapshot(id: Int, snapshotSchemaName: String?): Boolean {
+        return try {
+            postgresSnapshotService.restoreSnapshot(id, snapshotSchemaName)
+            true
+        } catch (e: Exception) {
+            logger.error("Manual restore failed for MR $id: ${e.message}", e)
+            false
+        }
+    }
+
     suspend fun completeMergeRequest(id: Int): Boolean {
         // Run cleanup of old merge requests before starting
         dataFileUtils.cleanupOldMergeRequests()
@@ -1134,6 +1164,14 @@ class MergeRequestService(
         // 1. Retrieve the merge request
         val mergeRequest = mergeRequestRepository.getMergeRequestWithInstances(id)
             ?: throw IllegalArgumentException("Merge request not found")
+
+        // Take snapshot of target DB before starting
+        try {
+            postgresSnapshotService.takeSnapshot(id)
+        } catch (e: Exception) {
+            logger.error("Failed to take snapshot for MR $id: ${e.message}", e)
+            // We might want to stop here if snapshot is mandatory, but for now we continue
+        }
 
         val comparisonDataMap = dataFileUtils.getContentComparisonFile(id)
             ?: throw IllegalStateException("Comparison data not found")
@@ -1294,6 +1332,19 @@ class MergeRequestService(
 
             return result
         } catch (e: Exception) {
+            logger.error("Merge request $id failed: ${e.message}", e)
+            
+            // Perform rollback from snapshot - REMOVED AUTOMATIC RESTORE
+            /*
+            try {
+                logger.info("Starting rollback for MR $id")
+                postgresSnapshotService.restoreSnapshot(id)
+                logger.info("Rollback completed for MR $id")
+            } catch (rollbackEx: Exception) {
+                logger.error("Rollback failed for MR $id: ${rollbackEx.message}", rollbackEx)
+            }
+            */
+
             // Send final error update
             try {
                 val currentSelections = mergeRequestSelectionsRepository.getSelectionsForMergeRequest(id)

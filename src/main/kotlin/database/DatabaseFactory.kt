@@ -31,7 +31,9 @@ object DatabaseFactory {
                     MergeRequestDocumentMappingTable,
                     MergeRequestSelectionsTable,
                     MergeRequestExclusionTable,
-                    FileAnalysisCacheTable
+                    FileAnalysisCacheTable,
+                    MergeRequestSnapshotsTable,
+                    SnapshotActivityTable
                 )
             }
         }
@@ -56,7 +58,9 @@ fun Application.initDatabaseConnection() {
             MergeRequestDocumentMappingTable,
             MergeRequestSelectionsTable,
             MergeRequestExclusionTable,
-            FileAnalysisCacheTable
+            FileAnalysisCacheTable,
+            MergeRequestSnapshotsTable,
+            SnapshotActivityTable
         )
     }
 }

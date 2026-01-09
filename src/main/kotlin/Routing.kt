@@ -13,6 +13,7 @@ import it.sebi.repository.StrapiInstanceRepository
 import it.sebi.routes.configureInstanceRoutes
 import it.sebi.routes.configureMergeRequestRoutes
 import it.sebi.service.MergeRequestService
+import it.sebi.service.PostgresSnapshotService
 import it.sebi.service.SyncService
 
 fun Application.configureRouting() {
@@ -27,11 +28,13 @@ fun Application.configureRouting() {
     val syncService = SyncService()
     val mergeRequestRepository = MergeRequestRepository(instanceRepository)
     val mergeRequestSelectionsRepository = MergeRequestSelectionsRepository()
+    val postgresSnapshotService = PostgresSnapshotService(mergeRequestRepository)
     val mergeRequestService = MergeRequestService(
         this.environment.config,
         mergeRequestRepository,
         syncService,
-        mergeRequestSelectionsRepository
+        mergeRequestSelectionsRepository,
+        postgresSnapshotService
     )
 
     routing {

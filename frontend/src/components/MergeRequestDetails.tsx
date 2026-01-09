@@ -26,6 +26,7 @@ import MergeFilesStep from './steps/MergeFilesStep';
 import MergeSingleTypesStep from './steps/MergeSingleTypesStep';
 import MergeCollectionsStep from './steps/MergeCollectionsStep';
 import CompleteMergeStep from './steps/CompleteMergeStep';
+import SnapshotManager from './SnapshotManager';
 
 const MergeRequestDetails: React.FC = () => {
     console.log('Rendering MergeRequestDetails');
@@ -827,17 +828,26 @@ const MergeRequestDetails: React.FC = () => {
             )}
 
             {(['REVIEW', 'IN_PROGRESS', 'COMPLETED', 'FAILED'].includes(status)) && (
-                <Card className="mt-4">
-                    <div className="p-3">
-                        <CompleteMergeStep
-                            status={mergeRequestDetail.mergeRequest.status}
-                            completing={completing}
-                            completeMerge={completeMerge}
-                            selections={mergeRequestDetail.mergeRequestData?.selections}
-                            allMergeData={mergeRequestDetail.mergeRequestData}
-                        />
-                    </div>
-                </Card>
+                <>
+                    <SnapshotManager 
+                        mergeRequestId={parseInt(id || '0')} 
+                        onRestoreComplete={() => {
+                            // Optionally refresh detail after restore
+                            window.location.reload();
+                        }}
+                    />
+                    <Card className="mt-4">
+                        <div className="p-3">
+                            <CompleteMergeStep
+                                status={mergeRequestDetail.mergeRequest.status}
+                                completing={completing}
+                                completeMerge={completeMerge}
+                                selections={mergeRequestDetail.mergeRequestData?.selections}
+                                allMergeData={mergeRequestDetail.mergeRequestData}
+                            />
+                        </div>
+                    </Card>
+                </>
             )}
         </div>
     );

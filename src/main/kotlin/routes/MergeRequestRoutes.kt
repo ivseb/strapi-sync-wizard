@@ -374,6 +374,66 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
             }
         }
 
+        // Snapshot management
+        route("/{id}/snapshots") {
+            get {
+                val id = call.parameters["id"]?.toIntOrNull()
+                    ?: return@get call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+                try {
+                    val snapshots = mergeRequestService.getMergeRequestSnapshots(id)
+                    call.respond(HttpStatusCode.OK, snapshots)
+                } catch (e: Exception) {
+                    call.respond(HttpStatusCode.InternalServerError, e.message ?: "Error fetching snapshots")
+                }
+            }
+
+            post("/take") {
+                val id = call.parameters["id"]?.toIntOrNull()
+                    ?: return@post call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+                try {
+                    val success = mergeRequestService.takeManualSnapshot(id)
+                    if (success) {
+                        call.respond(HttpStatusCode.OK, mapOf("success" to true))
+                    } else {
+                        call.respond(HttpStatusCode.InternalServerError, mapOf("success" to false, "message" to "Failed to take snapshot"))
+                    }
+                } catch (e: Exception) {
+                    call.respond(HttpStatusCode.InternalServerError, e.message ?: "Error taking snapshot")
+                }
+            }
+
+            post("/restore") {
+                val id = call.parameters["id"]?.toIntOrNull()
+                    ?: return@post call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+                
+                // Optional schema name in the body
+                val body = try { call.receiveNullable<Map<String, String>>() } catch (e: Exception) { null }
+                val schemaName = body?.get("snapshotSchemaName")
+                
+                try {
+                    val success = mergeRequestService.restoreManualSnapshot(id, schemaName)
+                    if (success) {
+                        call.respond(HttpStatusCode.OK, mapOf("success" to true))
+                    } else {
+                        call.respond(HttpStatusCode.InternalServerError, mapOf("success" to false, "message" to "Failed to restore snapshot"))
+                    }
+                } catch (e: Exception) {
+                    call.respond(HttpStatusCode.InternalServerError, e.message ?: "Error restoring snapshot")
+                }
+            }
+
+            get("/history") {
+                val id = call.parameters["id"]?.toIntOrNull()
+                    ?: return@get call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+                try {
+                    val history = mergeRequestService.getMergeRequestSnapshotHistory(id)
+                    call.respond(HttpStatusCode.OK, history)
+                } catch (e: Exception) {
+                    call.respond(HttpStatusCode.InternalServerError, e.message ?: "Error fetching snapshot history")
+                }
+            }
+        }
+
         // Complete merge request
         post("/{id}/complete") {
             val id = call.parameters["id"]?.toIntOrNull()
