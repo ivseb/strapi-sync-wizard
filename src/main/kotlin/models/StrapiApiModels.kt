@@ -38,7 +38,9 @@ data class StrapiContentMetadata(
     val id: Int?,
     val documentId: String,
     val uniqueKey: String,
-    val locale: String?
+    val locale: String?,
+    // Stable, cross-instance identity (Phase 1). Null when not yet assigned/reconciled.
+    val syncId: String? = null
 )
 
 @Serializable

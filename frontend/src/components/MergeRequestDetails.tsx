@@ -1,855 +1,314 @@
-import React, {useEffect, useRef, useState} from 'react';
-import {useLocation, useNavigate, useParams} from 'react-router-dom';
-import axios from 'axios';
-import {Card} from 'primereact/card';
-import {Button} from 'primereact/button';
-import {Message} from 'primereact/message';
-import {Toast} from 'primereact/toast';
-import {ProgressSpinner} from 'primereact/progressspinner';
-import {Tag} from 'primereact/tag';
-import {Stepper} from 'primereact/stepper';
-import {StepperPanel} from 'primereact/stepperpanel';
+import React, { useEffect, useRef, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
+import { Button } from 'primereact/button';
+import { Message } from 'primereact/message';
+import { Toast } from 'primereact/toast';
+import { ProgressSpinner } from 'primereact/progressspinner';
+import { Tag } from 'primereact/tag';
 
-// Import types
 import {
-    ContentTypeComparisonResultKind,
-    ContentTypeComparisonResultWithRelationships,
-    MergeRequestData,
-    MergeRequestDetail,
-    StrapiContentTypeKind
+  ContentTypeComparisonResultKind,
+  ContentTypeComparisonResultWithRelationships,
+  MergeRequestData,
+  MergeRequestDetail,
+  StrapiContentTypeKind,
 } from '../types';
+import {
+  mrKeys,
+  useMergeRequest,
+  useCheckSchema,
+  useCompareContent,
+  useUpdateSelection,
+  useCompleteMerge,
+  useUpdateMergeRequest,
+  useImportSchema,
+  useImportPrefetch,
+  type UnifiedSelection,
+} from '../api/mergeRequests';
+import { apiErrorMessage } from '../api/http';
 
-// Step Components
 import SchemaCompatibilityStep from './steps/SchemaCompatibilityStep';
 import ContentComparisonStep from './steps/ContentComparisonStep';
 import MergeFilesStep from './steps/MergeFilesStep';
-import MergeSingleTypesStep from './steps/MergeSingleTypesStep';
-import MergeCollectionsStep from './steps/MergeCollectionsStep';
+import MergeContentWorkspace from './steps/MergeContentWorkspace';
 import CompleteMergeStep from './steps/CompleteMergeStep';
 import SnapshotManager from './SnapshotManager';
+import IdentityReconciliationDialog from './steps/IdentityReconciliationDialog';
+
+const RANK: Record<string, number> = {
+  CREATED: 0, SCHEMA_CHECKED: 1, COMPARED: 2, MERGED_FILES: 3,
+  MERGED_SINGLES: 4, MERGED_COLLECTIONS: 5, REVIEW: 6, IN_PROGRESS: 6, FAILED: 6, COMPLETED: 7,
+};
+
+const statusSeverity = (s: string): 'success' | 'danger' | 'info' | 'warning' =>
+  s === 'COMPLETED' ? 'success' : s === 'FAILED' ? 'danger' : s === 'REVIEW' || s === 'IN_PROGRESS' ? 'warning' : 'info';
+
+interface PipeStep {
+  key: string;
+  label: string;
+  icon: string;
+  done: boolean;
+  current: boolean;
+  onClick?: () => void;
+}
+
+const Pipeline: React.FC<{ steps: PipeStep[] }> = ({ steps }) => (
+  <div className="ss-pipe surface-card border-round" style={{ border: '1px solid var(--surface-border)' }}>
+    {steps.map((s, i) => (
+      <React.Fragment key={s.key}>
+        {i > 0 && <div className={`ss-pipe-conn${steps[i].done ? ' done' : ''}`} />}
+        <button
+          type="button"
+          className={`ss-pipe-step${s.done ? ' done' : ''}${s.current ? ' current' : ''}${s.onClick ? ' clickable' : ''}`}
+          onClick={s.onClick}
+          disabled={!s.onClick}
+        >
+          <span className="ss-pipe-dot"><i className={s.done ? 'pi pi-check' : s.icon} aria-hidden="true" /></span>
+          <span className="ss-pipe-label">{s.label}</span>
+        </button>
+      </React.Fragment>
+    ))}
+  </div>
+);
 
 const MergeRequestDetails: React.FC = () => {
-    console.log('Rendering MergeRequestDetails');
-    const {id} = useParams<{ id: string }>();
-    const navigate = useNavigate();
-    const location = useLocation();
-    const toast = useRef<Toast>(null);
+  const { id } = useParams<{ id: string }>();
+  const idNum = parseInt(id || '0', 10);
+  const navigate = useNavigate();
+  const toast = useRef<Toast>(null);
+  const queryClient = useQueryClient();
 
-    const [mergeRequestDetail, setMergeRequestDetail] = useState<MergeRequestDetail | null>(null);
-    const [loading, setLoading] = useState<boolean>(true);
-    const [error, setError] = useState<string | null>(null);
-    const [activeStep, setActiveStep] = useState<number>(0);
-    const [checkingSchema, setCheckingSchema] = useState<boolean>(false);
-    const [comparingContent, setComparingContent] = useState<boolean>(false);
-    const [mergingCollections, setMergingCollections] = useState<boolean>(false);
-    const [completing, setCompleting] = useState<boolean>(false);
+  const { data: mr, isLoading, error, refetch } = useMergeRequest(idNum);
 
-    // Async mode upload state
-    const schemaInputRef = useRef<HTMLInputElement>(null)
-    const prefetchInputRef = useRef<HTMLInputElement>(null)
-    const [uploadingSchema, setUploadingSchema] = useState(false)
-    const [uploadingPrefetch, setUploadingPrefetch] = useState(false)
+  const [activeStep, setActiveStep] = useState<number>(0);
+  const [showReconcile, setShowReconcile] = useState(false);
+  const [mergingCollections, setMergingCollections] = useState(false);
 
-    // Create a ref for the stepper
-    const stepperRef = useRef<any>(null);
+  const schemaInputRef = useRef<HTMLInputElement>(null);
+  const prefetchInputRef = useRef<HTMLInputElement>(null);
 
-    const updateMergeData = (data?: MergeRequestData) => {
-        if (!data || !mergeRequestDetail) return
-        const mergeRequestDetailNew = {
-            ...mergeRequestDetail,
-            mergeRequestData: data
-        }
-        setMergeRequestDetail(mergeRequestDetailNew)
+  const checkSchemaMut = useCheckSchema(idNum);
+  const compareMut = useCompareContent(idNum);
+  const selectionMut = useUpdateSelection(idNum);
+  const completeMut = useCompleteMerge(idNum);
+  const updateMut = useUpdateMergeRequest(idNum);
+  const importSchemaMut = useImportSchema(idNum);
+  const importPrefetchMut = useImportPrefetch(idNum);
 
+  const showError = (detail: string, summary = 'Error') => toast.current?.show({ severity: 'error', summary, detail, life: 5000 });
+
+  useEffect(() => {
+    if (!mr) return;
+    const r = RANK[mr.mergeRequest.status] ?? 0;
+    setActiveStep(r >= 3 ? 1 : 0); // 0 = files, 1 = content
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mr?.mergeRequest.id]);
+
+  const patchMergeData = (data?: MergeRequestData) => {
+    if (!data) return;
+    queryClient.setQueryData<MergeRequestDetail>(mrKeys.detail(idNum), (old) => (old ? { ...old, mergeRequestData: data } : old));
+  };
+
+  const onSchemaFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text());
+      const res: any = await importSchemaMut.mutateAsync(parsed && parsed.schema ? parsed : { schema: parsed });
+      toast.current?.show({ severity: res?.isCompatible ? 'success' : 'warn', summary: 'Schema imported', detail: res?.isCompatible ? 'Compatible with target' : 'Not compatible with target', life: 4000 });
+    } catch (err) { showError(apiErrorMessage(err) || 'Failed to import schema'); }
+    finally { if (schemaInputRef.current) schemaInputRef.current.value = ''; }
+  };
+
+  const onPrefetchFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      await importPrefetchMut.mutateAsync(JSON.parse(await file.text()));
+      toast.current?.show({ severity: 'success', summary: 'Prefetch imported', detail: 'You can now run Compare.', life: 4000 });
+    } catch (err) { showError(apiErrorMessage(err) || 'Failed to import prefetch'); }
+    finally { if (prefetchInputRef.current) prefetchInputRef.current.value = ''; }
+  };
+
+  const checkSchemaCompatibility = async (force = false) => {
+    try {
+      const res: any = await checkSchemaMut.mutateAsync(force);
+      toast.current?.show({ severity: res?.isCompatible ? 'success' : 'warn', summary: res?.isCompatible ? 'Compatible' : 'Incompatible', detail: res?.isCompatible ? 'Source and target schemas are compatible.' : 'Schemas are not compatible.', life: 5000 });
+    } catch (err) { showError(apiErrorMessage(err) || 'Failed to check schema'); }
+  };
+
+  const compareContent = async () => {
+    try {
+      await compareMut.mutateAsync('full');
+      toast.current?.show({ severity: 'success', summary: 'Compared', detail: 'Content comparison completed.', life: 4000 });
+      setActiveStep(0);
+    } catch (err) { showError(apiErrorMessage(err) || 'Failed to compare content'); }
+  };
+
+  const updateMergeRequestStatus = async (status: string): Promise<boolean> => {
+    if (!mr) return false;
+    try {
+      await updateMut.mutateAsync({
+        id: mr.mergeRequest.id, name: mr.mergeRequest.name, description: mr.mergeRequest.description,
+        sourceInstanceId: mr.mergeRequest.sourceInstance.id, targetInstanceId: mr.mergeRequest.targetInstance.id, status,
+      });
+      return true;
+    } catch (err) { showError(apiErrorMessage(err) || 'Failed to update status'); return false; }
+  };
+
+  const proceedToNextStep = async (nextStep: number) => {
+    if (!mr) return;
+    const status = mr.mergeRequest.status;
+    if (nextStep > activeStep && !['IN_PROGRESS', 'COMPLETED', 'FAILED'].includes(status)) {
+      if (nextStep <= 1) await updateMergeRequestStatus('MERGED_FILES');
+      else if (nextStep === 2) await updateMergeRequestStatus('MERGED_SINGLES');
+      else if (nextStep === 3) await updateMergeRequestStatus('MERGED_COLLECTIONS');
+      else await updateMergeRequestStatus('REVIEW');
     }
+    setActiveStep(Math.min(nextStep, 2));
+  };
 
+  const updateAllSelections = async (
+    kind: StrapiContentTypeKind, isSelected: boolean, tableName?: string,
+    documentIds?: string[], selectAllKind?: ContentTypeComparisonResultKind
+  ): Promise<boolean> => {
+    try {
+      await selectionMut.mutateAsync({ kind: kind as unknown as UnifiedSelection['kind'], tableName, ids: documentIds, selectAllKind: selectAllKind as unknown as string, isSelected });
+      return true;
+    } catch (err) { showError(apiErrorMessage(err) || 'Failed to update selections'); return false; }
+  };
 
-    // No need for a separate function to fetch merge data as it's now included in the main API response
+  const mergeSingleTypes = async () => {
+    if (await updateMergeRequestStatus('MERGED_SINGLES')) { toast.current?.show({ severity: 'success', summary: 'Single types saved', life: 4000 }); await proceedToNextStep(2); }
+  };
 
-    // Fetch merge request details
-    useEffect(() => {
-        const fetchMergeRequest = async () => {
-            try {
-                setLoading(true);
+  const mergeCollections = async () => {
+    setMergingCollections(true);
+    try {
+      if (await updateMergeRequestStatus('MERGED_COLLECTIONS')) { toast.current?.show({ severity: 'success', summary: 'Collections saved', life: 4000 }); await proceedToNextStep(4); }
+    } finally { setMergingCollections(false); }
+  };
 
-                const response = await axios.get(`/api/merge-requests/${id}`);
-                setMergeRequestDetail(response.data);
+  const completeMerge = async () => {
+    try { await completeMut.mutateAsync(); toast.current?.show({ severity: 'success', summary: 'Merge completed', life: 5000 }); }
+    catch (err) { showError(apiErrorMessage(err) || 'Failed to complete merge'); }
+  };
 
-                // Set active step based on status (after extracting schema and comparison steps)
-                let stepIndex = 0;
-                switch (response.data.mergeRequest.status) {
-                    case 'MERGED_FILES':
-                        stepIndex = 1;
-                        break;
-                    case 'MERGED_SINGLES':
-                        stepIndex = 2;
-                        break;
-                    case 'MERGED_COLLECTIONS':
-                    case 'IN_PROGRESS':
-                    case 'FAILED':
-                    case 'COMPLETED':
-                        stepIndex = 2;
-                        break;
-                    default:
-                        stepIndex = 0; // CREATED, SCHEMA_CHECKED, COMPARED
-                }
-
-                setActiveStep(stepIndex);
-                // We'll set the active step in the stepper using the activeIndex prop
-
-                setError(null);
-            } catch (err: any) {
-                console.error('Error fetching merge request:', err);
-                setError(err.response?.data?.message || 'Failed to fetch merge request');
-            } finally {
-                setLoading(false);
-            }
-        };
-
-        if (id) {
-            fetchMergeRequest();
-        }
-
-        // No need for cleanup function as we're not using localStorage anymore
-    }, [id]);
-
-    // Async mode: import schema JSON
-    const onSchemaFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
-        if (!id) return;
-        const file = e.target.files?.[0]
-        if (!file) return
-        try {
-            setUploadingSchema(true)
-            const text = await file.text()
-            let parsed: any
-            try { parsed = JSON.parse(text) } catch (err) { throw new Error('Invalid JSON file') }
-            const body = parsed && parsed.schema ? parsed : { schema: parsed }
-            const resp = await axios.post(`/api/merge-requests/${id}/import/schema`, body)
-            const { isCompatible } = resp.data || {}
-            toast.current?.show({
-                severity: isCompatible ? 'success' : 'warn',
-                summary: 'Schema imported',
-                detail: isCompatible ? 'Uploaded schema is compatible with target' : 'Uploaded schema is not compatible with target',
-                life: 4000
-            })
-            // refresh MR detail
-            const updatedMergeRequest = await axios.get(`/api/merge-requests/${id}`)
-            setMergeRequestDetail(updatedMergeRequest.data)
-        } catch (err: any) {
-            console.error('Error importing schema', err)
-            toast.current?.show({ severity:'error', summary:'Error', detail: err.response?.data || err.message || 'Failed to import schema', life: 5000 })
-        } finally {
-            setUploadingSchema(false)
-            if (schemaInputRef.current) schemaInputRef.current.value = ''
-        }
-    }
-
-    const onPrefetchFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
-        if (!id) return;
-        const file = e.target.files?.[0]
-        if (!file) return
-        try {
-            setUploadingPrefetch(true)
-            const text = await file.text()
-            let parsed: any
-            try { parsed = JSON.parse(text) } catch (err) { throw new Error('Invalid JSON file') }
-            await axios.post(`/api/merge-requests/${id}/import/prefetch`, parsed)
-            toast.current?.show({ severity:'success', summary:'Prefetch imported', detail:'Source prefetch cache uploaded. You can now run Compare (mode=cache/full).', life: 5000 })
-        } catch (err: any) {
-            console.error('Error importing prefetch', err)
-            toast.current?.show({ severity:'error', summary:'Error', detail: err.response?.data || err.message || 'Failed to import prefetch', life: 5000 })
-        } finally {
-            setUploadingPrefetch(false)
-            if (prefetchInputRef.current) prefetchInputRef.current.value = ''
-        }
-    }
-
-    // Check schema compatibility
-    const checkSchemaCompatibility = async (force: boolean = false) => {
-        if (!id) return;
-
-        try {
-            setCheckingSchema(true);
-
-            const response = await axios.post(`/api/merge-requests/${id}/check-schema?force=${force}`);
-            const {isCompatible} = response.data;
-
-            // Fetch the updated merge request details
-            const updatedMergeRequest = await axios.get(`/api/merge-requests/${id}`);
-            setMergeRequestDetail(updatedMergeRequest.data);
-
-            // Show success message
-            toast.current?.show({
-                severity: isCompatible ? 'success' : 'warn',
-                summary: isCompatible ? 'Compatible Schemas' : 'Incompatible Schemas',
-                detail: isCompatible
-                    ? 'The schemas of the source and target instances are compatible.'
-                    : 'The schemas of the source and target instances are not compatible.',
-                life: 5000
-            });
-
-            // After check, keep the wizard on the first merge step
-            if (isCompatible) {
-                setActiveStep(0);
-            }
-        } catch (err: any) {
-            console.error('Error checking schema compatibility:', err);
-            toast.current?.show({
-                severity: 'error',
-                summary: 'Error',
-                detail: err.response?.data?.message || 'Failed to check schema compatibility',
-                life: 5000
-            });
-        } finally {
-            setCheckingSchema(false);
-        }
-    };
-
-    // Compare content
-    const compareContent = async () => {
-        if (!id) return;
-
-        try {
-            setComparingContent(true);
-
-            // Call the compare endpoint with new mode parameter (Full recompute)
-            await axios.post(`/api/merge-requests/${id}/compare?mode=full`);
-
-            // Fetch the updated merge request details
-            const updatedMergeRequest = await axios.get(`/api/merge-requests/${id}`);
-            setMergeRequestDetail(updatedMergeRequest.data);
-
-            if (updatedMergeRequest.data.mergeRequest.status !== 'COMPARED') {
-                setMergeRequestDetail(prev => prev ? {
-                    ...prev,
-                    mergeRequest: {
-                        ...prev.mergeRequest,
-                        status: 'COMPARED'
-                    }
-                } : null);
-            }
-            // Show success message
-            toast.current?.show({
-                severity: 'success',
-                summary: 'Content Compared',
-                detail: 'Content comparison completed successfully.',
-                life: 5000
-            });
-
-            // After comparison, start from the first merge step
-            setActiveStep(0);
-        } catch (err: any) {
-            console.error('Error comparing content:', err);
-            toast.current?.show({
-                severity: 'error',
-                summary: 'Error',
-                detail: err.response?.data?.message || 'Failed to compare content',
-                life: 5000
-            });
-        } finally {
-            setComparingContent(false);
-        }
-    };
-
-
-    // Proceed to next step
-    const proceedToNextStep = async (nextStep: number) => {
-        if (!id) return;
-
-        // Only update status when moving forward
-        if (nextStep > activeStep && mergeRequestDetail) {
-            // Determine the new status based on the next step
-            let newStatus = mergeRequestDetail.mergeRequest.status;
-
-            if (!['IN_PROGRESS', 'COMPLETED', 'FAILED'].includes(status)) {
-                if (nextStep <=1) {
-                    newStatus = 'MERGED_FILES';
-                    await updateMergeRequestStatus(newStatus);
-                } else if (nextStep === 2) {
-                    newStatus = 'MERGED_SINGLES';
-                    await updateMergeRequestStatus(newStatus);
-                } else if (nextStep === 3) {
-                    newStatus = 'MERGED_COLLECTIONS';
-                    await updateMergeRequestStatus(newStatus);
-                } else if (nextStep > 3) {
-                    newStatus = 'REVIEW';
-                    await updateMergeRequestStatus(newStatus);
-                }
-            }
-        }
-
-        setActiveStep(nextStep);
-    };
-
-    // Update merge request status
-    const updateMergeRequestStatus = async (status: string) => {
-        if (!id || !mergeRequestDetail) return false;
-
-        try {
-            // Update the merge request with the new status
-            await axios.put(`/api/merge-requests/${id}`, {
-                id: mergeRequestDetail.mergeRequest.id,
-                name: mergeRequestDetail.mergeRequest.name,
-                description: mergeRequestDetail.mergeRequest.description,
-                sourceInstanceId: mergeRequestDetail.mergeRequest.sourceInstance.id,
-                targetInstanceId: mergeRequestDetail.mergeRequest.targetInstance.id,
-                status: status
-            });
-
-
-            const newData: MergeRequestDetail = {
-                ...mergeRequestDetail,
-                mergeRequest: {...mergeRequestDetail.mergeRequest, status: status}
-            }
-            setMergeRequestDetail(newData);
-
-            return true;
-        } catch (err: any) {
-            console.error('Error updating merge request status:', err);
-            toast.current?.show({
-                severity: 'error',
-                summary: 'Error',
-                detail: err.response?.data?.message || 'Failed to update merge request status',
-                life: 5000
-            });
-            return false;
-        }
-    };
-
-
-    // Function to update selections for a list or all (unified API)
-    const updateAllSelections = async (kind: StrapiContentTypeKind, isSelected: boolean, tableName?: string, documentIds?: string[], selectAllKind?: ContentTypeComparisonResultKind) => {
-        if (!id) return false;
-
-        try {
-            await axios.post(`/api/merge-requests/${id}/selection`, {
-                kind,
-                tableName,
-                ids: documentIds,
-                selectAllKind: selectAllKind,
-                isSelected
-            });
-
-            // Fetch the updated merge request details
-            const updatedMergeRequest = await axios.get(`/api/merge-requests/${id}`);
-            setMergeRequestDetail(updatedMergeRequest.data);
-
-            return true;
-        } catch (err: any) {
-            console.error('Error updating selections:', err);
-            toast.current?.show({
-                severity: 'error',
-                summary: 'Error',
-                detail: err.response?.data?.message || 'Failed to update selections',
-                life: 3000
-            });
-            return false;
-        }
-    };
-
-    // Merge single types - now just updates status and proceeds to next step
-    const mergeSingleTypes = async () => {
-        if (!id) return;
-
-        try {
-
-            // Update the merge request status
-            const success = await updateMergeRequestStatus('MERGED_SINGLES');
-
-            if (success) {
-                // Show success message
-                toast.current?.show({
-                    severity: 'success',
-                    summary: 'Single Types Step Completed',
-                    detail: 'Single type selections saved successfully.',
-                    life: 5000
-                });
-
-                // Validate and proceed to next step
-                await proceedToNextStep(2);
-            }
-        } catch (err: any) {
-            console.error('Error in single types step:', err);
-            toast.current?.show({
-                severity: 'error',
-                summary: 'Error',
-                detail: err.response?.data?.message || 'Failed to complete single types step',
-                life: 5000
-            });
-        } finally {
-        }
-    };
-
-    // Merge collections - now just updates status and proceeds to next step
-    const mergeCollections = async () => {
-        if (!id) return;
-
-        try {
-            setMergingCollections(true);
-
-            // Update the merge request status
-            const success = await updateMergeRequestStatus('MERGED_COLLECTIONS');
-
-            if (success) {
-                // Show success message
-                toast.current?.show({
-                    severity: 'success',
-                    summary: 'Collections Step Completed',
-                    detail: 'Collection selections saved successfully.',
-                    life: 5000
-                });
-
-                // Validate and proceed to next step
-                await proceedToNextStep(5);
-            }
-        } catch (err: any) {
-            console.error('Error in collections step:', err);
-            toast.current?.show({
-                severity: 'error',
-                summary: 'Error',
-                detail: err.response?.data?.message || 'Failed to complete collections step',
-                life: 5000
-            });
-        } finally {
-            setMergingCollections(false);
-        }
-    };
-
-    // Complete merge
-    const completeMerge = async () => {
-        if (!id) return;
-
-        try {
-            setCompleting(true);
-
-            await axios.post(`/api/merge-requests/${id}/complete`);
-
-            // Fetch the updated merge request details
-            const updatedMergeRequest = await axios.get(`/api/merge-requests/${id}`);
-            setMergeRequestDetail(updatedMergeRequest.data);
-
-            // Show success message
-            toast.current?.show({
-                severity: 'success',
-                summary: 'Merge Completed',
-                detail: 'The merge request has been completed successfully.',
-                life: 5000
-            });
-        } catch (err: any) {
-            console.error('Error completing merge:', err);
-            toast.current?.show({
-                severity: 'error',
-                summary: 'Error',
-                detail: err.response?.data?.message || 'Failed to complete merge request',
-                life: 5000
-            });
-        } finally {
-            setCompleting(false);
-        }
-    };
-
-    // Loading state
-    if (loading) {
-        return <div className="flex justify-content-center p-5"><ProgressSpinner/></div>;
-    }
-
-    // Error state
-    if (error) {
-        return (
-            <div className="container py-4">
-                <Toast ref={toast}/>
-                <Card className="mb-4">
-                    <div className="p-3 bg-danger text-white">
-                        <h2 className="m-0">Error</h2>
-                    </div>
-                    <div className="p-3">
-                        <Message severity="error" text={error} className="w-full mb-3"/>
-                        <Button label="Back to Merge Requests" icon="pi pi-arrow-left"
-                                onClick={() => navigate('/merge-requests')}/>
-                    </div>
-                </Card>
-            </div>
-        );
-    }
-
-    // No merge request found
-    if (!mergeRequestDetail) {
-        return (
-            <div className="container py-4">
-                <Toast ref={toast}/>
-                <Card className="mb-4">
-                    <div className="p-3 bg-warning text-white">
-                        <h2 className="m-0">Not Found</h2>
-                    </div>
-                    <div className="p-3">
-                        <Message severity="warn" text="Merge request not found" className="w-full mb-3"/>
-                        <Button label="Back to Merge Requests" icon="pi pi-arrow-left"
-                                onClick={() => navigate('/merge-requests')}/>
-                    </div>
-                </Card>
-            </div>
-        );
-    }
-
-    const status = mergeRequestDetail.mergeRequest.status;
-    const isLocked = ['IN_PROGRESS', 'COMPLETED', 'FAILED'].includes(status);
-    const completeOnly = location.pathname.endsWith('/complete');
-
+  if (isLoading) return <div className="flex justify-content-center p-5"><ProgressSpinner /></div>;
+  if (error || !mr) {
     return (
-        <div className="container py-4">
-            <Toast ref={toast}/>
-
-            {/* derive lock flag */}
-            {(() => {
-                return null;
-            })()}
-
-            {/* Header */}
-            <Card className="mb-4">
-                <div className="flex justify-content-between align-items-center p-3 bg-primary text-white">
-                    <div>
-                        <h2 className="m-0">{mergeRequestDetail.mergeRequest.name}</h2>
-                        <p className="m-0 mt-2">{mergeRequestDetail.mergeRequest.description}</p>
-                    </div>
-                    <Button label="Back to Merge Requests" icon="pi pi-arrow-left"
-                            className="p-button-outlined p-button-secondary"
-                            onClick={() => navigate('/merge-requests')}/>
-                </div>
-                <div className="p-3">
-                    <div className="grid">
-                        <div className="col-12 md:col-6">
-                            <div className="flex align-items-center mb-3">
-                                <span className="font-bold mr-2">Source Instance:</span>
-                                <Tag value={mergeRequestDetail.mergeRequest.sourceInstance.name} severity="info"/>
-                            </div>
-                            <div className="flex align-items-center mb-3">
-                                <span className="font-bold mr-2">Target Instance:</span>
-                                <Tag value={mergeRequestDetail.mergeRequest.targetInstance.name} severity="warning"/>
-                            </div>
-                        </div>
-                        <div className="col-12 md:col-6">
-                            <div className="flex align-items-center mb-3">
-                                <span className="font-bold mr-2">Status:</span>
-                                <Tag
-                                    value={mergeRequestDetail.mergeRequest.status.replace('_', ' ').toLowerCase()}
-                                    severity={
-                                        mergeRequestDetail.mergeRequest.status === 'COMPLETED' ? 'success' :
-                                            mergeRequestDetail.mergeRequest.status === 'FAILED' ? 'danger' : 'info'
-                                    }
-                                />
-                            </div>
-                            <div className="flex align-items-center mb-3">
-                                <span className="font-bold mr-2">Created:</span>
-                                <span>{new Date(mergeRequestDetail.mergeRequest.createdAt).toLocaleString()}</span>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </Card>
-
-
-            {/* Stepper */}
-            {(!isLocked && !completeOnly && ['CREATED','SCHEMA_CHECKED','COMPARED', 'MERGED_FILES', 'MERGED_SINGLES', 'MERGED_COLLECTIONS'].includes(status)) && (
-
-                <Card className="mb-4">
-                    <div className="p-3">
-                        <div className="grid">
-                            <div className="col-12 md:col-6">
-                                <Card className="h-full">
-                                    <div className="flex align-items-center justify-content-between mb-3">
-                                        <h3 className="m-0">1. Schema Compatibility</h3>
-                                        <Tag
-                                            value={mergeRequestDetail.mergeRequest.status !== 'CREATED' ? 'Checked' : 'Pending'}
-                                            severity={mergeRequestDetail.mergeRequest.status !== 'CREATED' ? 'success' : 'warning'}
-                                        />
-                                    </div>
-                                    {/* Async mode: import schema/prefetch */}
-                                    <div className="mb-3 flex gap-2 flex-wrap">
-                                        <input type="file" accept="application/json" style={{display:'none'}} ref={schemaInputRef} onChange={onSchemaFileSelected} />
-                                        <Button label={uploadingSchema ? 'Importing schema…' : 'Import schema JSON'} icon="pi pi-upload" disabled={uploadingSchema || isLocked} onClick={() => schemaInputRef.current?.click()} />
-                                        <input type="file" accept="application/json" style={{display:'none'}} ref={prefetchInputRef} onChange={onPrefetchFileSelected} />
-                                        <Button label={uploadingPrefetch ? 'Import prefetch…' : 'Import prefetch JSON'} icon="pi pi-upload" disabled={uploadingPrefetch || isLocked} onClick={() => prefetchInputRef.current?.click()} />
-                                    </div>
-                                    <SchemaCompatibilityStep
-                                        schemaCompatible={mergeRequestDetail?.isCompatible === true}
-                                        checkingSchema={checkingSchema}
-                                        checkSchemaCompatibility={checkSchemaCompatibility}
-                                    />
-                                </Card>
-                            </div>
-                            <div className="col-12 md:col-6">
-                                <Card className="h-full">
-                                    <div className="flex align-items-center justify-content-between mb-3">
-                                        <h3 className="m-0">2. Content Comparison</h3>
-                                        <Tag
-                                            value={(mergeRequestDetail.mergeRequest.status === 'COMPARED' || mergeRequestDetail.mergeRequest.status === 'MERGED_FILES' || mergeRequestDetail.mergeRequest.status === 'MERGED_SINGLES' || mergeRequestDetail.mergeRequest.status === 'MERGED_COLLECTIONS' || mergeRequestDetail.mergeRequest.status === 'COMPLETED') ? 'Done' : (mergeRequestDetail.mergeRequest.status !== 'CREATED' ? 'Ready' : 'Locked')}
-                                            severity={(mergeRequestDetail.mergeRequest.status === 'COMPARED' || mergeRequestDetail.mergeRequest.status === 'MERGED_FILES' || mergeRequestDetail.mergeRequest.status === 'MERGED_SINGLES' || mergeRequestDetail.mergeRequest.status === 'MERGED_COLLECTIONS' || mergeRequestDetail.mergeRequest.status === 'COMPLETED') ? 'success' : (mergeRequestDetail.mergeRequest.status !== 'CREATED' ? 'info' : 'warning')}
-                                        />
-                                    </div>
-                                    <ContentComparisonStep
-                                        comparingContent={comparingContent}
-                                        schemaCompatible={mergeRequestDetail?.isCompatible === true}
-                                        compareContent={compareContent}
-                                        status={mergeRequestDetail.mergeRequest.status}
-                                    />
-                                </Card>
-                            </div>
-                        </div>
-                    </div>
-                </Card>
-            )}
-            {(!isLocked && !completeOnly && ['COMPARED', 'MERGED_FILES', 'MERGED_SINGLES', 'MERGED_COLLECTIONS'].includes(status)) && (
-                <Card>
-                    <div className="p-3">
-                        <Stepper
-                            ref={stepperRef}
-                            style={{width: '100%'}}
-                            orientation="vertical"
-                            activeStep={activeStep}
-                            linear={false}
-                            onChange={(event) => {
-                                const index = (event as any).index;
-                                setActiveStep(index);
-                            }}>
-
-                            {/* Step 3: Merge Files */}
-                            <StepperPanel header="Merge Files">
-                                <MergeFilesStep
-                                    mergeRequestId={mergeRequestDetail.mergeRequest.id}
-                                    filesData={mergeRequestDetail.mergeRequestData?.files}
-                                    loading={false}
-                                    updateAllSelections={updateAllSelections}
-                                    selections={mergeRequestDetail.mergeRequestData?.selections || []}
-                                    allMergeData={mergeRequestDetail.mergeRequestData!}
-                                    onSaved={updateMergeData}
-                                />
-                                <div className="flex py-4 gap-2 justify-content-between">
-                                    <Button
-                                        label="Back"
-                                        severity="secondary"
-                                        icon="pi pi-arrow-left"
-                                        disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
-                                        onClick={() => {
-                                            if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
-                                                toast.current?.show({
-                                                    severity: 'info',
-                                                    summary: 'Merge Completed',
-                                                    detail: 'This merge request has been completed and cannot be modified.',
-                                                    life: 3000
-                                                });
-                                                return;
-                                            }
-                                            stepperRef.current.prevCallback();
-                                        }}
-                                    />
-                                    <Button
-                                        label="Next"
-                                        icon="pi pi-arrow-right"
-                                        iconPos="right"
-                                        disabled={mergeRequestDetail.mergeRequest.status !== 'COMPARED' && mergeRequestDetail.mergeRequest.status !== 'MERGED_FILES' && mergeRequestDetail.mergeRequest.status !== 'MERGED_SINGLES' && mergeRequestDetail.mergeRequest.status !== 'MERGED_COLLECTIONS' && mergeRequestDetail.mergeRequest.status !== 'COMPLETED'}
-                                        onClick={() => {
-                                            if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
-                                                toast.current?.show({
-                                                    severity: 'info',
-                                                    summary: 'Merge Completed',
-                                                    detail: 'This merge request has been completed and cannot be modified.',
-                                                    life: 3000
-                                                });
-                                                return;
-                                            }
-                                            proceedToNextStep(1).catch(error => {
-                                                toast.current?.show({
-                                                    severity: 'error',
-                                                    summary: 'Error',
-                                                    detail: error,
-                                                    life: 3000
-
-                                                })
-                                            })
-                                        }}
-                                    />
-                                </div>
-                            </StepperPanel>
-
-                            {/* Step 4: Merge Single Types */}
-                            <StepperPanel header="Merge Single Types">
-                                {(() => {
-
-                                    const arrayTypes: Record<string, ContentTypeComparisonResultWithRelationships[]> = mergeRequestDetail.mergeRequestData?.singleTypes ? Object.entries(mergeRequestDetail.mergeRequestData?.singleTypes).reduce(
-                                        (acc, [key, value]) => {
-                                            acc[key] = [value];
-                                            return acc;
-                                        },
-                                        {} as Record<string, ContentTypeComparisonResultWithRelationships[]>
-                                    ) : {} as Record<string, ContentTypeComparisonResultWithRelationships[]>
-
-                                    return <MergeSingleTypesStep
-                                        kind={StrapiContentTypeKind.SingleType}
-                                        status={mergeRequestDetail.mergeRequest.status}
-                                        mergeSingleTypes={mergeSingleTypes}
-                                        mergeRequestId={parseInt(id || '0')}
-                                        contentData={arrayTypes}
-                                        selections={mergeRequestDetail.mergeRequestData?.selections || []}
-                                        loading={false}
-                                        allMergeData={mergeRequestDetail.mergeRequestData!}
-                                        updateAllSelections={updateAllSelections}
-                                        onSaved={updateMergeData}
-                                    />
-                                })()}
-                                <div className="flex py-4 gap-2 justify-content-between">
-                                    <Button
-                                        label="Back"
-                                        severity="secondary"
-                                        icon="pi pi-arrow-left"
-                                        disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
-                                        onClick={() => {
-                                            if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
-                                                toast.current?.show({
-                                                    severity: 'info',
-                                                    summary: 'Merge Completed',
-                                                    detail: 'This merge request has been completed and cannot be modified.',
-                                                    life: 3000
-                                                });
-                                                return;
-                                            }
-                                            stepperRef.current.prevCallback();
-                                        }}
-                                    />
-                                    <Button
-                                        label="Next"
-                                        icon="pi pi-arrow-right"
-                                        iconPos="right"
-                                        disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
-                                        onClick={() => {
-                                            if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
-                                                toast.current?.show({
-                                                    severity: 'info',
-                                                    summary: 'Merge Completed',
-                                                    detail: 'This merge request has been completed and cannot be modified.',
-                                                    life: 3000
-                                                });
-                                                return;
-                                            }
-                                            proceedToNextStep(2).catch(error => {
-                                                toast.current?.show({
-                                                    severity: 'error',
-                                                    summary: 'Error',
-                                                    detail: error,
-                                                    life: 3000
-
-                                                })
-                                            })
-                                        }}
-                                    />
-                                </div>
-                            </StepperPanel>
-
-                            {/* Step 5: Merge Collections */}
-                            <StepperPanel header="Merge Collections">
-                                {mergeRequestDetail.mergeRequestData && (
-                                    <MergeCollectionsStep
-                                        status={mergeRequestDetail.mergeRequest.status}
-                                        mergingCollections={mergingCollections}
-                                        mergeCollections={mergeCollections}
-                                        mergeRequestId={parseInt(id || '0')}
-                                        collectionTypesData={mergeRequestDetail.mergeRequestData?.collectionTypes}
-                                        selections={mergeRequestDetail.mergeRequestData?.selections}
-                                        allMergeData={mergeRequestDetail.mergeRequestData!}
-                                        updateAllSelections={updateAllSelections}
-                                        onSaved={updateMergeData}
-                                    />
-                                )}
-                                <div className="flex py-4 gap-2 justify-content-between">
-                                    <Button
-                                        label="Back"
-                                        severity="secondary"
-                                        icon="pi pi-arrow-left"
-                                        disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
-                                        onClick={() => {
-                                            if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
-                                                toast.current?.show({
-                                                    severity: 'info',
-                                                    summary: 'Merge Completed',
-                                                    detail: 'This merge request has been completed and cannot be modified.',
-                                                    life: 3000
-                                                });
-                                                return;
-                                            }
-                                            stepperRef.current.prevCallback();
-                                        }}
-                                    />
-                                    <Button
-                                        label="Next"
-                                        icon="pi pi-arrow-right"
-                                        iconPos="right"
-                                        disabled={mergeRequestDetail.mergeRequest.status === 'COMPLETED'}
-                                        onClick={() => {
-                                            if (mergeRequestDetail.mergeRequest.status === 'COMPLETED') {
-                                                toast.current?.show({
-                                                    severity: 'info',
-                                                    summary: 'Merge Completed',
-                                                    detail: 'This merge request has been completed and cannot be modified.',
-                                                    life: 3000
-                                                });
-                                                return;
-                                            }
-                                            proceedToNextStep(4).catch(error => {
-                                                toast.current?.show({
-                                                    severity: 'error',
-                                                    summary: 'Error',
-                                                    detail: error,
-                                                    life: 3000
-
-                                                })
-                                            })
-                                        }}
-                                    />
-                                </div>
-                            </StepperPanel>
-
-                        </Stepper>
-                    </div>
-                </Card>
-
-            )}
-
-            {['REVIEW', 'IN_PROGRESS'].includes(status) && (
-                <div className="mb-3">
-                    <Button label="Torna alla wizard" icon="pi pi-arrow-left" className="p-button-outlined"
-                            onClick={() => {
-                                setActiveStep(2)
-                                updateMergeRequestStatus('MERGED_COLLECTIONS').catch(error => {
-                                    console.error('Error updating merge request status:', error);
-                                })
-                            }
-                            }/>
-                </div>
-            )}
-
-            {(['REVIEW', 'IN_PROGRESS', 'COMPLETED', 'FAILED'].includes(status)) && (
-                <>
-                    <SnapshotManager 
-                        mergeRequestId={parseInt(id || '0')} 
-                        onRestoreComplete={() => {
-                            // Optionally refresh detail after restore
-                            window.location.reload();
-                        }}
-                    />
-                    <Card className="mt-4">
-                        <div className="p-3">
-                            <CompleteMergeStep
-                                status={mergeRequestDetail.mergeRequest.status}
-                                completing={completing}
-                                completeMerge={completeMerge}
-                                selections={mergeRequestDetail.mergeRequestData?.selections}
-                                allMergeData={mergeRequestDetail.mergeRequestData}
-                            />
-                        </div>
-                    </Card>
-                </>
-            )}
-        </div>
+      <div>
+        <Toast ref={toast} />
+        <Message severity={error ? 'error' : 'warn'} text={error ? apiErrorMessage(error) : 'Merge request not found'} className="w-full mb-3" />
+        <Button label="Back to merge requests" icon="pi pi-arrow-left" onClick={() => navigate('/merge-requests')} />
+      </div>
     );
+  }
+
+  const detail = mr;
+  const status = detail.mergeRequest.status;
+  const rank = RANK[status] ?? 0;
+  const phase: 'prep' | 'merge' | 'review' = rank < 2 ? 'prep' : rank < 6 ? 'merge' : 'review';
+  const completed = status === 'COMPLETED';
+  const bothReal = !detail.mergeRequest.sourceInstance.isVirtual && !detail.mergeRequest.targetInstance.isVirtual;
+  const data = detail.mergeRequestData;
+
+  const steps: PipeStep[] = [
+    { key: 'schema', label: 'Schema', icon: 'pi pi-shield', done: rank >= 1, current: phase === 'prep' && rank < 1 },
+    { key: 'compare', label: 'Compare', icon: 'pi pi-search', done: rank >= 2, current: phase === 'prep' && rank >= 1 },
+    { key: 'identity', label: 'Identity', icon: 'pi pi-id-card', done: false, current: false, onClick: rank >= 2 && bothReal ? () => setShowReconcile(true) : undefined },
+    { key: 'files', label: 'Files', icon: 'pi pi-images', done: rank >= 3, current: phase === 'merge' && activeStep === 0, onClick: phase === 'merge' ? () => setActiveStep(0) : undefined },
+    { key: 'content', label: 'Content', icon: 'pi pi-database', done: rank >= 5, current: phase === 'merge' && activeStep === 1, onClick: phase === 'merge' ? () => setActiveStep(1) : undefined },
+    { key: 'complete', label: 'Complete', icon: 'pi pi-flag', done: completed, current: phase === 'review' },
+  ];
+
+  return (
+    <div>
+      <Toast ref={toast} />
+
+      <div className="ss-page-head">
+        <div className="flex align-items-center gap-3" style={{ minWidth: 0 }}>
+          <Button icon="pi pi-arrow-left" rounded text aria-label="Back" onClick={() => navigate('/merge-requests')} />
+          <div style={{ minWidth: 0 }}>
+            <h2 style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{detail.mergeRequest.name}</h2>
+            <div className="ss-muted text-sm mt-1">
+              {detail.mergeRequest.sourceInstance.name} <i className="pi pi-arrow-right" style={{ fontSize: '.7rem' }} aria-hidden="true" /> {detail.mergeRequest.targetInstance.name}
+            </div>
+          </div>
+        </div>
+        <Tag value={status.replace(/_/g, ' ').toLowerCase()} severity={statusSeverity(status)} />
+      </div>
+
+      <Pipeline steps={steps} />
+
+      <div className="mt-3">
+        {phase === 'prep' && (
+          <div className="surface-card border-round p-4" style={{ border: '1px solid var(--surface-border)' }}>
+            <div className="grid">
+              <div className="col-12 md:col-6">
+                <h3 className="mb-2">Schema compatibility</h3>
+                <div className="mb-3 flex gap-2 flex-wrap">
+                  <input type="file" accept="application/json" style={{ display: 'none' }} ref={schemaInputRef} onChange={onSchemaFileSelected} />
+                  <Button label="Import schema JSON" icon="pi pi-upload" outlined size="small" loading={importSchemaMut.isPending} onClick={() => schemaInputRef.current?.click()} />
+                  <input type="file" accept="application/json" style={{ display: 'none' }} ref={prefetchInputRef} onChange={onPrefetchFileSelected} />
+                  <Button label="Import prefetch JSON" icon="pi pi-upload" outlined size="small" loading={importPrefetchMut.isPending} onClick={() => prefetchInputRef.current?.click()} />
+                </div>
+                <SchemaCompatibilityStep schemaCompatible={detail.isCompatible === true} checkingSchema={checkSchemaMut.isPending} checkSchemaCompatibility={checkSchemaCompatibility} />
+              </div>
+              <div className="col-12 md:col-6">
+                <h3 className="mb-2">Content comparison</h3>
+                <ContentComparisonStep comparingContent={compareMut.isPending} schemaCompatible={detail.isCompatible === true} compareContent={compareContent} status={status} />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {phase === 'merge' && (
+          <>
+            <div className="surface-card border-round p-3" style={{ border: '1px solid var(--surface-border)' }}>
+              {activeStep === 0 && (
+                <MergeFilesStep mergeRequestId={detail.mergeRequest.id} filesData={data?.files} loading={false}
+                  updateAllSelections={updateAllSelections} selections={data?.selections || []} allMergeData={data!} onSaved={patchMergeData} />
+              )}
+              {activeStep === 1 && data && (
+                <MergeContentWorkspace mergeRequestId={idNum} data={data}
+                  updateAllSelections={updateAllSelections} onSaved={() => { refetch(); }} />
+              )}
+            </div>
+
+            <div className="ss-actionbar">
+              <Button label="Re-compare" icon="pi pi-refresh" text size="small" loading={compareMut.isPending} onClick={compareContent} />
+              <div className="flex gap-2">
+                <Button label="Back" icon="pi pi-arrow-left" outlined disabled={completed || activeStep === 0} onClick={() => setActiveStep(activeStep - 1)} />
+                <Button
+                  label={activeStep === 1 ? 'Go to review' : 'Next'} icon="pi pi-arrow-right" iconPos="right" disabled={completed}
+                  onClick={() => proceedToNextStep(activeStep === 0 ? 1 : 4).catch((e) => showError(apiErrorMessage(e)))}
+                />
+              </div>
+            </div>
+          </>
+        )}
+
+        {phase === 'review' && (
+          <>
+            <SnapshotManager mergeRequestId={idNum} onRestoreComplete={() => refetch()} />
+            <div className="surface-card border-round p-3 mt-3" style={{ border: '1px solid var(--surface-border)' }}>
+              <CompleteMergeStep status={status} completing={completeMut.isPending} completeMerge={completeMerge}
+                selections={data?.selections} allMergeData={data} />
+            </div>
+            {!completed && (
+              <div className="mt-3">
+                <Button label="Back to wizard" icon="pi pi-arrow-left" outlined onClick={() => { setActiveStep(1); updateMergeRequestStatus('MERGED_COLLECTIONS'); }} />
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      <IdentityReconciliationDialog mergeRequestId={idNum} visible={showReconcile} onHide={() => setShowReconcile(false)} />
+    </div>
+  );
 };
 
 export default MergeRequestDetails;

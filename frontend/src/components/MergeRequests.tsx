@@ -1,10 +1,6 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import axios from 'axios';
-import { Card } from 'primereact/card';
 import { Button } from 'primereact/button';
-import { DataTable, SortOrder } from 'primereact/datatable';
-import { Column } from 'primereact/column';
 import { Message } from 'primereact/message';
 import { Toast } from 'primereact/toast';
 import { Dialog } from 'primereact/dialog';
@@ -12,546 +8,194 @@ import { InputText } from 'primereact/inputtext';
 import { Dropdown } from 'primereact/dropdown';
 import { InputTextarea } from 'primereact/inputtextarea';
 import { Tag } from 'primereact/tag';
+import { SelectButton } from 'primereact/selectbutton';
 import { ProgressSpinner } from 'primereact/progressspinner';
 import { confirmDialog, ConfirmDialog } from 'primereact/confirmdialog';
-import { TabView, TabPanel } from 'primereact/tabview';
+import { useMergeRequests, useCreateMergeRequest, useDeleteMergeRequest } from '../api/mergeRequests';
+import { useInstances } from '../api/instances';
+import { apiErrorMessage } from '../api/http';
 
-interface StrapiInstance {
-  id: number;
-  name: string;
-  url: string;
-}
-
-interface MergeRequest {
+interface MergeRequestRow {
   id: number;
   name: string;
   description: string;
-  sourceInstance: StrapiInstance;
-  targetInstance: StrapiInstance;
+  sourceInstance?: { name: string };
+  targetInstance?: { name: string };
   status: string;
   schemaCompatible: boolean | null;
-  createdAt: string;
   updatedAt: string;
 }
 
-interface MergeRequestFormData {
-  name: string;
-  description: string;
-  sourceInstanceId: number | null;
-  targetInstanceId: number | null;
-}
+const statusMeta = (status: string, schemaCompatible: boolean | null): { label: string; severity: 'success' | 'info' | 'warning' | 'danger' } => {
+  switch (status) {
+    case 'CREATED': return { label: 'created', severity: 'info' };
+    case 'SCHEMA_CHECKED': return schemaCompatible ? { label: 'schema ok', severity: 'success' } : { label: 'schema incompatible', severity: 'danger' };
+    case 'COMPARED': return { label: 'compared', severity: 'info' };
+    case 'MERGED_FILES': return { label: 'files merged', severity: 'info' };
+    case 'MERGED_SINGLES': return { label: 'singles merged', severity: 'info' };
+    case 'MERGED_COLLECTIONS': return { label: 'collections merged', severity: 'info' };
+    case 'REVIEW': return { label: 'review', severity: 'warning' };
+    case 'IN_PROGRESS': return { label: 'in progress', severity: 'warning' };
+    case 'COMPLETED': return { label: 'completed', severity: 'success' };
+    case 'FAILED': return { label: 'failed', severity: 'danger' };
+    default: return { label: status.replace(/_/g, ' ').toLowerCase(), severity: 'info' };
+  }
+};
+
+const iconColor = (sev: string) =>
+  sev === 'success' ? 'var(--green-400)' : sev === 'danger' ? 'var(--red-400)' : sev === 'warning' ? 'var(--yellow-400)' : 'var(--primary-color)';
 
 const MergeRequests: React.FC = () => {
-  const [mergeRequests, setMergeRequests] = useState<MergeRequest[]>([]);
-  const [instances, setInstances] = useState<StrapiInstance[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
-  const [showCreateDialog, setShowCreateDialog] = useState<boolean>(false);
-  const [formData, setFormData] = useState<MergeRequestFormData>({
-    name: '',
-    description: '',
-    sourceInstanceId: null,
-    targetInstanceId: null
-  });
-  const [formErrors, setFormErrors] = useState<Record<string, string>>({});
-  const [submitting, setSubmitting] = useState<boolean>(false);
-  const [activeTabIndex, setActiveTabIndex] = useState<number>(0);
-  const [sortField, setSortField] = useState<string>("updatedAt");
-  const [sortOrder, setSortOrder] = useState<SortOrder>(-1 as SortOrder); // -1 for DESC, 1 for ASC
-  const [page, setPage] = useState<number>(1);
-  const [pageSize, setPageSize] = useState<number>(10);
-  const toast = useRef<Toast>(null);
   const navigate = useNavigate();
+  const toast = useRef<Toast>(null);
+  const [completed, setCompleted] = useState<boolean>(false);
+  const [showCreate, setShowCreate] = useState(false);
+  const [form, setForm] = useState<{ name: string; description: string; sourceInstanceId: number | null; targetInstanceId: number | null }>({
+    name: '', description: '', sourceInstanceId: null, targetInstanceId: null,
+  });
 
-  // Fetch merge requests and instances
-  const fetchData = async () => {
+  const { data: mergeRequests = [], isLoading } = useMergeRequests({ completed, sortBy: 'updatedAt', sortOrder: 'DESC' });
+  const { data: instances = [] } = useInstances();
+  const createMut = useCreateMergeRequest();
+  const deleteMut = useDeleteMergeRequest();
+
+  const rows = mergeRequests as MergeRequestRow[];
+
+  const submit = async () => {
+    if (!form.name.trim() || form.sourceInstanceId == null || form.targetInstanceId == null) {
+      toast.current?.show({ severity: 'warn', summary: 'Missing fields', detail: 'Name, source and target are required.', life: 3000 });
+      return;
+    }
+    if (form.sourceInstanceId === form.targetInstanceId) {
+      toast.current?.show({ severity: 'warn', summary: 'Invalid', detail: 'Source and target must differ.', life: 3000 });
+      return;
+    }
     try {
-      setLoading(true);
-
-      // Fetch instances if not already loaded
-      if (instances.length === 0) {
-        const instancesResponse = await axios.get('/api/instances');
-        setInstances(instancesResponse.data);
-      }
-
-      // Determine completed status based on active tab
-      const completed = activeTabIndex === 1 ? true : (activeTabIndex === 0 ? false : null);
-
-      // Convert sort order from number to string
-      const sortOrderStr = sortOrder === 1 ? 'ASC' : 'DESC';
-
-      // Fetch merge requests with filtering, sorting, and pagination
-      const mergeRequestsResponse = await axios.get('/api/merge-requests', {
-        params: {
-          completed,
-          sortBy: sortField,
-          sortOrder: sortOrderStr,
-          page,
-          pageSize
-        }
+      const created: any = await createMut.mutateAsync({
+        name: form.name.trim(),
+        description: (form.description || '').trim(),
+        sourceInstanceId: form.sourceInstanceId,
+        targetInstanceId: form.targetInstanceId,
       });
-
-      setMergeRequests(mergeRequestsResponse.data);
-      setError(null);
-    } catch (err: any) {
-      console.error('Error fetching data:', err);
-      setError(err.response?.data?.message || 'Failed to fetch data');
-    } finally {
-      setLoading(false);
+      setShowCreate(false);
+      setForm({ name: '', description: '', sourceInstanceId: null, targetInstanceId: null });
+      if (created?.id) navigate(`/merge-requests/${created.id}`);
+    } catch (e) {
+      toast.current?.show({ severity: 'error', summary: 'Error', detail: apiErrorMessage(e), life: 4000 });
     }
   };
 
-  // Fetch data on component mount and when parameters change
-  useEffect(() => {
-    fetchData();
-  }, [activeTabIndex, sortField, sortOrder, page, pageSize]);
-
-  // Handle form input changes
-  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement> | { value: any, target: { name: string } }) => {
-    // Handle both React.ChangeEvent and custom object with value property
-    const name = e.target.name;
-    const value = 'value' in e ? e.value : (e.target as HTMLInputElement | HTMLTextAreaElement).value;
-
-    setFormData(prev => ({ ...prev, [name]: value }));
-
-    // Clear error for this field
-    if (formErrors[name]) {
-      setFormErrors(prev => {
-        const newErrors = { ...prev };
-        delete newErrors[name];
-        return newErrors;
-      });
-    }
-  };
-
-  // Validate form
-  const validateForm = (): boolean => {
-    const errors: Record<string, string> = {};
-
-    if (!formData.name.trim()) {
-      errors.name = 'Name is required';
-    }
-
-    // Description is optional
-
-    if (formData.sourceInstanceId === null) {
-      errors.sourceInstanceId = 'Source instance is required';
-    }
-
-    if (formData.targetInstanceId === null) {
-      errors.targetInstanceId = 'Target instance is required';
-    }
-
-    if (formData.sourceInstanceId === formData.targetInstanceId && formData.sourceInstanceId !== null) {
-      errors.targetInstanceId = 'Source and target instances must be different';
-    }
-
-    setFormErrors(errors);
-    return Object.keys(errors).length === 0;
-  };
-
-  // Handle form submission
-  const handleSubmit = async () => {
-    if (!validateForm()) return;
-
-    try {
-      setSubmitting(true);
-
-      const response = await axios.post('/api/merge-requests', {
-        ...formData,
-        // ensure backend receives empty string when description omitted
-        description: (formData.description || '').trim()
-      });
-
-      // Show success message
-      toast.current?.show({
-        severity: 'success',
-        summary: 'Success',
-        detail: 'Merge request created successfully',
-        life: 3000
-      });
-
-      // Close the dialog and reset form
-      setShowCreateDialog(false);
-      setFormData({
-        name: '',
-        description: '',
-        sourceInstanceId: null,
-        targetInstanceId: null
-      });
-
-      // Make sure we're on the "Pending" tab since new merge requests are always pending
-      if (activeTabIndex !== 0) {
-        setActiveTabIndex(0);
-      } else {
-        // If already on the pending tab, just refresh the data
-        fetchData();
-      }
-
-      // Navigate directly to the merge request details page
-      navigate(`/merge-requests/${response.data.id}`);
-    } catch (err: any) {
-      console.error('Error creating merge request:', err);
-      toast.current?.show({
-        severity: 'error',
-        summary: 'Error',
-        detail: err.response?.data?.message || 'Failed to create merge request',
-        life: 3000
-      });
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  // Handle delete merge request
-  const handleDelete = (id: number) => {
+  const onDelete = (e: React.MouseEvent, id: number) => {
+    e.stopPropagation();
     confirmDialog({
-      message: 'Are you sure you want to delete this merge request?',
-      header: 'Confirm Delete',
+      message: 'Delete this merge request?',
+      header: 'Confirm delete',
       icon: 'pi pi-exclamation-triangle',
       acceptClassName: 'p-button-danger',
       accept: async () => {
         try {
-          await axios.delete(`/api/merge-requests/${id}`);
-
-          // Refresh the data to reflect the deletion
-          fetchData();
-
-          // Show success message
-          toast.current?.show({
-            severity: 'success',
-            summary: 'Success',
-            detail: 'Merge request deleted successfully',
-            life: 3000
-          });
-        } catch (err: any) {
-          console.error('Error deleting merge request:', err);
-          toast.current?.show({
-            severity: 'error',
-            summary: 'Error',
-            detail: err.response?.data?.message || 'Failed to delete merge request',
-            life: 3000
-          });
+          await deleteMut.mutateAsync(id);
+          toast.current?.show({ severity: 'success', summary: 'Deleted', life: 2500 });
+        } catch (err) {
+          toast.current?.show({ severity: 'error', summary: 'Error', detail: apiErrorMessage(err), life: 4000 });
         }
-      }
+      },
     });
   };
 
-  // Navigate to merge request details
-  const handleViewMergeRequest = (id: number) => {
-    navigate(`/merge-requests/${id}`);
-  };
-
-  // Render status tag
-  const statusTemplate = (rowData: MergeRequest) => {
-    let severity: 'success' | 'info' | 'warning' | 'danger' = 'info';
-    let label = rowData.status;
-
-    switch (rowData.status) {
-      case 'CREATED':
-        severity = 'info';
-        label = 'Created';
-        break;
-      case 'SCHEMA_CHECKED':
-        severity = rowData.schemaCompatible ? 'success' : 'danger';
-        label = rowData.schemaCompatible ? 'Schema Compatible' : 'Schema Incompatible';
-        break;
-      case 'COMPARED':
-        severity = 'info';
-        label = 'Content Compared';
-        break;
-      case 'MERGED_FILES':
-        severity = 'info';
-        label = 'Files Merged';
-        break;
-      case 'MERGED_SINGLES':
-        severity = 'info';
-        label = 'Singles Merged';
-        break;
-      case 'MERGED_COLLECTIONS':
-        severity = 'info';
-        label = 'Collections Merged';
-        break;
-      case 'COMPLETED':
-        severity = 'success';
-        label = 'Completed';
-        break;
-      case 'FAILED':
-        severity = 'danger';
-        label = 'Failed';
-        break;
-    }
-
-    return <Tag severity={severity} value={label} />;
-  };
-
-  // Render instances
-  const instancesTemplate = (rowData: MergeRequest) => {
-    // Check if sourceInstance and targetInstance exist before accessing their properties
-    const sourceName = rowData.sourceInstance?.name || 'Unknown';
-    const targetName = rowData.targetInstance?.name || 'Unknown';
-
-    return (
-      <div className="flex flex-column">
-        <div className="mb-2">
-          <span className="font-bold mr-2">Source:</span>
-          <Tag value={sourceName} severity="info" />
-        </div>
-        <div>
-          <span className="font-bold mr-2">Target:</span>
-          <Tag value={targetName} severity="warning" />
-        </div>
-      </div>
-    );
-  };
-
-  // Render actions
-  const actionsTemplate = (rowData: MergeRequest) => {
-    return (
-      <div className="flex gap-2">
-        <Button 
-          icon="pi pi-eye" 
-          className="p-button-rounded p-button-outlined p-button-primary p-button-sm" 
-          onClick={() => handleViewMergeRequest(rowData.id)}
-          tooltip="View Details"
-        />
-        {/* Only show delete button for non-completed merge requests (first tab) */}
-        {activeTabIndex === 0 && (
-          <Button 
-            icon="pi pi-trash" 
-            className="p-button-rounded p-button-outlined p-button-danger p-button-sm"
-            onClick={() => handleDelete(rowData.id)}
-            tooltip="Delete"
-          />
-        )}
-      </div>
-    );
-  };
-
-  // Handle sort change
-  const onSort = (event: any) => {
-    setSortField(event.sortField);
-    setSortOrder(event.sortOrder);
-    setPage(1); // Reset to first page when sorting changes
-  };
-
-  // Handle page change
-  const onPage = (event: any) => {
-    setPage(event.page + 1); // PrimeReact uses 0-based indexing, our API uses 1-based
-    setPageSize(event.rows);
-  };
-
-  // Loading state
-  if (loading && mergeRequests.length === 0) {
-    return <div className="flex justify-content-center p-5"><ProgressSpinner /></div>;
-  }
-
   return (
-    <div className="container py-4">
+    <>
       <Toast ref={toast} />
       <ConfirmDialog />
 
-      <Card className="mb-4">
-        <div className="flex justify-content-between align-items-center p-3 bg-primary text-white">
-          <h2 className="m-0">Merge Requests</h2>
-          <Button 
-            label="Create Merge Request" 
-            icon="pi pi-plus" 
-            onClick={() => setShowCreateDialog(true)} 
-          />
-        </div>
-        <div className="p-3">
-          {error && <Message severity="error" text={error} className="w-full mb-3" />}
+      <div className="ss-page-head">
+        <h2>Merge requests</h2>
+        <Button label="New" icon="pi pi-plus" onClick={() => setShowCreate(true)} />
+      </div>
 
-          <TabView 
-            activeIndex={activeTabIndex} 
-            onTabChange={(e) => {
-              setActiveTabIndex(e.index);
-              setPage(1); // Reset to first page when changing tabs
-            }}
-          >
-            <TabPanel header="Pending Merge Requests">
-              {mergeRequests.length === 0 && !loading ? (
-                <Message 
-                  severity="info" 
-                  text="No pending merge requests found. Create your first merge request to get started." 
-                  className="w-full" 
-                />
-              ) : (
-                <DataTable 
-                  value={mergeRequests} 
-                  responsiveLayout="stack" 
-                  breakpoint="960px"
-                  stripedRows 
-                  paginator 
-                  rows={pageSize} 
-                  rowsPerPageOptions={[5, 10, 25, 50]}
-                  emptyMessage="No pending merge requests found"
-                  className="p-datatable-sm"
-                  lazy
-                  first={(page - 1) * pageSize}
-                  totalRecords={mergeRequests.length}
-                  onPage={onPage}
-                  loading={loading}
-                  sortField={sortField}
-                  sortOrder={sortOrder}
-                  onSort={onSort}
-                >
-                  <Column field="name" header="Name" sortable />
-                  <Column field="description" header="Description" />
-                  <Column header="Instances" body={instancesTemplate} />
-                  <Column header="Status" body={statusTemplate} sortable sortField="status" />
-                  <Column 
-                    field="updatedAt" 
-                    header="Last Updated" 
-                    sortable 
-                    body={(rowData) => new Date(rowData.updatedAt).toLocaleString()} 
-                  />
-                  <Column 
-                    field="createdAt" 
-                    header="Created" 
-                    sortable 
-                    body={(rowData) => new Date(rowData.createdAt).toLocaleString()} 
-                  />
-                  <Column header="Actions" body={actionsTemplate} style={{ width: '10rem' }} />
-                </DataTable>
-              )}
-            </TabPanel>
-            <TabPanel header="Completed Merge Requests">
-              {mergeRequests.length === 0 && !loading ? (
-                <Message 
-                  severity="info" 
-                  text="No completed merge requests found." 
-                  className="w-full" 
-                />
-              ) : (
-                <DataTable 
-                  value={mergeRequests} 
-                  responsiveLayout="stack" 
-                  breakpoint="960px"
-                  stripedRows 
-                  paginator 
-                  rows={pageSize} 
-                  rowsPerPageOptions={[5, 10, 25, 50]}
-                  emptyMessage="No completed merge requests found"
-                  className="p-datatable-sm"
-                  lazy
-                  first={(page - 1) * pageSize}
-                  totalRecords={mergeRequests.length}
-                  onPage={onPage}
-                  loading={loading}
-                  sortField={sortField}
-                  sortOrder={sortOrder}
-                  onSort={onSort}
-                >
-                  <Column field="name" header="Name" sortable />
-                  <Column field="description" header="Description" />
-                  <Column header="Instances" body={instancesTemplate} />
-                  <Column header="Status" body={statusTemplate} sortable sortField="status" />
-                  <Column 
-                    field="updatedAt" 
-                    header="Last Updated" 
-                    sortable 
-                    body={(rowData) => new Date(rowData.updatedAt).toLocaleString()} 
-                  />
-                  <Column 
-                    field="createdAt" 
-                    header="Created" 
-                    sortable 
-                    body={(rowData) => new Date(rowData.createdAt).toLocaleString()} 
-                  />
-                  <Column header="Actions" body={actionsTemplate} style={{ width: '10rem' }} />
-                </DataTable>
-              )}
-            </TabPanel>
-          </TabView>
-        </div>
-      </Card>
+      <SelectButton
+        value={completed}
+        onChange={(e) => e.value !== null && setCompleted(e.value)}
+        options={[{ label: 'In progress', value: false }, { label: 'Completed', value: true }]}
+        className="mb-3"
+      />
 
-      {/* Create Merge Request Dialog */}
-      <Dialog 
-        header="Create Merge Request" 
-        visible={showCreateDialog} 
-        style={{ width: '50vw' }} 
-        onHide={() => setShowCreateDialog(false)}
+      {isLoading ? (
+        <div className="flex justify-content-center p-5"><ProgressSpinner /></div>
+      ) : rows.length === 0 ? (
+        <Message severity="info" text={completed ? 'No completed merge requests.' : 'No merge requests yet. Create your first one.'} className="w-full" />
+      ) : (
+        <div className="flex flex-column gap-2">
+          {rows.map((mr) => {
+            const meta = statusMeta(mr.status, mr.schemaCompatible);
+            return (
+              <div
+                key={mr.id}
+                onClick={() => navigate(`/merge-requests/${mr.id}`)}
+                className="surface-card border-round p-3 flex align-items-center gap-3 cursor-pointer"
+                style={{ border: '1px solid var(--surface-border)' }}
+              >
+                <i className="pi pi-arrows-h" style={{ fontSize: '1.1rem', color: iconColor(meta.severity) }} aria-hidden="true" />
+                <div style={{ minWidth: 0, maxWidth: 420 }}>
+                  <div style={{ fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{mr.name}</div>
+                  <div className="ss-muted text-sm mt-1" style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {mr.sourceInstance?.name || '?'} <i className="pi pi-arrow-right" style={{ fontSize: '.7rem', verticalAlign: 'baseline' }} aria-hidden="true" /> {mr.targetInstance?.name || '?'}
+                  </div>
+                </div>
+                <Tag value={meta.label} severity={meta.severity} />
+                <span className="flex-1" />
+                <span className="ss-muted text-sm" style={{ whiteSpace: 'nowrap' }}>
+                  {new Date(mr.updatedAt).toLocaleDateString()}
+                </span>
+                {!completed && (
+                  <Button
+                    icon="pi pi-trash"
+                    rounded text severity="danger"
+                    aria-label="Delete"
+                    onClick={(e) => onDelete(e, mr.id)}
+                  />
+                )}
+                <i className="pi pi-chevron-right ss-muted" aria-hidden="true" />
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <Dialog
+        header="New merge request"
+        visible={showCreate}
+        style={{ width: '480px' }}
+        onHide={() => setShowCreate(false)}
         footer={
           <div>
-            <Button 
-              label="Cancel" 
-              icon="pi pi-times" 
-              className="p-button-text" 
-              onClick={() => setShowCreateDialog(false)} 
-              disabled={submitting}
-            />
-            <Button 
-              label="Create" 
-              icon="pi pi-check" 
-              onClick={handleSubmit} 
-              loading={submitting}
-            />
+            <Button label="Cancel" text onClick={() => setShowCreate(false)} disabled={createMut.isPending} />
+            <Button label="Create" icon="pi pi-check" onClick={submit} loading={createMut.isPending} />
           </div>
         }
       >
         <div className="p-fluid">
           <div className="field">
-            <label htmlFor="name">Name</label>
-            <InputText 
-              id="name" 
-              name="name" 
-              value={formData.name} 
-              onChange={handleInputChange} 
-              className={formErrors.name ? 'p-invalid' : ''}
-            />
-            {formErrors.name && <small className="p-error">{formErrors.name}</small>}
+            <label htmlFor="mr-name">Name</label>
+            <InputText id="mr-name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
           </div>
-
           <div className="field">
-            <label htmlFor="description">Description</label>
-            <InputTextarea 
-              id="description" 
-              name="description" 
-              value={formData.description} 
-              onChange={handleInputChange} 
-              rows={3} 
-              className={formErrors.description ? 'p-invalid' : ''}
-            />
-            {formErrors.description && <small className="p-error">{formErrors.description}</small>}
+            <label htmlFor="mr-desc">Description</label>
+            <InputTextarea id="mr-desc" rows={3} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
           </div>
-
           <div className="field">
-            <label htmlFor="sourceInstanceId">Source Instance</label>
-            <Dropdown 
-              id="sourceInstanceId" 
-              name="sourceInstanceId" 
-              value={formData.sourceInstanceId} 
-              options={instances} 
-              onChange={handleInputChange} 
-              optionLabel="name" 
-              optionValue="id" 
-              placeholder="Select a source instance" 
-              className={formErrors.sourceInstanceId ? 'p-invalid' : ''}
-            />
-            {formErrors.sourceInstanceId && <small className="p-error">{formErrors.sourceInstanceId}</small>}
+            <label htmlFor="mr-src">Source instance</label>
+            <Dropdown id="mr-src" value={form.sourceInstanceId} options={instances as any[]} optionLabel="name" optionValue="id"
+              onChange={(e) => setForm({ ...form, sourceInstanceId: e.value })} placeholder="Select source" />
           </div>
-
           <div className="field">
-            <label htmlFor="targetInstanceId">Target Instance</label>
-            <Dropdown 
-              id="targetInstanceId" 
-              name="targetInstanceId" 
-              value={formData.targetInstanceId} 
-              options={instances} 
-              onChange={handleInputChange} 
-              optionLabel="name" 
-              optionValue="id" 
-              placeholder="Select a target instance" 
-              className={formErrors.targetInstanceId ? 'p-invalid' : ''}
-            />
-            {formErrors.targetInstanceId && <small className="p-error">{formErrors.targetInstanceId}</small>}
+            <label htmlFor="mr-tgt">Target instance</label>
+            <Dropdown id="mr-tgt" value={form.targetInstanceId} options={instances as any[]} optionLabel="name" optionValue="id"
+              onChange={(e) => setForm({ ...form, targetInstanceId: e.value })} placeholder="Select target" />
           </div>
         </div>
       </Dialog>
-    </div>
+    </>
   );
 };
 

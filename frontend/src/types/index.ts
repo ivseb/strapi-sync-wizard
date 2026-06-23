@@ -118,6 +118,8 @@ export interface StrapiContentMetadata {
     id: number | null;
     documentId: string;
     locale?: string | null;
+    uniqueKey?: string;
+    syncId?: string | null;
 }
 
 export interface StrapiLinkRef {
@@ -295,4 +297,32 @@ export interface SnapshotActivityDTO {
     snapshotSchemaName: string | null;
     message: string | null;
     createdAt: string;
+}
+
+// --- Identity layer (Phase 1) ---
+export type ReconciliationActionKind =
+    | 'ALREADY_LINKED'
+    | 'LINK_TARGET_TO_SOURCE'
+    | 'LINK_SOURCE_TO_TARGET'
+    | 'ASSIGN_NEW_BOTH'
+    | 'CONFLICT_PREFER_SOURCE';
+
+export interface IdentityReconciliationAction {
+    contentType: string;
+    sourceDocumentId: string | null;
+    targetDocumentId: string | null;
+    locale: string | null;
+    canonicalSyncId: string;
+    kind: ReconciliationActionKind;
+}
+
+export interface IdentityReconciliationReport {
+    mergeRequestId: number;
+    applied: boolean;
+    totalPairs: number;
+    alreadyLinked: number;
+    linked: number;
+    assignedNew: number;
+    conflicts: number;
+    actions: IdentityReconciliationAction[];
 }

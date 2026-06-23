@@ -7,6 +7,7 @@ import it.sebi.database.dbQuery
 import it.sebi.models.*
 import it.sebi.repository.MergeRequestSelectionsRepository
 import it.sebi.service.MergeRequestService
+import it.sebi.service.identity.SyncIdentityService
 import it.sebi.service.merge.ContentJsonUtils.normalizeKeyName
 import it.sebi.service.resolveComponentTableName
 import it.sebi.tables.MergeRequestDocumentMappingTable
@@ -24,6 +25,34 @@ import org.slf4j.LoggerFactory
 class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeRequestSelectionsRepository) {
     private val logger = LoggerFactory.getLogger(ContentMergeProcessor::class.java)
 
+    // Target content-type attributes (by collectionName), used to auto-drop source-only fields so a
+    // COMPATIBLE-but-not-identical schema can still merge (target rejects unknown fields otherwise).
+    private var targetAttrsByTable: Map<String, Set<String>> = emptyMap()
+    private var targetAttrsNormByTable: Map<String, Set<String>> = emptyMap()
+
+    private suspend fun loadTargetAttrs(targetClient: StrapiClient) {
+        targetAttrsByTable = try {
+            targetClient.getContentTypes().associate { it.schema.collectionName to it.schema.attributes.keys }
+        } catch (e: Exception) {
+            logger.warn("Could not load target content types for field filtering: ${e.message}")
+            emptyMap()
+        }
+        targetAttrsNormByTable = targetAttrsByTable.mapValues { (_, v) -> v.map { normalizeKeyName(it) }.toSet() }
+    }
+
+    /** Remove fields the source has but the target schema doesn't, so writes aren't rejected. */
+    private fun dropForeignFields(tableName: String, data: JsonObject): JsonObject {
+        val allowed = targetAttrsByTable[tableName] ?: return data
+        val allowedNorm = targetAttrsNormByTable[tableName] ?: emptySet()
+        val dropped = mutableListOf<String>()
+        val kept = data.filterKeys { k ->
+            if (k.startsWith("__") || allowed.contains(k) || allowedNorm.contains(normalizeKeyName(k))) true
+            else { dropped.add(k); false }
+        }
+        if (dropped.isNotEmpty()) logger.info("[schema-compat] '$tableName': dropping source-only fields absent in target: $dropped")
+        return JsonObject(kept)
+    }
+
     /**
      * Second pass: update only circular dependency relations for items whose dependencies succeeded.
      */
@@ -39,6 +68,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
         mappingMap: MutableMap<String, MutableMap<String, MergeRequestDocumentMapping>> = mutableMapOf()
     ) {
         val contentTypeMappingByTable: Map<String, DbTable> = schema.tables.associateBy { it.name }
+        if (targetAttrsByTable.isEmpty()) loadTargetAttrs(targetClient)
 
         // Group circular edges by source item (from)
         val circularByFrom: Map<Pair<String, String>, List<MergeRequestService.CircularDependencyEdge>> =
@@ -83,7 +113,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                 val targetDocumentId = mappingMap[selection.tableName]?.get(srcDoc)?.targetDocumentId ?: srcDoc
                 targetClient.upsertContentEntry(
                     schemaTable.metadata!!.queryName,
-                    dataToCreate,
+                    dropForeignFields(schemaTable.name, dataToCreate),
                     entry.kind,
                     sourceContent.metadata.documentId,
                     targetDocumentId
@@ -118,6 +148,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
         mappingMap: MutableMap<String, MutableMap<String, MergeRequestDocumentMapping>> = mutableMapOf()
     ) {
         val contentTypeMappingByTable: Map<String, DbTable> = schema.tables.associateBy { it.name }
+        loadTargetAttrs(targetClient)
 
         // Build the set of all selected keys (table, documentId) to detect intra-selection dependencies
         val selectedKeys: Set<Pair<String, String>> = batches
@@ -309,7 +340,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                 try {
                     val response = targetClient.upsertContentEntry(
                         contentTypeSchema.metadata!!.queryName,
-                        dataToCreate,
+                        dropForeignFields(contentTypeSchema.name, dataToCreate),
                         StrapiContentTypeKind.SingleType,
                         sourceEntry.metadata.documentId,
                         comparisonResult.targetContent?.metadata?.documentId
@@ -362,6 +393,18 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                             sourceDocumentId = sourceDocId,
                             targetId = targetId,
                             targetDocumentId = targetDocumentId
+                        )
+                    }
+                    // Anti-drift (Phase 1): propagate the SOURCE syncId onto the target sidecar so
+                    // identity stays shared after apply (prevents phantom diffs on re-compare).
+                    val srcSyncId = sourceEntry.metadata.syncId
+                    if (!srcSyncId.isNullOrBlank() && targetDocumentId.isNotBlank()) {
+                        SyncIdentityService.upsertIdentity(
+                            targetStrapiInstance,
+                            contentTypeSchema.metadata!!.apiUid,
+                            targetDocumentId,
+                            sourceEntry.metadata.locale,
+                            srcSyncId
                         )
                     }
                     mergeRequestSelectionsRepository.updateSyncStatus(selection.id, true, null)
@@ -449,7 +492,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                 try {
                     val response = targetClient.upsertContentEntry(
                         contentTypeSchema.metadata!!.queryName,
-                        dataToCreate,
+                        dropForeignFields(contentTypeSchema.name, dataToCreate),
                         StrapiContentTypeKind.CollectionType,
                         sourceContent.metadata.documentId,
                         entry.targetContent?.metadata?.documentId
@@ -501,6 +544,18 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                             sourceDocumentId = sourceDocId,
                             targetId = targetId,
                             targetDocumentId = targetDocumentId
+                        )
+                    }
+                    // Anti-drift (Phase 1): propagate the SOURCE syncId onto the target sidecar so
+                    // identity stays shared after apply (prevents phantom diffs on re-compare).
+                    val srcSyncId = sourceContent.metadata.syncId
+                    if (!srcSyncId.isNullOrBlank() && targetDocumentId.isNotBlank()) {
+                        SyncIdentityService.upsertIdentity(
+                            targetStrapiInstance,
+                            contentTypeSchema.metadata!!.apiUid,
+                            targetDocumentId,
+                            sourceContent.metadata.locale,
+                            srcSyncId
                         )
                     }
                     mergeRequestSelectionsRepository.updateSyncStatus(selection.id, true, null)

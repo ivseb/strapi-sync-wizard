@@ -1,26 +1,19 @@
-import React, { useContext } from 'react';
+import React from 'react';
 import { MenuItem } from 'primereact/menuitem';
-import { LayoutContext } from '../../layout/context/layoutcontext';
-import Header from './Header';
-import Footer from './Footer';
+import Sidebar from './Sidebar';
 
 interface LayoutProps {
   children: React.ReactNode;
   menuItems: MenuItem[];
 }
 
-const Layout: React.FC<LayoutProps> = ({ children, menuItems }) => {
-  const { layoutConfig } = useContext(LayoutContext);
-
-  return (
-    <div className={`flex flex-column min-h-screen ${layoutConfig.colorScheme === 'dark' ? 'surface-ground' : ''}`}>
-      <Header menuItems={menuItems} />
-      <div className="container flex-grow-1 py-4">
-        {children}
-      </div>
-      <Footer />
-    </div>
-  );
-};
+const Layout: React.FC<LayoutProps> = ({ children, menuItems }) => (
+  <div className="ss-shell surface-ground">
+    <Sidebar menuItems={menuItems} />
+    <main className="ss-main">
+      <div className="ss-content">{children}</div>
+    </main>
+  </div>
+);
 
 export default Layout;

@@ -38,7 +38,9 @@ data class AttributeIncompatibilityDTO(
  */
 @Serializable
 data class SchemaCompatibilityResponse(
-    val isCompatible: Boolean
+    val isCompatible: Boolean,
+    val blocking: List<String> = emptyList(),
+    val warnings: List<String> = emptyList()
 )
 
 /**

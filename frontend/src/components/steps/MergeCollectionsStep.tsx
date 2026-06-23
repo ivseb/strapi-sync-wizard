@@ -112,32 +112,12 @@ const MergeCollectionsStep: React.FC<MergeCollectionsStepProps> = ({
         );
     }
 
-    const messageContent = <div className="flex align-items-center">
-        <i className="pi pi-info-circle mr-2" style={{fontSize: '1.5rem'}}></i>
-        <div>
-            <h5 className="mt-0 mb-1">Selection Management</h5>
-            <p className="m-0">
-                Select or deselect content types to include in the merge.
-                Each selection will be immediately saved to the server.
-                When you select a content type, you can view its details below.
-            </p>
-        </div>
-    </div>
-
     const selectedContent = activeContentType ? {
         activeContentType: collectionTypesData[activeContentType]
     } as Record<string, ContentTypeComparisonResultWithRelationships[]> : null
 
     return (
         <div>
-            <h3>Merge Collections</h3>
-            <p>
-                This step allows you to select which collection content types to create, update, or delete on the target
-                instance.
-                Review the differences and make your selections before proceeding.
-            </p>
-            <Message severity="info" className="mb-3" content={messageContent}/>
-
             <ContentTypesSummaryTable
                 collectionTypes={collectionTypesData}
                 activeContentType={activeContentType}

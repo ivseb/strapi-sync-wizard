@@ -12,11 +12,13 @@ export const getRepresentativeAttributes = (entry: StrapiContent, maxAttributes:
     if (!entry) return [];
 
     // If entry is a StrapiContent, use its rawData
-    const entryData = entry.rawData ? entry.rawData : entry;
+    const entryData: Record<string, any> = (entry.rawData ? entry.rawData : entry) as Record<string, any>;
 
     // Technical attributes to exclude
     const technicalAttributes = [
-        'id', 'documentId', 'createdAt', 'updatedAt', 'publishedAt', 'createdBy', 'updatedBy',
+        'id', 'documentId', 'document_id', '__sync_id',
+        'createdAt', 'updatedAt', 'publishedAt', 'created_at', 'updated_at', 'published_at',
+        'createdBy', 'updatedBy', 'created_by_id', 'updated_by_id',
         'locale', 'localizations', 'hash', 'ext', 'mime', 'size', 'url', 'provider', 'previewUrl'
     ];
 

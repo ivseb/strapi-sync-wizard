@@ -2,6 +2,7 @@ package it.sebi.service
 
 import it.sebi.database.dbQuery
 import it.sebi.models.*
+import it.sebi.service.identity.SyncIdentityService
 import it.sebi.tables.MergeRequestDocumentMappingTable
 import it.sebi.tables.MergeRequestExclusionTable
 import kotlinx.coroutines.*
@@ -222,6 +223,11 @@ suspend fun prefetchComparisonData(
     val logger = LoggerFactory.getLogger("SyncServiceDb")
     logger.info("Prefetching Strapi data for MR ${mergeRequest.id} between '${mergeRequest.sourceInstance.name}' and '${mergeRequest.targetInstance.name}'")
 
+    // Identity layer (Phase 1): ensure the sync_identity sidecar exists on both instances before
+    // any read JOINs it. Idempotent and cheap. Virtual/unconfigured instances are skipped inside.
+    if (!mergeRequest.sourceInstance.isVirtual) SyncIdentityService.ensureTable(mergeRequest.sourceInstance)
+    if (!mergeRequest.targetInstance.isVirtual) SyncIdentityService.ensureTable(mergeRequest.targetInstance)
+
     // Files and relations/components/tables/components definitions
     val srcFilesDef: Deferred<List<StrapiImage>> = async { fetchFilesFromDb(mergeRequest.sourceInstance) }
     val tgtFilesDef: Deferred<List<StrapiImage>> = async { fetchFilesFromDb(mergeRequest.targetInstance) }
@@ -334,6 +340,10 @@ suspend fun exportSourcePrefetch(
 ): ComparisonPrefetchCache = coroutineScope {
     val logger = LoggerFactory.getLogger("SyncServiceDb")
     logger.info("Exporting source-only prefetch for instance '${instance.name}'")
+
+    // Identity layer (Phase 1): ensure the sync_identity sidecar exists before reads JOIN it,
+    // so the exported rows carry their shared sync_id across the air-gap.
+    if (!instance.isVirtual) SyncIdentityService.ensureTable(instance)
 
     // Files and relations/components/tables/components definitions for source only
     val filesDef: Deferred<List<StrapiImage>> = async { fetchFilesFromDb(instance) }

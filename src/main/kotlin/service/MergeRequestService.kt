@@ -854,6 +854,22 @@ class MergeRequestService(
     }
 
     /**
+     * Identity reconciliation (Phase 1): pair source/target via the current comparison and link a
+     * SHARED sync_id on both instances. With apply=false it is a dry-run that only reports what
+     * would change; with apply=true it writes the sidecars.
+     */
+    suspend fun reconcileIdentity(
+        id: Int,
+        apply: Boolean,
+        mode: CompareMode = CompareMode.Compare
+    ): it.sebi.service.identity.IdentityReconciliationReport {
+        val mergeRequest = mergeRequestRepository.getMergeRequestWithInstances(id)
+            ?: throw IllegalArgumentException("Merge request not found")
+        val comparison = compareContent(mergeRequest, mode)
+        return it.sebi.service.identity.IdentityReconciliationService.reconcile(mergeRequest, comparison, apply)
+    }
+
+    /**
      * Compare content for a merge request
      * @param mergeRequest Merge request with instances
      * @param force If true, force a new comparison even if results already exist

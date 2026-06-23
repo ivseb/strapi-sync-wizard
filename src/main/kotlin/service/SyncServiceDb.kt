@@ -3,6 +3,7 @@ package it.sebi.service
 import it.sebi.client.StrapiClient
 import it.sebi.database.dbQuery
 import it.sebi.models.*
+import it.sebi.service.identity.SyncIdentityService
 import it.sebi.utils.FileFingerprintUtil
 import it.sebi.tables.FileAnalysisCacheTable
 import kotlinx.coroutines.*
@@ -244,10 +245,17 @@ suspend fun fetchTables(instance: StrapiInstance, dbSchema: DbSchema): TableMap 
     val tableMap: TableMap = mutableMapOf()
 
     val tablesQuery = dbSchema.tables.filter { it.metadata?.apiUid?.startsWith("api::") ?: false }.map { table ->
-        """SELECT '${table.name}' as table_n, 
+        // Identity layer (Phase 1): attach the shared sync_id as "__sync_id" here too, since this
+        // prefetched TableMap is preferred over fetchPublishedRowsAsJson's own query.
+        val syncIdJoin = if (table.columns.any { it.name == "locale" })
+            "LEFT JOIN ${SyncIdentityService.TABLE} si ON si.document_id = t.document_id AND si.locale IS NOT DISTINCT FROM t.locale"
+        else
+            "LEFT JOIN ${SyncIdentityService.TABLE} si ON si.document_id = t.document_id AND si.locale IS NULL"
+        """SELECT '${table.name}' as table_n,
                     t.document_id,
-                    to_jsonb(t) AS obj
+                    to_jsonb(t) || jsonb_build_object('__sync_id', si.sync_id) AS obj
                     FROM "${table.name}" t
+                    $syncIdJoin
                     WHERE t.document_id IS NOT NULL AND t.published_at IS NOT NULL
                     """
 
@@ -500,7 +508,7 @@ suspend fun getfileCompareFromDb(
 val TECHNICAL_FIELDS = setOf(
     "id", "created_by_id", "updated_by_id", "created_at", "updated_at", "published_at"
 )
-private val IGNORE_COMPARE_FIELDS = TECHNICAL_FIELDS + setOf("locale")
+private val IGNORE_COMPARE_FIELDS = TECHNICAL_FIELDS + setOf("locale", "__sync_id")
 
 private fun parseJsonObject(json: String): JsonObject = Json.parseToJsonElement(json).jsonObject
 
@@ -556,14 +564,24 @@ suspend fun fetchPublishedRowsAsJson(
     tableMap: TableMap
 ): List<Pair<JsonObject, List<StrapiLinkRef>>> = withContext(Dispatchers.IO) {
     try {
+        // Identity layer: attach the shared sync_id (Phase 1) into each row JSON as "__sync_id".
+        // Locale-aware join so non-localized content types (no locale column) don't break the SQL.
+        // sync_identity is ensured to exist by the prefetch/export entry points before this runs.
+        val hasLocaleColumn = dbSchema.tables.firstOrNull { it.name == table }?.columns?.any { it.name == "locale" } == true
+        val syncIdJoin = if (hasLocaleColumn) {
+            "LEFT JOIN ${SyncIdentityService.TABLE} si ON si.document_id = t.document_id AND si.locale IS NOT DISTINCT FROM t.locale"
+        } else {
+            "LEFT JOIN ${SyncIdentityService.TABLE} si ON si.document_id = t.document_id AND si.locale IS NULL"
+        }
         val baseRows = tableMap[table]?.values?.toList() ?: dbQuery(instance.database) {
             exec(
                 """
-                    SELECT 
-                           to_jsonb(t) AS obj
+                    SELECT
+                           to_jsonb(t) || jsonb_build_object('__sync_id', si.sync_id) AS obj
                     FROM "$table" t
+                    $syncIdJoin
                     WHERE t.document_id IS NOT NULL AND t.published_at IS NOT NULL
-                    ORDER BY document_id, published_at DESC, id DESC
+                    ORDER BY t.document_id, t.published_at DESC, t.id DESC
                     """.trimIndent()
             ) { rs ->
                 val list = mutableListOf<JsonObject>()
@@ -1042,14 +1060,18 @@ fun toStrapiContent(
 ): StrapiContent {
     val id = o["id"]?.jsonPrimitive?.intOrNull
     val documentId = o["document_id"]?.jsonPrimitive?.content ?: ""
-    val locale = o["locale"]?.jsonPrimitive?.content
-    val raw = o
+    // contentOrNull (not content): a JSON null locale must stay null, not become the string "null".
+    val locale = o["locale"]?.jsonPrimitive?.contentOrNull
+    val syncId = o["__sync_id"]?.jsonPrimitive?.contentOrNull
+    // Strip the identity marker from rawData so it never leaks into payloads sent to Strapi
+    // (it lives only in metadata.syncId). It is also excluded from comparison via IGNORE_COMPARE_FIELDS.
+    val raw = if (o.containsKey("__sync_id")) JsonObject(o.filterKeys { it != "__sync_id" }) else o
     val uniqueId = metadata.columns.filter { it.unique }
         .mapNotNull { raw[it.name.camelToSnakeCase()]?.toString()?.removeSurrounding("\"") }.joinToString("_")
         .ifEmpty { documentId }
-    val clean = cleanObject(o, excludedFields)
+    val clean = cleanObject(raw, excludedFields)
     return StrapiContent(
-        metadata = StrapiContentMetadata(id = id, documentId = documentId, uniqueId, locale),
+        metadata = StrapiContentMetadata(id = id, documentId = documentId, uniqueId, locale, syncId = syncId),
         rawData = raw,
         cleanData = clean,
         links = links
@@ -1223,24 +1245,46 @@ fun compareCollectionType(
     val sourceByDoc = sourceList.associateBy { it.metadata.documentId }
     val targetByDoc = targetList.associateBy { it.metadata.documentId }
 
-    // Map contentMappings for this specific UID
-    // computeComparisonFromPrefetch passed all non-file mappings in one flat map.
-    // We should be careful to only use mappings that belong to this contentType if possible.
-    // However, idMappings passed here already filtered by contentType indirectly via the loop in computeComparisonFromPrefetch?
-    // Let's check computeComparisonFromPrefetch again.
-
-    val mappedSourceToTarget = idMappings.filterValues { it.contentType == uid }
-        .mapValues { it.value.targetDocumentId }
-
-    val mappedTargetToSource = idMappings.filterValues { it.contentType == uid }
-        .entries.associate { it.value.targetDocumentId!! to it.key }
-
     val results = mutableListOf<ContentTypeComparisonResultWithRelationships>()
     val processedSourceDocs = mutableSetOf<String>()
     val processedTargetDocs = mutableSetOf<String>()
 
-    // 1. First pair by explicit mappings
+    // 0. EXACT IDENTITY MATCH by shared syncId (Phase 1) — highest priority.
+    // Entries that carry the same sync_id on both instances are the SAME logical entity;
+    // pair them deterministically (no heuristics). Also seed idMappings so relations pointing
+    // to an already-in-both entity resolve to the correct target documentId downstream.
+    val (existingSrcInst, existingTgtInst) = idMappings.values.firstOrNull()
+        ?.let { it.sourceStrapiInstanceId to it.targetStrapiInstanceId } ?: (0 to 0)
+    val targetBySyncId: Map<String, StrapiContent> = targetList
+        .filter { !it.metadata.syncId.isNullOrBlank() }
+        .associateBy { it.metadata.syncId!! }
+    for (s in sourceList) {
+        val sid = s.metadata.syncId
+        if (sid.isNullOrBlank()) continue
+        val t = targetBySyncId[sid] ?: continue
+        if (t.metadata.documentId in processedTargetDocs) continue
+        results.add(compareSingleType(tableName, uid, s, t, kind, fileMapping, idMappings, exclusions))
+        processedSourceDocs.add(s.metadata.documentId)
+        processedTargetDocs.add(t.metadata.documentId)
+        // Seed in-memory mapping (not persisted here) so relation rewriting can resolve targets.
+        idMappings[s.metadata.documentId] = MergeRequestDocumentMapping(
+            sourceStrapiInstanceId = existingSrcInst,
+            targetStrapiInstanceId = existingTgtInst,
+            contentType = uid,
+            sourceId = s.metadata.id,
+            sourceDocumentId = s.metadata.documentId,
+            targetId = t.metadata.id,
+            targetDocumentId = t.metadata.documentId
+        )
+    }
+
+    // Map contentMappings for this specific UID (recomputed after syncId seeding above).
+    val mappedSourceToTarget = idMappings.filterValues { it.contentType == uid }
+        .mapValues { it.value.targetDocumentId }
+
+    // 1. Then pair remaining by explicit mappings (skip anything already matched by syncId).
     for ((srcDoc, tgtDoc) in mappedSourceToTarget) {
+        if (srcDoc in processedSourceDocs || (tgtDoc != null && tgtDoc in processedTargetDocs)) continue
         val s = sourceByDoc[srcDoc]
         val t = targetByDoc[tgtDoc]
         if (s != null || t != null) {

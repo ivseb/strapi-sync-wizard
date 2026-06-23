@@ -348,53 +348,35 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
         );
     };
 
-    const messageContent = <div className="flex align-items-center">
-        <i className="pi pi-info-circle mr-2" style={{fontSize: '1.5rem'}}></i>
-        <div>
-            <h5 className="mt-0 mb-1">Selection Management</h5>
-            <p className="m-0">
-                Select or deselect content types to include in the merge.
-                Each selection will be immediately saved to the server.
-            </p>
-        </div>
-    </div>
-
     const groupedElements: GroupEntry<ContentTypeComparisonResultKind, ContentTypeWithRelationStatus>[] = groupByToArray(contentTypes, p => p.content.compareState);
 
 
     return (
         <div>
-            <h3>Merge {title}</h3>
-            <p>
-                This step allows you to select which single content types to create, update, or delete on the target
-                instance.
-                Review the differences and make your selections before proceeding.
-            </p>
-            <Message severity="info" className="mb-3" content={messageContent}/>
-
-            <div className="flex justify-content-between align-items-center mb-3">
+            <div className="flex justify-content-between align-items-center mb-3 gap-2">
                 <span className="p-input-icon-left w-20rem">
                     <i className="pi pi-search" />
                     <InputText
                         type="search"
                         value={globalFilter}
                         onChange={(e) => setGlobalFilter(e.target.value)}
-                        placeholder="Ricerca globale..."
+                        placeholder="Search..."
                         className="w-full"
                     />
                 </span>
                 <div className="flex gap-2">
                     {kind === StrapiContentTypeKind.CollectionType && (
                         <Button
-                            label="Associa manualmente"
+                            label="Manual mapping"
                             icon="pi pi-link"
+                            outlined
                             onClick={() => setShowManualMapper(true)}
                         />
                     )}
-                    <Button 
-                        label="Gestisci vincoli"
+                    <Button
+                        label="Manage exclusions"
                         icon="pi pi-ban"
-                        severity="warning"
+                        outlined
                         onClick={() => setShowExclusionsManager(true)}
                     />
                 </div>
@@ -501,11 +483,11 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
                             {!disableSelection && <Column selectionMode="multiple" headerStyle={{width: '3rem'}}/>}
 
                             <Column field="content.tableName" header="Content Type" sortable/>
-                            <Column header="Representative Attributes Source"
+                            <Column header="Source attributes"
                                     body={(e: ContentTypeWithRelationStatus) => renderRepresentativeAttributes(e.content.sourceContent || e.content.targetContent)}
                                     style={{minWidth: '20rem'}}/>
                             {isDifference &&
-                                <Column header="Representative Attributes TARGET"
+                                <Column header="Target attributes"
                                         body={(e: ContentTypeWithRelationStatus) => renderRepresentativeAttributes(e.content.targetContent || e.content.sourceContent)}
                                         style={{minWidth: '20rem'}}/>
                             }
@@ -523,15 +505,15 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
                                     }}
                                 />
                             )} style={{width: '12rem'}}/>
-                            <Column header="Azioni" body={(rowData: ContentTypeWithRelationStatus) => (
+                            <Column header="Actions" body={(rowData: ContentTypeWithRelationStatus) => (
                                 <Button 
                                     icon="pi pi-ban" 
                                     className="p-button-text p-button-warning"
-                                    tooltip="Escludi questa entità dalla sincronizzazione (vincolo ambientale)"
+                                    tooltip="Exclude this entry from sync (environment-specific)"
                                     onClick={async () => {
                                         const docId = rowData.content.sourceContent?.metadata?.documentId || rowData.content.targetContent?.metadata?.documentId;
                                         if (!docId) return;
-                                        if (!window.confirm(`Vuoi escludere l'entità ${docId} dalla sincronizzazione per sempre?`)) return;
+                                        if (!window.confirm(`Exclude entry ${docId} from sync permanently?`)) return;
                                         try {
                                             setUpdateTableLoading(true);
                                             await axios.post(`/api/merge-requests/${mergeRequestId}/exclusions`, {
@@ -541,7 +523,7 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
                                             if (onSaved) await onSaved();
                                         } catch (e) {
                                             console.error('Errore durante l\'esclusione dell\'entità', e);
-                                            alert("Errore durante l'esclusione dell'entità");
+                                            alert("Error excluding the entry");
                                         } finally {
                                             setUpdateTableLoading(false);
                                         }
@@ -578,7 +560,7 @@ const MergeSingleTypesStep: React.FC<MergeSingleTypesStepProps> = ({
                 httpLogs={httpLogs}
                 onExcludePath={async (path) => {
                     if (!editorTargetInfo) return;
-                    if (!window.confirm(`Vuoi escludere il campo '${path}' per questa entità?`)) return;
+                    if (!window.confirm(`Exclude field '${path}' for this entry?`)) return;
                     try {
                         setUpdateTableLoading(true);
                         await axios.post(`/api/merge-requests/${mergeRequestId}/exclusions`, {

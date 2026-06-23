@@ -249,7 +249,7 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
     );
 
     return (
-        <Dialog header="Associazioni manuali (Collections)" visible={visible} style={{width: '90vw', maxWidth: 1200}}
+        <Dialog header="Manual mappings (collections)" visible={visible} style={{width: '90vw', maxWidth: 1200}}
                 modal onHide={onHide} className="manual-mapper-dialog">
             <div className="col-12 mb-3 flex gap-2 align-items-center">
                 <span className="font-bold">Collection:</span>
@@ -266,14 +266,14 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
                         <InputText 
                             value={activeTab === 0 ? globalFilter : savedGlobalFilter} 
                             onChange={(e) => activeTab === 0 ? setGlobalFilter(e.target.value) : setSavedGlobalFilter(e.target.value)} 
-                            placeholder="Ricerca globale..." 
+                            placeholder="Search..." 
                         />
                     </span>
                 </div>
             </div>
 
             <TabView activeIndex={activeTab} onTabChange={(e) => setActiveTab(e.index)}>
-                <TabPanel header="Nuove associazioni">
+                <TabPanel header="New mappings">
                     <div className="grid">
                         <div className="col-12 md:col-6">
                             <div className="flex align-items-center justify-content-between mb-2">
@@ -282,7 +282,7 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
                             </div>
                             <span className="p-input-icon-left w-full mb-2">
                                 <i className="pi pi-search"/>
-                                <InputText value={sourceFilter} onChange={e => setSourceFilter(e.target.value)} placeholder="Cerca..." className="w-full"/>
+                                <InputText value={sourceFilter} onChange={e => setSourceFilter(e.target.value)} placeholder="Search..." className="w-full"/>
                             </span>
                             <DataTable value={sourceCandidates} selectionMode="single" selection={selectedSource}
                                        onSelectionChange={(e) => setSelectedSource(e.value as ContentTypeComparisonResultWithRelationships | null)} dataKey="id" paginator rows={5}
@@ -308,7 +308,7 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
                             </div>
                             <span className="p-input-icon-left w-full mb-2">
                                 <i className="pi pi-search"/>
-                                <InputText value={targetFilter} onChange={e => setTargetFilter(e.target.value)} placeholder="Cerca..." className="w-full"/>
+                                <InputText value={targetFilter} onChange={e => setTargetFilter(e.target.value)} placeholder="Search..." className="w-full"/>
                             </span>
                             <DataTable value={targetCandidates} selectionMode="single" selection={selectedTarget}
                                        onSelectionChange={(e) => setSelectedTarget(e.value as ContentTypeComparisonResultWithRelationships | null)} dataKey="id" paginator rows={5}
@@ -334,7 +334,7 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
 
                         <div className="col-12">
                             <h5>Coppie da salvare</h5>
-                            <DataTable value={queue} emptyMessage="Nessuna coppia selezionata" className="text-sm">
+                            <DataTable value={queue} emptyMessage="No pairs selected" className="text-sm">
                                 <Column header="#" body={(_, opt) => (opt.rowIndex + 1)} style={{width: '3rem'}}/>
                                 <Column field="tableName" header="Collection"/>
                                 <Column field="sourceDocumentId" header="Source Doc" body={(r: MappingPair) => (
@@ -357,21 +357,21 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
                                         setEditorVisible(true);
                                     }}/>
                                 )} style={{width: '8rem'}}/>
-                                <Column header="Azioni" body={(_, opt) => (
+                                <Column header="Actions" body={(_, opt) => (
                                     <Button className="p-button-text p-button-sm" icon="pi pi-trash" onClick={() => removePair(opt.rowIndex)}/>
                                 )} style={{width: '6rem'}}/>
                             </DataTable>
                         </div>
 
                         <div className="col-12 flex justify-content-end gap-2">
-                            <Button label="Annulla" severity="secondary" onClick={onHide}/>
-                            <Button label="Salva associazioni" icon="pi pi-save" onClick={saveAll} loading={saving}
+                            <Button label="Cancel" severity="secondary" onClick={onHide}/>
+                            <Button label="Save mappings" icon="pi pi-save" onClick={saveAll} loading={saving}
                                     disabled={queue.length === 0}/>
                         </div>
                     </div>
                 </TabPanel>
-                <TabPanel header="Associazioni salvate">
-                    <DataTable value={savedMappings} loading={loadingSaved} emptyMessage="Nessuna associazione salvata" 
+                <TabPanel header="Saved mappings">
+                    <DataTable value={savedMappings} loading={loadingSaved} emptyMessage="No saved mappings"
                                paginator rows={5} globalFilter={savedGlobalFilter}
                                globalFilterFields={['sourceDocumentId', 'targetDocumentId']}
                                className="text-sm">
@@ -389,9 +389,9 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
                                 setEditorVisible(true);
                             }}/>
                         )} style={{width: '8rem'}}/>
-                        <Column header="Azioni" body={(r: SavedMappingDTO) => (
+                        <Column header="Actions" body={(r: SavedMappingDTO) => (
                             <Button className="p-button-text p-button-sm" icon="pi pi-trash" onClick={async () => {
-                                if (!window.confirm('Eliminare questa relazione?')) return;
+                                if (!window.confirm('Delete this mapping?')) return;
                                 try {
                                     const res = await axios.delete<ManualMappingsResponseDTO>(`/api/merge-requests/${mergeRequestId}/mappings/${r.id}`);
                                     await refreshSaved();

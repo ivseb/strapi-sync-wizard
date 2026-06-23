@@ -32,6 +32,9 @@ data class AdminPasswordResponse(val success: Boolean, val message: String)
 @Serializable
 data class InstanceSchemaExport(val schema: DbSchema)
 
+@Serializable
+data class IdentityBackfillResponse(val instanceId: Int, val inserted: Int)
+
 fun Route.configureInstanceRoutes(
     repository: StrapiInstanceRepository,
     mergeRequestRepository: MergeRequestRepository? = null,
@@ -161,6 +164,26 @@ fun Route.configureInstanceRoutes(
                 call.respond(HttpStatusCode.OK, InstanceSchemaExport(schema = dbSchema))
             } catch (e: Exception) {
                 call.respond(HttpStatusCode.InternalServerError, e.message ?: "Error exporting schema")
+            }
+        }
+
+        // Identity layer (Phase 1): backfill the sync_identity sidecar for this instance.
+        // Assigns a fresh INSTANCE-LOCAL sync_id to every existing entry lacking one.
+        // Cross-instance linking is done separately by reconciliation.
+        post("/{id}/identity/backfill") {
+            val id = call.parameters["id"]?.toIntOrNull()
+            if (id == null) { call.respond(HttpStatusCode.BadRequest, "Invalid ID format"); return@post }
+            val instance = repository.getInstance(id)
+            if (instance == null) { call.respond(HttpStatusCode.NotFound, "Instance not found"); return@post }
+            if (instance.isVirtual) { call.respond(HttpStatusCode.BadRequest, "Cannot backfill identity on a virtual instance"); return@post }
+            try {
+                val dbSchema = it.sebi.service.buildDbSchemaForInstance(instance)
+                if (dbSchema == null) { call.respond(HttpStatusCode.BadRequest, "Schema not available for this instance"); return@post }
+                it.sebi.service.identity.SyncIdentityService.ensureTable(instance)
+                val inserted = it.sebi.service.identity.SyncIdentityService.backfill(instance, dbSchema)
+                call.respond(HttpStatusCode.OK, IdentityBackfillResponse(instanceId = id, inserted = inserted))
+            } catch (e: Exception) {
+                call.respond(HttpStatusCode.InternalServerError, e.message ?: "Error during identity backfill")
             }
         }
 

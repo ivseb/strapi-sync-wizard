@@ -1,0 +1,123 @@
+/* Redesign tokens — lighter weights, sidebar shell, calmer density.
+   Uses PrimeReact theme CSS variables so it adapts to the active theme. */
+
+.ss-shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+.ss-sidebar {
+  width: 230px;
+  flex: 0 0 230px;
+  border-right: 1px solid var(--surface-border);
+  padding: 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ss-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px 16px;
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.ss-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  color: var(--text-color-secondary);
+  text-decoration: none;
+  font-weight: 400;
+  font-size: 14px;
+  transition: background-color .12s, color .12s;
+}
+.ss-nav-item:hover {
+  background: var(--surface-hover);
+  color: var(--text-color);
+}
+.ss-nav-item.active {
+  background: var(--primary-color);
+  color: var(--primary-color-text);
+}
+
+.ss-main {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+}
+.ss-content {
+  /* Fluid full width — use the available space, just comfortable side padding.
+     (No centered max-width, which wasted space on wide monitors.) */
+  max-width: 100%;
+  margin: 0;
+  padding: 22px 32px;
+}
+
+/* Lighter typography for the redesigned screens (no heavy 700 weights). */
+.ss-content h1 { font-size: 22px; }
+.ss-content h2 { font-size: 18px; }
+.ss-content h3 { font-size: 16px; }
+.ss-content h1,
+.ss-content h2,
+.ss-content h3 { font-weight: 500; margin: 0; }
+
+.ss-page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+.ss-muted { color: var(--text-color-secondary); }
+
+/* Horizontal status pipeline (merge request detail). */
+.ss-pipe {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 14px 16px;
+}
+.ss-pipe-step {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  background: none;
+  border: none;
+  cursor: default;
+  color: var(--text-color-secondary);
+  font: inherit;
+  padding: 0;
+}
+.ss-pipe-step.clickable { cursor: pointer; }
+.ss-pipe-step .ss-pipe-dot {
+  width: 30px; height: 30px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--surface-border);
+  color: var(--text-color-secondary);
+  background: var(--surface-card);
+}
+.ss-pipe-step .ss-pipe-label { font-size: 12px; }
+.ss-pipe-step.done .ss-pipe-dot { background: var(--green-500, #22c55e); border-color: transparent; color: #fff; }
+.ss-pipe-step.current .ss-pipe-dot { border: 2px solid var(--primary-color); color: var(--primary-color); }
+.ss-pipe-step.current .ss-pipe-label { color: var(--text-color); }
+.ss-pipe-conn { flex: 1 1 14px; min-width: 14px; height: 1px; background: var(--surface-border); margin: 0 6px; align-self: flex-start; margin-top: 15px; }
+.ss-pipe-conn.done { background: var(--green-500, #22c55e); }
+
+.ss-actionbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  margin-top: 16px;
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  background: var(--surface-card);
+}

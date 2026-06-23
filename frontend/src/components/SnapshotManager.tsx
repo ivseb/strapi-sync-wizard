@@ -128,10 +128,10 @@ const SnapshotManager: React.FC<SnapshotManagerProps> = ({ mergeRequestId, onRes
                     />
                 </div>
 
-                <DataTable value={snapshots} emptyMessage="Nessuno snapshot trovato per questa Merge Request." loading={loading} responsiveLayout="scroll">
-                    <Column field="createdAt" header="Data Creazione" body={(rowData) => new Date(rowData.createdAt).toLocaleString()} sortable />
-                    <Column field="snapshotSchemaName" header="Nome Schema" body={(rowData) => <code>{rowData.snapshotSchemaName}</code>} />
-                    <Column header="Azioni" body={(rowData) => (
+                <DataTable value={snapshots} emptyMessage="No snapshots for this merge request." loading={loading} responsiveLayout="scroll">
+                    <Column field="createdAt" header="Created" body={(rowData) => new Date(rowData.createdAt).toLocaleString()} sortable />
+                    <Column field="snapshotSchemaName" header="Schema name" body={(rowData) => <code>{rowData.snapshotSchemaName}</code>} />
+                    <Column header="Actions" body={(rowData) => (
                         <Button 
                             label="Ripristina" 
                             icon="pi pi-undo" 
@@ -145,7 +145,7 @@ const SnapshotManager: React.FC<SnapshotManagerProps> = ({ mergeRequestId, onRes
             </Card>
 
             <Dialog 
-                header="Storico Attività Snapshot" 
+                header="Snapshot activity history"
                 visible={showHistory} 
                 onHide={() => setShowHistory(false)}
                 style={{ width: '50vw' }}

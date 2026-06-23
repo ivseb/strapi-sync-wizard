@@ -177,6 +177,25 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
             }
         }
 
+        // Identity reconciliation (Phase 1): link a shared sync_id across instances for matched pairs.
+        // ?apply=false (default) is a dry-run returning the proposed actions; ?apply=true writes sidecars.
+        post("/{id}/identity/reconcile") {
+            val id = call.parameters["id"]?.toIntOrNull()
+                ?: return@post call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+            val apply = call.queryParameters["apply"]?.toBooleanStrictOrNull() ?: false
+            try {
+                val report = mergeRequestService.reconcileIdentity(id, apply)
+                call.respond(HttpStatusCode.OK, report)
+            } catch (e: IllegalArgumentException) {
+                call.respond(HttpStatusCode.NotFound, e.message ?: "Merge request not found")
+            } catch (e: IllegalStateException) {
+                call.respond(HttpStatusCode.BadRequest, e.message ?: "Invalid state for reconciliation")
+            } catch (e: Exception) {
+                logger.error("Error during identity reconciliation for merge request $id", e)
+                call.respond(HttpStatusCode.InternalServerError, "Error during identity reconciliation: ${e.message}")
+            }
+        }
+
         // Manual mappings upsert (bulk)
         post("/{id}/mappings") {
             val id = call.parameters["id"]?.toIntOrNull()
