@@ -3,6 +3,7 @@ package it.sebi.service
 import it.sebi.database.dbQuery
 import it.sebi.repository.MergeRequestRepository
 import it.sebi.repository.StrapiInstanceRepository
+import it.sebi.models.InstanceSnapshotDTO
 import it.sebi.models.SnapshotActivityDTO
 import it.sebi.models.SnapshotDTO
 import it.sebi.tables.MergeRequestSnapshotsTable
@@ -68,6 +69,55 @@ class PostgresSnapshotService(
                     createdAt = it[MergeRequestSnapshotsTable.createdAt]
                 )
             }
+    }
+
+    /** All snapshots whose merge request targets the given instance (newest first). */
+    suspend fun getSnapshotsForInstance(instanceId: Int): List<InstanceSnapshotDTO> = dbQuery {
+        (MergeRequestSnapshotsTable innerJoin MergeRequestsTable)
+            .selectAll()
+            .where { MergeRequestsTable.targetInstanceId eq instanceId }
+            .orderBy(MergeRequestSnapshotsTable.createdAt to SortOrder.DESC)
+            .map {
+                InstanceSnapshotDTO(
+                    id = it[MergeRequestSnapshotsTable.id].value,
+                    mergeRequestId = it[MergeRequestSnapshotsTable.mergeRequestId],
+                    mergeRequestName = it[MergeRequestsTable.name],
+                    snapshotSchemaName = it[MergeRequestSnapshotsTable.snapshotSchemaName],
+                    createdAt = it[MergeRequestSnapshotsTable.createdAt]
+                )
+            }
+    }
+
+    /** Drop a snapshot's schema on its target instance and remove the metadata row. */
+    suspend fun deleteSnapshotById(snapshotId: Int): Boolean {
+        val row = dbQuery {
+            (MergeRequestSnapshotsTable innerJoin MergeRequestsTable)
+                .selectAll()
+                .where { MergeRequestSnapshotsTable.id eq snapshotId }
+                .map { Pair(it[MergeRequestSnapshotsTable.snapshotSchemaName], it[MergeRequestsTable.targetInstanceId]) }
+                .singleOrNull()
+        } ?: return false
+        val (schemaName, targetId) = row
+        val targetInstance = dbQuery { StrapiInstanceRepository().getInstance(targetId) }
+        targetInstance?.database?.let { db ->
+            try {
+                dbQuery(db) { exec("DROP SCHEMA IF EXISTS \"$schemaName\" CASCADE") }
+            } catch (e: Exception) {
+                logger.error("Failed to drop schema $schemaName: ${e.message}")
+            }
+        }
+        return dbQuery { MergeRequestSnapshotsTable.deleteWhere { MergeRequestSnapshotsTable.id eq snapshotId } > 0 }
+    }
+
+    /** Restore a snapshot by its id (resolves the owning merge request, then restores its schema). */
+    suspend fun restoreSnapshotById(snapshotId: Int) {
+        val row = dbQuery {
+            MergeRequestSnapshotsTable.selectAll()
+                .where { MergeRequestSnapshotsTable.id eq snapshotId }
+                .map { Pair(it[MergeRequestSnapshotsTable.mergeRequestId], it[MergeRequestSnapshotsTable.snapshotSchemaName]) }
+                .singleOrNull()
+        } ?: throw IllegalArgumentException("Snapshot not found: $snapshotId")
+        restoreSnapshot(row.first, row.second)
     }
 
     suspend fun getSnapshotActivityHistory(mergeRequestId: Int): List<SnapshotActivityDTO> = dbQuery {
@@ -170,6 +220,13 @@ class PostgresSnapshotService(
                         while (rs.next()) {
                             tablesToRestore.add(rs.getString("table_name"))
                         }
+                    }
+
+                    // Guard: a missing/empty snapshot schema must fail loudly instead of silently
+                    // "succeeding" while truncating/restoring nothing (which previously left the
+                    // target untouched yet reported success).
+                    if (tablesToRestore.isEmpty()) {
+                        throw Exception("Snapshot '$targetSnapshot' not found or empty for MR $mergeRequestId")
                     }
 
                     tablesToRestore.forEach { tableName ->

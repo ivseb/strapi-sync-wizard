@@ -30,6 +30,24 @@ import kotlin.uuid.Uuid
  */
 
 
+/** documentId -> sync_id for every entry in an instance's sync_identity sidecar (files + content).
+ *  Used to normalize relation references to a cross-instance identity during comparison. */
+suspend fun fetchSyncIdMap(instance: StrapiInstance): Map<String, String> = try {
+    dbQuery(instance.database) {
+        val m = HashMap<String, String>()
+        exec("SELECT document_id, sync_id FROM sync_identity", explicitStatementType = StatementType.SELECT) { rs ->
+            while (rs.next()) {
+                val d = rs.getString("document_id"); val s = rs.getString("sync_id")
+                if (d != null && s != null) m[d] = s
+            }
+        }
+        m as Map<String, String>
+    } ?: emptyMap()
+} catch (e: Exception) {
+    LoggerFactory.getLogger("SyncServiceDb").warn("fetchSyncIdMap('${instance.name}') failed: ${e.message}")
+    emptyMap()
+}
+
 suspend fun fetchFilesFromDb(instance: StrapiInstance): List<StrapiImage> = withContext(Dispatchers.IO) {
     val logger = LoggerFactory.getLogger("SyncServiceDb")
     try {
@@ -74,9 +92,14 @@ suspend fun fetchFilesFromDb(instance: StrapiInstance): List<StrapiImage> = with
                 f.folder_path,
                 f.locale,
                 f.updated_at,
-                COALESCE(fh.full_path, '/') as folder_name
+                COALESCE(fh.full_path, '/') as folder_name,
+                si.sync_id as sync_id
             FROM files f
                      LEFT JOIN folder_hierarchy fh ON fh.path = f.folder_path
+                     LEFT JOIN sync_identity si
+                        ON si.document_id = f.document_id
+                        AND COALESCE(si.locale, '') = COALESCE(f.locale, '')
+                        AND si.uid = 'plugin::upload.file'
             WHERE f.document_id IS NOT NULL
             ORDER BY f.document_id, COALESCE(f.locale, ''), f.updated_at DESC, f.id DESC;
         """.trimIndent()
@@ -108,7 +131,8 @@ suspend fun fetchFilesFromDb(instance: StrapiInstance): List<StrapiImage> = with
                         folderPath = folderPath,
                         folder = folderName,
                         locale = rs.getString("locale"),
-                        updatedAt = updatedAt ?: OffsetDateTime.now()
+                        updatedAt = updatedAt ?: OffsetDateTime.now(),
+                        syncId = rs.getString("sync_id")
                     )
                     val raw = buildJsonObject {
                         put("id", meta.id)
@@ -332,6 +356,11 @@ suspend fun getfileCompareFromDb(
     currentFileMapping: Map<String, MergeRequestDocumentMapping>
 ): List<ContentTypeFileComparisonResult> = coroutineScope {
 
+    // 0) Make sure the sync_identity sidecar exists on both instances so the file fetch
+    //    can LEFT JOIN it for durable identity (no-op if already present).
+    if (!mergeRequest.sourceInstance.isVirtual) it.sebi.service.identity.SyncIdentityService.ensureTable(mergeRequest.sourceInstance)
+    if (!mergeRequest.targetInstance.isVirtual) it.sebi.service.identity.SyncIdentityService.ensureTable(mergeRequest.targetInstance)
+
     // 1) Fetch files from both DBs (latest per document_id/locale) concurrently
     val sourceDef = async { fetchFilesFromDb(mergeRequest.sourceInstance) }
     val targetDef = async { fetchFilesFromDb(mergeRequest.targetInstance) }
@@ -354,18 +383,13 @@ suspend fun getfileCompareFromDb(
 
     fun keyOfTarget(m: StrapiImageMetadata): String = keyOf(m.documentId, m.locale)
 
-    // 4) Index targets: by key and by fingerprint for fallback
-    val targetByKey: MutableMap<String, StrapiImage> =
-        targetWithFp.associateBy { keyOfTarget(it.metadata) }.toMutableMap()
-    val targetByFp: MutableMap<String, MutableList<StrapiImage>> = mutableMapOf()
-    for (t in targetWithFp) {
-        val fp = t.metadata.calculatedHash
-        if (!fp.isNullOrBlank()) targetByFp.getOrPut(fp) { mutableListOf() }.add(t)
-    }
-
+    // 4) Deterministic, conservative pairing state. Tiers: explicit mapping ->
+    //    shared syncId -> exact bytes (sha256, unique 1:1) -> name+ext+folderPath (unique 1:1).
+    //    No greedy dHash matching (it mis-pairs duplicates and steals true twins); ambiguous
+    //    groups are left unpaired so a human can confirm them.
+    val targetByDocKey: Map<String, StrapiImage> = targetWithFp.associateBy { keyOfTarget(it.metadata) }
     val usedTargetIds = mutableSetOf<Int>()
-
-    // 5) Iterate over source files, pair using mapping first, then fingerprint
+    val pairedSourceIds = mutableSetOf<Int>()
     val results = mutableListOf<ContentTypeFileComparisonResult>()
 
     fun compareStateOf(s: StrapiImage?, t: StrapiImage?): ContentTypeComparisonResultKind {
@@ -440,66 +464,60 @@ suspend fun getfileCompareFromDb(
         }
     }
 
+    fun pairUp(s: StrapiImage, t: StrapiImage) {
+        results.add(ContentTypeFileComparisonResult(sourceImage = s, targetImage = t, compareState = compareStateOf(s, t)))
+        usedTargetIds.add(t.metadata.id)
+        pairedSourceIds.add(s.metadata.id)
+    }
+    fun remainingSources(): List<StrapiImage> = sourceWithFp.filter { it.metadata.id !in pairedSourceIds }
+    fun remainingTargets(): List<StrapiImage> = targetWithFp.filter { it.metadata.id !in usedTargetIds }
+    fun nameKey(m: StrapiImageMetadata): String =
+        "${m.name.trim().lowercase()}|${m.ext.lowercase()}|${m.folderPath}|${m.locale ?: ""}"
+
+    // Tier 0 — explicit manual mappings (human-confirmed) by documentId.
     for (s in sourceWithFp) {
-        val sm = s.metadata
-        val mappedDoc = currentFileMapping[sm.documentId]?.targetDocumentId ?: sm.documentId
-        val k = keyOf(mappedDoc, sm.locale)
-        var t: StrapiImage? = targetByKey[k]?.takeIf { usedTargetIds.add(it.metadata.id) }
-        if (t == null) {
-            // Try fingerprint association
-            val fp = sm.calculatedHash
-            if (!fp.isNullOrBlank()) {
-                val candidates = targetByFp[fp]
-                if (!candidates.isNullOrEmpty()) {
-                    // Safety check before pairing: fingerprints match, but do metadata and size also match within reason?
-                    // This prevents auto-pairing very different images that happen to have same dHash (like black logos).
-                    val sourceSize = sm.calculatedSizeBytes ?: sm.size.toLong()
-
-                    val filteredCandidates = candidates.filter { cand ->
-                        if (usedTargetIds.contains(cand.metadata.id)) return@filter false
-
-                        val targetSize = cand.metadata.calculatedSizeBytes ?: cand.metadata.size.toLong()
-                        val sizeDiff = Math.abs(sourceSize - targetSize).toDouble()
-                        val maxSize = Math.max(sourceSize, targetSize).toDouble()
-                        val sizeToleranceOk = if (maxSize > 0) (sizeDiff / maxSize) < 0.25 else true
-
-                        val nameSimilarityOk = sm.name.equals(cand.metadata.name, ignoreCase = true) ||
-                                sm.name.contains(cand.metadata.name, ignoreCase = true) ||
-                                cand.metadata.name.contains(sm.name, ignoreCase = true)
-
-                        // Accept if either size is similar OR name is similar.
-                        // If both are very different, it's likely a collision.
-                        sizeToleranceOk || nameSimilarityOk
-                    }
-
-                    // Prefer same locale
-                    val preferred =
-                        filteredCandidates.firstOrNull { it.metadata.locale == sm.locale }
-                    val anyOther = preferred ?: filteredCandidates.firstOrNull()
-                    if (anyOther != null) {
-                        t = anyOther
-                        usedTargetIds.add(anyOther.metadata.id)
-                    }
-                }
-            }
-        }
-        val state = compareStateOf(s, t)
-        results.add(ContentTypeFileComparisonResult(sourceImage = s, targetImage = t, compareState = state))
+        val mapped = currentFileMapping[s.metadata.documentId]?.targetDocumentId ?: continue
+        val t = targetByDocKey[keyOf(mapped, s.metadata.locale)] ?: continue
+        if (t.metadata.id in usedTargetIds) continue
+        pairUp(s, t)
     }
 
-    // 6) Add remaining targets not paired
-    for (t in targetWithFp) {
-        if (!usedTargetIds.contains(t.metadata.id)) {
-            results.add(
-                ContentTypeFileComparisonResult(
-                    sourceImage = null,
-                    targetImage = t,
-                    compareState = ContentTypeComparisonResultKind.ONLY_IN_TARGET
-                )
-            )
-            usedTargetIds.add(t.metadata.id)
+    // Tier 1 — durable shared syncId (exact identity join).
+    run {
+        val tgtBySync = remainingTargets().filter { !it.metadata.syncId.isNullOrBlank() }.groupBy { it.metadata.syncId!! }
+        for (s in remainingSources()) {
+            val sid = s.metadata.syncId?.takeIf { it.isNotBlank() } ?: continue
+            val t = tgtBySync[sid]?.firstOrNull { it.metadata.id !in usedTargetIds } ?: continue
+            pairUp(s, t)
         }
     }
+
+    // Tier 2 — exact same bytes (sha256), only when unique 1:1 on both sides.
+    run {
+        val srcBySha = remainingSources().filter { !it.metadata.calculatedSha.isNullOrBlank() }.groupBy { it.metadata.calculatedSha!! }
+        val tgtBySha = remainingTargets().filter { !it.metadata.calculatedSha.isNullOrBlank() }.groupBy { it.metadata.calculatedSha!! }
+        for ((sha, sList) in srcBySha) {
+            val tList = tgtBySha[sha] ?: continue
+            if (sList.size == 1 && tList.size == 1) pairUp(sList.first(), tList.first())
+        }
+    }
+
+    // Tier 3 — same name+ext+folderPath (+locale), only when unique 1:1 on both sides
+    //          (handles re-encoded same asset whose bytes/dHash changed).
+    run {
+        val srcByName = remainingSources().groupBy { nameKey(it.metadata) }
+        val tgtByName = remainingTargets().groupBy { nameKey(it.metadata) }
+        for ((k, sList) in srcByName) {
+            val tList = tgtByName[k] ?: continue
+            if (sList.size == 1 && tList.size == 1) pairUp(sList.first(), tList.first())
+        }
+    }
+
+    // Tier 4 — leftovers: genuinely one-sided OR ambiguous (duplicates / collisions) left for review.
+    for (s in remainingSources())
+        results.add(ContentTypeFileComparisonResult(sourceImage = s, targetImage = null, compareState = ContentTypeComparisonResultKind.ONLY_IN_SOURCE))
+    for (t in remainingTargets())
+        results.add(ContentTypeFileComparisonResult(sourceImage = null, targetImage = t, compareState = ContentTypeComparisonResultKind.ONLY_IN_TARGET))
 
     results
 }
@@ -1173,6 +1191,129 @@ private suspend fun fetchDocumentIdsForTable(
 
 
 @OptIn(ExperimentalUuidApi::class)
+// Identity/timestamp fields dropped when fingerprinting an entry's content for bootstrap matching.
+private val FINGERPRINT_DROP = setOf(
+    "id", "document_id", "documentId", "__sync_id", "locale",
+    "createdAt", "updatedAt", "publishedAt", "created_at", "updated_at", "published_at",
+    "created_by_id", "updated_by_id", "createdBy", "updatedBy",
+)
+
+/** Replace a __links object's per-field documentId lists with the referenced entities' IDENTITY
+ *  (sync_id, else content/file hash via the passed map), SORTED. So the SAME logical references
+ *  compare equal across instances regardless of per-instance documentId or order (duplicate targets
+ *  referenced in a different order are not a change), while add/remove of a reference still shows. */
+fun normalizeLinksBySyncId(objMap: MutableMap<String, JsonElement>, syncByDoc: Map<String, String>) {
+    val links = objMap["__links"] as? JsonObject ?: return
+    objMap["__links"] = JsonObject(links.entries.associate { (field, arr) ->
+        val a = arr as? JsonArray ?: JsonArray(emptyList())
+        val keys = a.map { v -> v.jsonPrimitive.contentOrNull?.let { id -> syncByDoc[id] ?: "doc:$id" } ?: "null" }.sorted()
+        field to JsonArray(keys.map { JsonPrimitive(it) })
+    })
+}
+
+/** Canonical, identity-independent fingerprint of an entry's content (relations normalized to sync_id),
+ *  used to pair entries that have no stable key yet (bootstrap). */
+fun contentFingerprint(c: StrapiContent, syncByDoc: Map<String, String>): String {
+    fun canonLinks(v: JsonElement): JsonElement {
+        val obj = v as? JsonObject ?: return v
+        return JsonObject(obj.entries.sortedBy { it.key }.associate { (field, arr) ->
+            val a = arr as? JsonArray ?: JsonArray(emptyList())
+            field to JsonArray(a.map { x ->
+                val id = x.jsonPrimitive.contentOrNull
+                JsonPrimitive(if (id == null) null else (syncByDoc[id] ?: "doc:$id"))
+            })
+        })
+    }
+    fun canon(e: JsonElement): JsonElement = when (e) {
+        is JsonObject -> JsonObject(
+            e.filterKeys { it !in FINGERPRINT_DROP }.toSortedMap()
+                .mapValues { (k, v) -> if (k == "__links") canonLinks(v) else canon(v) }
+        )
+        is JsonArray -> JsonArray(e.map { canon(it) })
+        else -> e
+    }
+    return canon(c.cleanData).toString()
+}
+
+private val LABEL_NAME_HINTS = listOf("title", "name", "label", "heading", "subject", "slug", "code")
+
+private fun isLabelField(key: String): Boolean { val k = key.lowercase(); return LABEL_NAME_HINTS.any { k.contains(it) } }
+private fun shortText(v: JsonElement?): String? =
+    (v as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotBlank() && it.length in 1..80 }
+
+/**
+ * A short human label for a content entry. Looks (recursively) for a field whose NAME hints a label
+ * (title/name/label/heading… as a substring, so title_main/needAssistanceSectionTitle match too),
+ * then for any short text; falls back to the documentId only as a last resort.
+ */
+fun contentLabelOf(c: StrapiContent): String {
+    fun search(e: JsonElement, labelFieldsOnly: Boolean): String? {
+        when (e) {
+            is JsonObject -> {
+                for ((k, v) in e) {
+                    if (k == "__links" || k in FINGERPRINT_DROP) continue
+                    if (v is JsonPrimitive && (!labelFieldsOnly || isLabelField(k))) shortText(v)?.let { return it }
+                }
+                for ((k, v) in e) if (k != "__links" && k !in FINGERPRINT_DROP) search(v, labelFieldsOnly)?.let { return it }
+            }
+            is JsonArray -> for (x in e) search(x, labelFieldsOnly)?.let { return it }
+            else -> {}
+        }
+        return null
+    }
+    return search(c.cleanData, true) ?: search(c.cleanData, false) ?: c.metadata.documentId
+}
+
+/**
+ * documentId -> CONTENT IDENTITY for one instance. Same content yields the same key (even for
+ * duplicate entities), so references are compared by what they point to, not by which copy/order.
+ * Files: by exact bytes (sha) then syncId then name. Content: by canonical content fingerprint.
+ */
+fun buildIdentityMap(rowsByUid: Map<String, List<StrapiContent>>, files: List<StrapiImage>, syncByDoc: Map<String, String>): Map<String, String> {
+    val m = HashMap<String, String>()
+    // Prefer the stable identity (sync_id): a referenced entity's identity must NOT change when its
+    // own content changes (otherwise the change would wrongly propagate to everything referencing it).
+    // Fall back to a content/byte hash only when there is no sync_id yet, so identical un-linked
+    // duplicates still collapse to one key.
+    files.forEach { f ->
+        m[f.metadata.documentId] = f.metadata.syncId?.let { "id:$it" } ?: ("file:" + (f.metadata.calculatedSha ?: f.metadata.name))
+    }
+    rowsByUid.values.flatten().forEach { c ->
+        m[c.metadata.documentId] = c.metadata.syncId?.let { "id:$it" } ?: ("c:" + contentFingerprint(c, syncByDoc))
+    }
+    return m
+}
+
+/** Build documentId -> ResolvedRef for one instance (files + content), for resolving __links. */
+fun buildRefResolver(rowsByUid: Map<String, List<StrapiContent>>, files: List<StrapiImage>, identityByDoc: Map<String, String> = emptyMap()): Map<String, ResolvedRef> {
+    val m = HashMap<String, ResolvedRef>()
+    files.forEach { f ->
+        m[f.metadata.documentId] = ResolvedRef(
+            documentId = f.metadata.documentId, label = f.metadata.name, syncId = f.metadata.syncId,
+            isFile = true, fileId = f.metadata.id, mime = f.metadata.mime, contentHash = identityByDoc[f.metadata.documentId],
+        )
+    }
+    rowsByUid.forEach { (uid, list) ->
+        val short = uid.substringAfterLast('.')
+        list.forEach { c ->
+            m[c.metadata.documentId] = ResolvedRef(
+                documentId = c.metadata.documentId, label = contentLabelOf(c), syncId = c.metadata.syncId, isFile = false,
+                contentHash = identityByDoc[c.metadata.documentId], refType = short,
+            )
+        }
+    }
+    return m
+}
+
+/** Resolve an entry's __links (field -> [documentId]) into readable references. */
+fun resolveRefs(c: StrapiContent?, resolver: Map<String, ResolvedRef>): Map<String, List<ResolvedRef>> {
+    val links = c?.cleanData?.get("__links") as? JsonObject ?: return emptyMap()
+    return links.entries.associate { (field, arr) ->
+        field to ((arr as? JsonArray)?.mapNotNull { it.jsonPrimitive.contentOrNull }
+            ?.map { id -> resolver[id] ?: ResolvedRef(documentId = id, label = "doc:$id") } ?: emptyList())
+    }
+}
+
 fun compareSingleType(
     tableName: String,
     uid: String,
@@ -1181,7 +1322,11 @@ fun compareSingleType(
     kind: StrapiContentTypeKind,
     fileMapping: Map<String, MergeRequestDocumentMapping>,
     contentMapping: MutableMap<String, MergeRequestDocumentMapping>,
-    exclusions: List<MergeRequestExclusion> = emptyList()
+    exclusions: List<MergeRequestExclusion> = emptyList(),
+    srcSyncByDoc: Map<String, String> = emptyMap(),
+    tgtSyncByDoc: Map<String, String> = emptyMap(),
+    srcResolver: Map<String, ResolvedRef> = emptyMap(),
+    tgtResolver: Map<String, ResolvedRef> = emptyMap(),
 ): ContentTypeComparisonResultWithRelationships {
     val documentId = sourceObj?.metadata?.documentId ?: targetObj?.metadata?.documentId
     val isExcluded = exclusions.any { it.contentType == uid && (it.documentId == null || it.documentId == documentId) && it.fieldPath == null }
@@ -1200,19 +1345,15 @@ fun compareSingleType(
             val sourceObjMap = sourceObj!!.cleanData.toMutableMap()
             sourceObjMap.remove("document_id")
 
-
-
             val targetObjMap = cleanObject(targetObj!!.cleanData, excludedFields).toMutableMap()
             targetObjMap.remove("document_id")
 
-            sourceObjMap["__links"]?.jsonObject?.entries?.map { fieldValues ->
-                val mappedValues: List<JsonPrimitive> = fieldValues.value.jsonArray.map { value ->
-                    val id = value.jsonPrimitive.content
-                    JsonPrimitive(fileMapping[id]?.targetDocumentId ?: contentMapping[id]?.targetDocumentId ?: id)
-                }
-                fieldValues.key to JsonArray(mappedValues)
-
-            }?.let { sourceObjMap["__links"] = JsonObject(it.toMap()) }
+            // Normalize relation/media references to a cross-instance identity (sync_id): the SAME
+            // logical target (different per-instance documentId) compares equal, while a genuinely
+            // different reference still surfaces as a change. Falls back to "doc:<id>" when the
+            // referenced entity has no sync_id yet (so it stays comparable, just not cross-env).
+            normalizeLinksBySyncId(sourceObjMap, srcSyncByDoc)
+            normalizeLinksBySyncId(targetObjMap, tgtSyncByDoc)
 
             val sourceObjToCompare = cleanObject(JsonObject(sourceObjMap), excludedFields)
             val targetObjToCompare = JsonObject(targetObjMap)
@@ -1228,6 +1369,8 @@ fun compareSingleType(
         targetContent = targetObj,
         compareState = resultKind,
         kind = kind,
+        sourceRefs = resolveRefs(sourceObj, srcResolver),
+        targetRefs = resolveRefs(targetObj, tgtResolver),
     )
 }
 
@@ -1240,7 +1383,11 @@ fun compareCollectionType(
     kind: StrapiContentTypeKind,
     idMappings: MutableMap<String, MergeRequestDocumentMapping>,
     fileMapping: Map<String, MergeRequestDocumentMapping>,
-    exclusions: List<MergeRequestExclusion> = emptyList()
+    exclusions: List<MergeRequestExclusion> = emptyList(),
+    srcSyncByDoc: Map<String, String> = emptyMap(),
+    tgtSyncByDoc: Map<String, String> = emptyMap(),
+    srcResolver: Map<String, ResolvedRef> = emptyMap(),
+    tgtResolver: Map<String, ResolvedRef> = emptyMap(),
 ): List<ContentTypeComparisonResultWithRelationships> {
     val sourceByDoc = sourceList.associateBy { it.metadata.documentId }
     val targetByDoc = targetList.associateBy { it.metadata.documentId }
@@ -1249,68 +1396,120 @@ fun compareCollectionType(
     val processedSourceDocs = mutableSetOf<String>()
     val processedTargetDocs = mutableSetOf<String>()
 
-    // 0. EXACT IDENTITY MATCH by shared syncId (Phase 1) — highest priority.
-    // Entries that carry the same sync_id on both instances are the SAME logical entity;
-    // pair them deterministically (no heuristics). Also seed idMappings so relations pointing
-    // to an already-in-both entity resolve to the correct target documentId downstream.
     val (existingSrcInst, existingTgtInst) = idMappings.values.firstOrNull()
         ?.let { it.sourceStrapiInstanceId to it.targetStrapiInstanceId } ?: (0 to 0)
+
+    fun seed(s: StrapiContent, t: StrapiContent) {
+        idMappings[s.metadata.documentId] = MergeRequestDocumentMapping(
+            sourceStrapiInstanceId = existingSrcInst, targetStrapiInstanceId = existingTgtInst,
+            contentType = uid, sourceId = s.metadata.id, sourceDocumentId = s.metadata.documentId,
+            targetId = t.metadata.id, targetDocumentId = t.metadata.documentId,
+        )
+    }
+    fun pair(s: StrapiContent, t: StrapiContent) {
+        results.add(compareSingleType(tableName, uid, s, t, kind, fileMapping, idMappings, exclusions, srcSyncByDoc, tgtSyncByDoc, srcResolver, tgtResolver))
+        processedSourceDocs.add(s.metadata.documentId)
+        processedTargetDocs.add(t.metadata.documentId)
+        seed(s, t) // so relations pointing at this entity resolve to the right target downstream
+    }
+
+    // 0. Shared syncId (exact identity) — highest priority.
     val targetBySyncId: Map<String, StrapiContent> = targetList
-        .filter { !it.metadata.syncId.isNullOrBlank() }
-        .associateBy { it.metadata.syncId!! }
+        .filter { !it.metadata.syncId.isNullOrBlank() }.associateBy { it.metadata.syncId!! }
     for (s in sourceList) {
         val sid = s.metadata.syncId
         if (sid.isNullOrBlank()) continue
         val t = targetBySyncId[sid] ?: continue
         if (t.metadata.documentId in processedTargetDocs) continue
-        results.add(compareSingleType(tableName, uid, s, t, kind, fileMapping, idMappings, exclusions))
-        processedSourceDocs.add(s.metadata.documentId)
-        processedTargetDocs.add(t.metadata.documentId)
-        // Seed in-memory mapping (not persisted here) so relation rewriting can resolve targets.
-        idMappings[s.metadata.documentId] = MergeRequestDocumentMapping(
-            sourceStrapiInstanceId = existingSrcInst,
-            targetStrapiInstanceId = existingTgtInst,
-            contentType = uid,
-            sourceId = s.metadata.id,
-            sourceDocumentId = s.metadata.documentId,
-            targetId = t.metadata.id,
-            targetDocumentId = t.metadata.documentId
-        )
+        pair(s, t)
     }
 
-    // Map contentMappings for this specific UID (recomputed after syncId seeding above).
-    val mappedSourceToTarget = idMappings.filterValues { it.contentType == uid }
-        .mapValues { it.value.targetDocumentId }
-
-    // 1. Then pair remaining by explicit mappings (skip anything already matched by syncId).
+    // 1. Explicit (manual / previously-mapped) document mappings for this uid.
+    val mappedSourceToTarget = idMappings.filterValues { it.contentType == uid }.mapValues { it.value.targetDocumentId }
     for ((srcDoc, tgtDoc) in mappedSourceToTarget) {
         if (srcDoc in processedSourceDocs || (tgtDoc != null && tgtDoc in processedTargetDocs)) continue
         val s = sourceByDoc[srcDoc]
         val t = targetByDoc[tgtDoc]
-        if (s != null || t != null) {
-            results.add(compareSingleType(tableName, uid, s, t, kind, fileMapping, idMappings, exclusions))
+        if (s != null && t != null) pair(s, t)
+        else if (s != null || t != null) {
+            results.add(compareSingleType(tableName, uid, s, t, kind, fileMapping, idMappings, exclusions, srcSyncByDoc, tgtSyncByDoc, srcResolver, tgtResolver))
             if (s != null) processedSourceDocs.add(srcDoc)
             if (t != null) processedTargetDocs.add(tgtDoc!!)
         }
     }
 
-    // 2. Pair remaining by uniqueKey (automatic matching)
+    // 2. CONTENT FINGERPRINT (identical content modulo ids/relations, relations normalized by syncId),
+    //    only when unique 1:1 on both sides — safe bootstrap for entries without a stable key.
+    run {
+        val remS = sourceList.filter { it.metadata.documentId !in processedSourceDocs }
+        val remT = targetList.filter { it.metadata.documentId !in processedTargetDocs }
+        val sByFp = remS.groupBy { contentFingerprint(it, srcSyncByDoc) }
+        val tByFp = remT.groupBy { contentFingerprint(it, tgtSyncByDoc) }
+        for ((fp, sList) in sByFp) {
+            val tList = tByFp[fp] ?: continue
+            // Identical content modulo ids/relations. Pair 1:1, and also N:N — when the SAME content
+            // appears the same number of times on both sides those are the same (duplicated) entities,
+            // so pair them positionally. Unequal counts stay unmatched (ambiguous -> review).
+            if (sList.size == tList.size) for (i in sList.indices) pair(sList[i], tList[i])
+        }
+    }
+
+    // 3. Representative NATURAL KEY (title/name/slug/code…), unique 1:1 — pairs same-key entries
+    //    whose content differs (they then show up as DIFFERENT with the real field diff).
+    run {
+        fun nk(c: StrapiContent): String? {
+            val cd = c.cleanData
+            for (f in listOf("title", "name", "slug", "code", "label", "uid", "key")) {
+                val v = (cd[f] as? JsonPrimitive)?.contentOrNull
+                if (!v.isNullOrBlank()) return "$f=$v"
+            }
+            return null
+        }
+        val remS = sourceList.filter { it.metadata.documentId !in processedSourceDocs }
+        val remT = targetList.filter { it.metadata.documentId !in processedTargetDocs }
+        val sByNk = remS.mapNotNull { c -> nk(c)?.let { it to c } }.groupBy({ it.first }, { it.second })
+        val tByNk = remT.mapNotNull { c -> nk(c)?.let { it to c } }.groupBy({ it.first }, { it.second })
+        for ((k, sList) in sByNk) {
+            val tList = tByNk[k] ?: continue
+            if (sList.size == 1 && tList.size == 1) pair(sList.first(), tList.first())
+        }
+    }
+
+    // 3b. RELATION FOOTPRINT (the sorted set of referenced identities), unique 1:1 — pairs keyless
+    //     entities that point to the same related entities/files but differ in scalar fields (so they
+    //     show up as DIFFERENT with the real change, instead of new+removed).
+    run {
+        fun footprint(c: StrapiContent, idmap: Map<String, String>): String? {
+            val links = c.cleanData["__links"] as? JsonObject ?: return null
+            val ids = links.values.flatMap { a -> (a as? JsonArray ?: JsonArray(emptyList())).mapNotNull { it.jsonPrimitive.contentOrNull } }
+            if (ids.isEmpty()) return null
+            return ids.map { idmap[it] ?: "doc:$it" }.sorted().joinToString(",")
+        }
+        val remS = sourceList.filter { it.metadata.documentId !in processedSourceDocs }
+        val remT = targetList.filter { it.metadata.documentId !in processedTargetDocs }
+        val sByFp = remS.mapNotNull { c -> footprint(c, srcSyncByDoc)?.let { it to c } }.groupBy({ it.first }, { it.second })
+        val tByFp = remT.mapNotNull { c -> footprint(c, tgtSyncByDoc)?.let { it to c } }.groupBy({ it.first }, { it.second })
+        for ((k, sList) in sByFp) {
+            val tList = tByFp[k] ?: continue
+            if (sList.size == 1 && tList.size == 1) pair(sList.first(), tList.first())
+        }
+    }
+
+    // 4. Fallback: legacy uniqueKey (scalar unique columns), positional within key. Also emits the
+    //    remaining genuinely one-sided entries (create on source / delete on target).
     val remainingSource = sourceList.filter { it.metadata.documentId !in processedSourceDocs }
     val remainingTarget = targetList.filter { it.metadata.documentId !in processedTargetDocs }
-
     val sourceByUniqueKey = remainingSource.groupBy { it.metadata.uniqueKey }
     val targetByUniqueKey = remainingTarget.groupBy { it.metadata.uniqueKey }
-
     val allUniqueKeys = sourceByUniqueKey.keys union targetByUniqueKey.keys
     for (key in allUniqueKeys) {
         val sList = sourceByUniqueKey[key] ?: emptyList()
         val tList = targetByUniqueKey[key] ?: emptyList()
-
         val maxLen = maxOf(sList.size, tList.size)
         for (i in 0 until maxLen) {
             val s = sList.getOrNull(i)
             val t = tList.getOrNull(i)
-            results.add(compareSingleType(tableName, uid, s, t, kind, fileMapping, idMappings, exclusions))
+            results.add(compareSingleType(tableName, uid, s, t, kind, fileMapping, idMappings, exclusions, srcSyncByDoc, tgtSyncByDoc, srcResolver, tgtResolver))
             if (s != null) processedSourceDocs.add(s.metadata.documentId)
             if (t != null) processedTargetDocs.add(t.metadata.documentId)
         }
@@ -1328,15 +1527,17 @@ suspend fun computeFingerprints(instance: StrapiInstance, files: List<StrapiImag
         val semaphore = Semaphore(6)
 
         // 1. Fetch existing cache entries for this instance
+        data class CacheEntry(val hash: String, val size: Long, val sha: String?, val updatedAt: String?)
         val cacheMap = dbQuery {
             FileAnalysisCacheTable.selectAll()
                 .where { FileAnalysisCacheTable.instanceId eq instance.id }
                 .associate {
-                    it[FileAnalysisCacheTable.documentId] to (
-                            it[FileAnalysisCacheTable.calculatedHash] to
-                                    it[FileAnalysisCacheTable.calculatedSizeBytes] to
-                                    it[FileAnalysisCacheTable.updatedAtStr]
-                            )
+                    it[FileAnalysisCacheTable.documentId] to CacheEntry(
+                        hash = it[FileAnalysisCacheTable.calculatedHash],
+                        size = it[FileAnalysisCacheTable.calculatedSizeBytes],
+                        sha = it[FileAnalysisCacheTable.calculatedSha],
+                        updatedAt = it[FileAnalysisCacheTable.updatedAtStr],
+                    )
                 }
         }
 
@@ -1348,11 +1549,13 @@ suspend fun computeFingerprints(instance: StrapiInstance, files: List<StrapiImag
                         val currentUpdatedAt = img.rawData["updated_at"]?.jsonPrimitive?.contentOrNull
                             ?: img.rawData["updatedAt"]?.jsonPrimitive?.contentOrNull
 
-                        // 2. Check if we have a valid cache entry
+                        // 2. Check if we have a valid cache entry (require sha present so older
+                        //    cache rows are recomputed once to backfill the exact-bytes digest).
                         val cached = cacheMap[docId]
-                        if (cached != null) {
-                            val (hashAndSize, cachedUpdatedAt) = cached
-                            val (cachedHash, cachedSize) = hashAndSize
+                        if (cached != null && cached.sha != null) {
+                            val cachedHash = cached.hash
+                            val cachedSize = cached.size
+                            val cachedUpdatedAt = cached.updatedAt
                             if (currentUpdatedAt == cachedUpdatedAt) {
                                 // Update last used timestamp in background
                                 launch {
@@ -1365,7 +1568,8 @@ suspend fun computeFingerprints(instance: StrapiInstance, files: List<StrapiImag
                                 return@withPermit img.copy(
                                     metadata = img.metadata.copy(
                                         calculatedHash = cachedHash,
-                                        calculatedSizeBytes = cachedSize
+                                        calculatedSizeBytes = cachedSize,
+                                        calculatedSha = cached.sha
                                     )
                                 )
                             }
@@ -1378,6 +1582,8 @@ suspend fun computeFingerprints(instance: StrapiInstance, files: List<StrapiImag
                         val fp = FileFingerprintUtil.compute(bytes, img.metadata.mime, img.metadata.ext)
                         val calculatedHash = fp.value
                         val calculatedSize = bytes.size.toLong()
+                        val calculatedSha = java.security.MessageDigest.getInstance("SHA-256")
+                            .digest(bytes).joinToString("") { "%02x".format(it) }
 
                         // 4. Update cache
                         dbQuery {
@@ -1392,12 +1598,14 @@ suspend fun computeFingerprints(instance: StrapiInstance, files: List<StrapiImag
                                     it[updatedAtStr] = currentUpdatedAt
                                     it[FileAnalysisCacheTable.calculatedHash] = calculatedHash
                                     it[calculatedSizeBytes] = calculatedSize
+                                    it[FileAnalysisCacheTable.calculatedSha] = calculatedSha
                                 }
                             } else {
                                 FileAnalysisCacheTable.update({ (FileAnalysisCacheTable.instanceId eq instance.id) and (FileAnalysisCacheTable.documentId eq docId) }) {
                                     it[updatedAtStr] = currentUpdatedAt
                                     it[FileAnalysisCacheTable.calculatedHash] = calculatedHash
                                     it[calculatedSizeBytes] = calculatedSize
+                                    it[FileAnalysisCacheTable.calculatedSha] = calculatedSha
                                     it[lastUsedAt] = OffsetDateTime.now()
                                 }
                             }
@@ -1405,7 +1613,8 @@ suspend fun computeFingerprints(instance: StrapiInstance, files: List<StrapiImag
 
                         val newMeta = img.metadata.copy(
                             calculatedHash = calculatedHash,
-                            calculatedSizeBytes = calculatedSize
+                            calculatedSizeBytes = calculatedSize,
+                            calculatedSha = calculatedSha
                         )
                         img.copy(metadata = newMeta)
                     } catch (e: Exception) {

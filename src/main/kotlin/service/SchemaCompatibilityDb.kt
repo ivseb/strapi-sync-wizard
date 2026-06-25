@@ -120,6 +120,8 @@ suspend fun SyncService.checkSchemaCompatibilityDb(
         missingTablesInTarget = missingInTarget,
         missingTablesInSource = missingInSource,
         tableDifferences = tableDiffs.sortedBy { it.table },
+        blockingContentTypes = blockingTables,
+        blockingColumnTypes = typeMismatches,
         extractedSchema = extracted
     )
 
@@ -376,6 +378,18 @@ private fun parseDbSchemaModel(
     return DbSchema(parsed)
 }
 
+/**
+ * Reads the schema JSON from the instance's `strapi_database_schema` (single row Strapi maintains).
+ * The resulting table count is taken verbatim from this JSON.
+ *
+ * CAVEAT (known, by-design): this reflects whatever Strapi last wrote. If the instance Strapi is still
+ * BOOTSTRAPPING (e.g. just restarted, or its DB was just reloaded and Strapi is re-syncing the schema),
+ * this row can transiently hold a partial/core-only schema (far fewer tables) until the boot finishes —
+ * `/_health` returns ready BEFORE the schema sync completes. A compare run started in that window will
+ * see a truncated schema and an almost-empty comparison. This does NOT happen with a steady, already-up
+ * instance. If you just restarted/reloaded a Strapi instance, wait for it to finish booting before
+ * running check-schema/compare (re-running check-schema once it's up yields the full schema).
+ */
 private fun fetchStrapiSchemaJsonFromDb(instance: StrapiInstance): String? {
     val logger = LoggerFactory.getLogger("SyncServiceDb")
 
@@ -681,6 +695,8 @@ suspend fun SyncService.checkSchemaCompatibilityAgainstTarget(
         missingTablesInTarget = missingInTarget,
         missingTablesInSource = missingInSource,
         tableDifferences = tableDiffs.sortedBy { it.table },
+        blockingContentTypes = blockingTables,
+        blockingColumnTypes = typeMismatches,
         extractedSchema = extracted
     )
 }

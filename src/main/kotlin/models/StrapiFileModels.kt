@@ -50,6 +50,10 @@ data class StrapiImageMetadata(
     // Computed fields (downloaded file):
     val calculatedHash: String? = null,
     val calculatedSizeBytes: Long? = null,
+    // Exact byte digest (sha256) of the downloaded file — definitive same-bytes signal.
+    val calculatedSha: String? = null,
+    // Durable cross-instance identity from the sync_identity sidecar (uid plugin::upload.file).
+    val syncId: String? = null,
 )
 
 @Serializable

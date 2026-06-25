@@ -5,7 +5,7 @@ import App from './App';
 import { queryClient } from './api/queryClient';
 
 // PrimeReact imports
-import 'primereact/resources/themes/mdc-dark-indigo/theme.css';    // theme
+import 'primereact/resources/themes/lara-dark-blue/theme.css';     // theme (flat dark base; overridden by app.css tokens)
 import 'primereact/resources/primereact.min.css';                  // core css
 import 'primeicons/primeicons.css';                                // icons
 import 'primeflex/primeflex.css';                                  // PrimeFlex for layout

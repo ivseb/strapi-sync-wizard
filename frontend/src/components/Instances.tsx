@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import { Button } from 'primereact/button';
 import { Message } from 'primereact/message';
 import { Toast } from 'primereact/toast';
@@ -24,6 +24,12 @@ const Instances: React.FC = () => {
 
   const menu = useRef<Menu>(null);
   const [menuModel, setMenuModel] = useState<MenuItem[]>([]);
+  const [search, setSearch] = useState('');
+
+  const rows = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return instances.filter((i) => !q || i.name.toLowerCase().includes(q) || (i.url || '').toLowerCase().includes(q));
+  }, [instances, search]);
 
   const notify = (summary: string, r: { connected: boolean; message: string }) =>
     instanceToast.current?.show({ severity: r.connected ? 'success' : 'warn', summary, detail: r.message, life: 3000 });
@@ -85,45 +91,52 @@ const Instances: React.FC = () => {
       <Menu model={menuModel} popup ref={menu} />
 
       <div className="ss-page-head">
-        <h2>Instances</h2>
-        <Button label="Add instance" icon="pi pi-plus" onClick={() => handleShowModal()} />
+        <h1>Instances</h1>
+        <span className="ss-spacer" />
+        {instances.length > 0 && (
+          <div className="ss-search" style={{ width: 200 }}>
+            <i className="pi pi-search" aria-hidden="true" />
+            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search…" />
+          </div>
+        )}
+        <button className="ss-btn primary" onClick={() => handleShowModal()}>
+          <i className="pi pi-plus" aria-hidden="true" /> Add instance
+        </button>
       </div>
 
       {error && <Message severity="error" text={error} className="w-full mb-3" />}
 
       {instances.length === 0 ? (
-        <Message severity="info" text="No instances yet. Add your first Strapi instance to get started." className="w-full" />
+        <div className="ss-empty">
+          <i className="pi pi-server" aria-hidden="true" />
+          No instances yet — add your first Strapi instance to get started.
+        </div>
       ) : (
-        <div className="flex flex-column gap-2">
-          {instances.map((instance) => {
+        <div className="ss-list">
+          {rows.map((instance) => {
             const virtual = !!instance.isVirtual;
             return (
-              <div key={instance.id} className="surface-card border-round p-3 flex align-items-center gap-3" style={{ border: '1px solid var(--surface-border)' }}>
-                <span
-                  className="flex align-items-center justify-content-center border-circle"
-                  style={{ width: 38, height: 38, flex: 'none', background: 'var(--surface-100)', color: virtual ? 'var(--text-color-secondary)' : 'var(--primary-color)' }}
-                >
-                  <i className={virtual ? 'pi pi-cloud' : 'pi pi-server'} aria-hidden="true" />
-                </span>
-                <div style={{ minWidth: 0, maxWidth: 460 }}>
-                  <div className="flex align-items-center gap-2">
-                    <span style={{ fontWeight: 500 }}>{instance.name}</span>
-                    <span className="ss-muted" style={{ fontSize: 11, border: '1px solid var(--surface-border)', borderRadius: 6, padding: '1px 7px' }}>
-                      {virtual ? 'virtual' : 'real'}
-                    </span>
+              <div key={instance.id} className="ss-card">
+                <div className="ss-card-row">
+                  <span className="ss-avatar" style={{ width: 36, height: 36, fontSize: 15, color: virtual ? 'var(--ss-text-2)' : 'var(--ss-accent-soft-fg)', background: virtual ? 'var(--ss-surface-3)' : 'var(--ss-accent-soft-bg)' }}>
+                    <i className={virtual ? 'pi pi-cloud' : 'pi pi-server'} aria-hidden="true" />
+                  </span>
+                  <div style={{ minWidth: 0 }}>
+                    <div className="ss-card-row" style={{ gap: 8 }}>
+                      <span className="ss-card-title">{instance.name}</span>
+                      <span className="ss-badge">{virtual ? 'virtual' : 'real'}</span>
+                    </div>
+                    <div className="ss-dim" style={{ fontSize: 12, marginTop: 3, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 460 }}>
+                      {virtual ? 'offline · via pipeline artifact' : instance.url}
+                    </div>
                   </div>
-                  <div className="ss-muted" style={{ fontFamily: 'var(--font-family, monospace)', fontSize: 12, marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    {virtual ? 'offline · via pipeline artifact' : instance.url}
-                  </div>
+                  <span className="ss-spacer" style={{ marginLeft: 'auto' }} />
+                  {!virtual && instance.dbName && (
+                    <span className="ss-dim" style={{ fontSize: 12 }}><i className="pi pi-database" style={{ fontSize: '.8rem' }} aria-hidden="true" /> {instance.dbName}</span>
+                  )}
+                  <Button icon="pi pi-ellipsis-v" rounded text aria-label="Actions"
+                    onClick={(e) => { setMenuModel(buildMenu(instance)); menu.current?.toggle(e); }} />
                 </div>
-                <span className="flex-1" />
-                {!virtual && instance.dbName && (
-                  <span className="ss-muted text-sm"><i className="pi pi-database" style={{ fontSize: '.8rem' }} aria-hidden="true" /> {instance.dbName}</span>
-                )}
-                <Button
-                  icon="pi pi-ellipsis-v" rounded text aria-label="Actions"
-                  onClick={(e) => { setMenuModel(buildMenu(instance)); menu.current?.toggle(e); }}
-                />
               </div>
             );
           })}

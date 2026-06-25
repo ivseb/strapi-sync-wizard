@@ -24,6 +24,14 @@ export interface ConnectionTestResult {
   message: string;
 }
 
+export interface InstanceSnapshot {
+  id: number;
+  mergeRequestId: number;
+  mergeRequestName: string;
+  snapshotSchemaName: string;
+  createdAt: string;
+}
+
 export const instanceKeys = {
   all: ['instances'] as const,
   list: () => [...instanceKeys.all, 'list'] as const,
@@ -39,6 +47,12 @@ export const instancesApi = {
   testToken: (id: number) => http.post<ConnectionTestResult>(`/api/instances/${id}/test-token`).then((r) => r.data),
   backfillIdentity: (id: number) =>
     http.post<{ instanceId: number; inserted: number }>(`/api/instances/${id}/identity/backfill`).then((r) => r.data),
+  listSnapshots: (id: number) =>
+    http.get<InstanceSnapshot[]>(`/api/instances/${id}/snapshots`).then((r) => r.data),
+  restoreSnapshot: (id: number, snapshotId: number) =>
+    http.post(`/api/instances/${id}/snapshots/${snapshotId}/restore`).then((r) => r.data),
+  deleteSnapshot: (id: number, snapshotId: number) =>
+    http.delete(`/api/instances/${id}/snapshots/${snapshotId}`).then((r) => r.data),
 };
 
 export function useInstances() {

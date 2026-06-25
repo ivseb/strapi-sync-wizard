@@ -176,6 +176,17 @@ export interface ContentRelationship {
     isBidirectional: boolean;
 }
 
+export interface ResolvedRef {
+    documentId: string;
+    label: string;
+    syncId?: string | null;
+    isFile?: boolean;
+    fileId?: number | null;
+    mime?: string | null;
+    contentHash?: string | null;
+    refType?: string | null;
+}
+
 export interface ContentTypeComparisonResultWithRelationships {
     id: string; // unique id used for selection
     tableName: string;
@@ -184,6 +195,8 @@ export interface ContentTypeComparisonResultWithRelationships {
     targetContent?: StrapiContent | null;
     compareState: ContentTypeComparisonResultKind;
     kind: StrapiContentTypeKind;
+    sourceRefs?: Record<string, ResolvedRef[]>;
+    targetRefs?: Record<string, ResolvedRef[]>;
 }
 
 

@@ -541,6 +541,24 @@ class StrapiClient(
 
     }
 
+    /**
+     * Delete a file via the upload API — removes the binary from the configured provider AND the DB
+     * row (and its relations). Returns true on success. Used by Media cleanup when binary deletion
+     * is enabled.
+     */
+    suspend fun deleteUploadFile(id: Int): Boolean {
+        val token = getLoginToken().token
+        val url = "$baseUrl/upload/files/$id"
+        return try {
+            selector.getClientForUrl(url).delete(url) {
+                headers { append(HttpHeaders.Authorization, "Bearer $token") }
+            }.status.isSuccess()
+        } catch (e: Exception) {
+            logger.warn("deleteUploadFile($id) failed: ${e.message}")
+            false
+        }
+    }
+
     suspend fun uploadFile(
         id: Int?,
         fileName: String,

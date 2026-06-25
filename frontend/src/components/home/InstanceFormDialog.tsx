@@ -61,7 +61,7 @@ const InstanceFormDialog: React.FC<InstanceFormDialogProps> = ({
         <div className="field mb-3">
           <div className="flex align-items-center gap-2">
             <Checkbox inputId="isVirtual" checked={!!formData.isVirtual} onChange={(e) => onInputChange({ target: { name: 'isVirtual', value: e.checked } as any } as any)} />
-            <label htmlFor="isVirtual" className="mb-0">Istanza virtuale (placeholder, campi di connessione non obbligatori)</label>
+            <label htmlFor="isVirtual" className="mb-0">Virtual instance (placeholder — connection fields optional)</label>
           </div>
         </div>
 

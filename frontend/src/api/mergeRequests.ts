@@ -4,6 +4,25 @@ import type { MergeRequestDetail, IdentityReconciliationReport } from '../types'
 
 export type CompareMode = 'full' | 'cache' | 'compare';
 
+export interface MergeVerificationItem {
+  contentType: string;
+  documentId: string;
+  direction: string;
+  expected: string;
+  actual: string;
+  consistent: boolean;
+  severity: 'ok' | 'schema_gap' | 'mismatch';
+  reason?: string | null;
+}
+export interface MergeVerificationReport {
+  mergeRequestId: number;
+  total: number;
+  consistent: number;
+  schemaGap: number;
+  inconsistent: number;
+  items: MergeVerificationItem[];
+}
+
 export interface CreateMergeRequestDTO {
   name: string;
   description?: string;
@@ -62,7 +81,10 @@ export const mergeRequestsApi = {
     http.post(`/api/merge-requests/${id}/import/prefetch`, body).then((r) => r.data),
   updateSelection: (id: number, selection: UnifiedSelection) =>
     http.post(`/api/merge-requests/${id}/selection`, selection).then((r) => r.data),
-  complete: (id: number) => http.post(`/api/merge-requests/${id}/complete`).then((r) => r.data),
+  complete: (id: number, opts?: { onlyFailed?: boolean; rollbackOnFailure?: boolean }) =>
+    http.post(`/api/merge-requests/${id}/complete`, null, { params: opts }).then((r) => r.data),
+  verify: (id: number) =>
+    http.post<MergeVerificationReport>(`/api/merge-requests/${id}/verify`).then((r) => r.data),
   reconcileIdentity: (id: number, apply: boolean) =>
     http
       .post<IdentityReconciliationReport>(`/api/merge-requests/${id}/identity/reconcile`, null, {
@@ -119,7 +141,7 @@ export function useUpdateSelection(id: number) {
 export function useCompleteMerge(id: number) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: () => mergeRequestsApi.complete(id),
+    mutationFn: (opts?: { onlyFailed?: boolean; rollbackOnFailure?: boolean }) => mergeRequestsApi.complete(id, opts),
     onSuccess: () => qc.invalidateQueries({ queryKey: mrKeys.detail(id) }),
   });
 }

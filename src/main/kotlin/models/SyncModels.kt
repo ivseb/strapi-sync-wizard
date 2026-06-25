@@ -163,6 +163,25 @@ data class EntryRelationship(
 )
 
 /**
+ * A relation/media reference resolved to something a human can read: the target's label (file name
+ * or content title), its cross-instance identity (syncId), and whether it is a file.
+ */
+@Serializable
+data class ResolvedRef(
+    val documentId: String,
+    val label: String,
+    val syncId: String? = null,
+    val isFile: Boolean = false,
+    val fileId: Int? = null,
+    val mime: String? = null,
+    // Content identity of the referenced entity (same content -> same hash, even for duplicates).
+    // Used to decide whether a reference actually changed, independent of which duplicate/order.
+    val contentHash: String? = null,
+    // Short type of the referenced entity (e.g. "section-card-assistance") for display.
+    val refType: String? = null,
+)
+
+/**
  * Enhanced comparison result with relationship information
  */
 @Serializable
@@ -174,6 +193,9 @@ data class ContentTypeComparisonResultWithRelationships(
     val targetContent: StrapiContent?,
     val compareState: ContentTypeComparisonResultKind,
     val kind: StrapiContentTypeKind,
+    // __links resolved to readable, identity-normalized references (field -> refs), per side.
+    val sourceRefs: Map<String, List<ResolvedRef>> = emptyMap(),
+    val targetRefs: Map<String, List<ResolvedRef>> = emptyMap(),
 )
 
 /**

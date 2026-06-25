@@ -40,7 +40,7 @@ const ExclusionsManager: React.FC<ExclusionsManagerProps> = ({
                 setExclusions(res.data.data);
             }
         } catch (e: any) {
-            setError(e.message || 'Errore nel caricamento delle esclusioni');
+            setError(e.message || 'Failed to load exclusions');
         } finally {
             setLoading(false);
         }
@@ -58,7 +58,7 @@ const ExclusionsManager: React.FC<ExclusionsManagerProps> = ({
             await fetchExclusions();
             if (onExclusionsChanged) onExclusionsChanged();
         } catch (e: any) {
-            setError(e.message || "Errore durante l'eliminazione dell'esclusione");
+            setError(e.message || 'Failed to delete exclusion');
         }
     };
 

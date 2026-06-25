@@ -132,9 +132,15 @@ class FileMergeProcessor(private val mergeRequestSelectionsRepository: MergeRequ
                         val sourceFile = sourceClient.downloadFile(file)
                         val folder =
                             sourceFoldersMap[file.metadata.folderPath]?.let { targetFolderMap[it.pathFull]?.id }
-                        val id = if (direction == Direction.TO_UPDATE) {
-                            file.metadata.id
-                        } else null
+                        // Idempotent re-run: if this source file was already created in a previous run
+                        // (mapping exists), update that target file in place instead of creating a new
+                        // one — otherwise every re-run would pile up duplicate files in the target.
+                        val existingTargetId = mergeMapping[file.metadata.documentId]?.targetId
+                        val id = when {
+                            direction == Direction.TO_UPDATE -> file.metadata.id
+                            existingTargetId != null -> existingTargetId
+                            else -> null
+                        }
                         val uploadResponse = targetClient.uploadFile(
                             id,
                             file.metadata.name,

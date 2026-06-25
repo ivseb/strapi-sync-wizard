@@ -5,11 +5,9 @@ import { Button } from 'primereact/button';
 import { Message } from 'primereact/message';
 import { Toast } from 'primereact/toast';
 import { ProgressSpinner } from 'primereact/progressspinner';
-import { Tag } from 'primereact/tag';
 
 import {
   ContentTypeComparisonResultKind,
-  ContentTypeComparisonResultWithRelationships,
   MergeRequestData,
   MergeRequestDetail,
   StrapiContentTypeKind,
@@ -30,7 +28,7 @@ import { apiErrorMessage } from '../api/http';
 
 import SchemaCompatibilityStep from './steps/SchemaCompatibilityStep';
 import ContentComparisonStep from './steps/ContentComparisonStep';
-import MergeFilesStep from './steps/MergeFilesStep';
+import MergeFilesWorkspace from './steps/MergeFilesWorkspace';
 import MergeContentWorkspace from './steps/MergeContentWorkspace';
 import CompleteMergeStep from './steps/CompleteMergeStep';
 import SnapshotManager from './SnapshotManager';
@@ -41,36 +39,13 @@ const RANK: Record<string, number> = {
   MERGED_SINGLES: 4, MERGED_COLLECTIONS: 5, REVIEW: 6, IN_PROGRESS: 6, FAILED: 6, COMPLETED: 7,
 };
 
-const statusSeverity = (s: string): 'success' | 'danger' | 'info' | 'warning' =>
-  s === 'COMPLETED' ? 'success' : s === 'FAILED' ? 'danger' : s === 'REVIEW' || s === 'IN_PROGRESS' ? 'warning' : 'info';
-
-interface PipeStep {
-  key: string;
-  label: string;
-  icon: string;
-  done: boolean;
-  current: boolean;
-  onClick?: () => void;
-}
-
-const Pipeline: React.FC<{ steps: PipeStep[] }> = ({ steps }) => (
-  <div className="ss-pipe surface-card border-round" style={{ border: '1px solid var(--surface-border)' }}>
-    {steps.map((s, i) => (
-      <React.Fragment key={s.key}>
-        {i > 0 && <div className={`ss-pipe-conn${steps[i].done ? ' done' : ''}`} />}
-        <button
-          type="button"
-          className={`ss-pipe-step${s.done ? ' done' : ''}${s.current ? ' current' : ''}${s.onClick ? ' clickable' : ''}`}
-          onClick={s.onClick}
-          disabled={!s.onClick}
-        >
-          <span className="ss-pipe-dot"><i className={s.done ? 'pi pi-check' : s.icon} aria-hidden="true" /></span>
-          <span className="ss-pipe-label">{s.label}</span>
-        </button>
-      </React.Fragment>
-    ))}
-  </div>
-);
+const statusBadge = (s: string): { label: string; cls: string } => {
+  if (s === 'COMPLETED') return { label: 'Completed', cls: 'success' };
+  if (s === 'FAILED') return { label: 'Failed', cls: 'danger' };
+  if (s === 'REVIEW' || s === 'IN_PROGRESS') return { label: s === 'REVIEW' ? 'Review' : 'In progress', cls: 'warn' };
+  if (s === 'COMPARED') return { label: 'Compared', cls: 'info' };
+  return { label: s.replace(/_/g, ' ').toLowerCase(), cls: '' };
+};
 
 const MergeRequestDetails: React.FC = () => {
   const { id } = useParams<{ id: string }>();
@@ -83,7 +58,7 @@ const MergeRequestDetails: React.FC = () => {
 
   const [activeStep, setActiveStep] = useState<number>(0);
   const [showReconcile, setShowReconcile] = useState(false);
-  const [mergingCollections, setMergingCollections] = useState(false);
+  const [schemaResult, setSchemaResult] = useState<{ isCompatible: boolean; blocking: string[]; warnings: string[] } | null>(null);
 
   const schemaInputRef = useRef<HTMLInputElement>(null);
   const prefetchInputRef = useRef<HTMLInputElement>(null);
@@ -134,6 +109,7 @@ const MergeRequestDetails: React.FC = () => {
   const checkSchemaCompatibility = async (force = false) => {
     try {
       const res: any = await checkSchemaMut.mutateAsync(force);
+      setSchemaResult({ isCompatible: !!res?.isCompatible, blocking: res?.blocking ?? [], warnings: res?.warnings ?? [] });
       toast.current?.show({ severity: res?.isCompatible ? 'success' : 'warn', summary: res?.isCompatible ? 'Compatible' : 'Incompatible', detail: res?.isCompatible ? 'Source and target schemas are compatible.' : 'Schemas are not compatible.', life: 5000 });
     } catch (err) { showError(apiErrorMessage(err) || 'Failed to check schema'); }
   };
@@ -179,20 +155,16 @@ const MergeRequestDetails: React.FC = () => {
     } catch (err) { showError(apiErrorMessage(err) || 'Failed to update selections'); return false; }
   };
 
-  const mergeSingleTypes = async () => {
-    if (await updateMergeRequestStatus('MERGED_SINGLES')) { toast.current?.show({ severity: 'success', summary: 'Single types saved', life: 4000 }); await proceedToNextStep(2); }
-  };
-
-  const mergeCollections = async () => {
-    setMergingCollections(true);
+  const completeMerge = async (opts?: { onlyFailed?: boolean; rollbackOnFailure?: boolean }) => {
     try {
-      if (await updateMergeRequestStatus('MERGED_COLLECTIONS')) { toast.current?.show({ severity: 'success', summary: 'Collections saved', life: 4000 }); await proceedToNextStep(4); }
-    } finally { setMergingCollections(false); }
-  };
-
-  const completeMerge = async () => {
-    try { await completeMut.mutateAsync(); toast.current?.show({ severity: 'success', summary: 'Merge completed', life: 5000 }); }
-    catch (err) { showError(apiErrorMessage(err) || 'Failed to complete merge'); }
+      const res: any = await completeMut.mutateAsync(opts);
+      const failed = typeof res?.failed === 'number' ? res.failed : 0;
+      if (failed > 0) {
+        toast.current?.show({ severity: 'warn', summary: 'Completed with errors', detail: res?.message || `${failed} item(s) failed`, life: 7000 });
+      } else {
+        toast.current?.show({ severity: 'success', summary: 'Merge completed', detail: res?.message, life: 5000 });
+      }
+    } catch (err) { showError(apiErrorMessage(err) || 'Failed to complete merge'); }
   };
 
   if (isLoading) return <div className="flex justify-content-center p-5"><ProgressSpinner /></div>;
@@ -201,7 +173,7 @@ const MergeRequestDetails: React.FC = () => {
       <div>
         <Toast ref={toast} />
         <Message severity={error ? 'error' : 'warn'} text={error ? apiErrorMessage(error) : 'Merge request not found'} className="w-full mb-3" />
-        <Button label="Back to merge requests" icon="pi pi-arrow-left" onClick={() => navigate('/merge-requests')} />
+        <button className="ss-btn" onClick={() => navigate('/merge-requests')}><i className="pi pi-arrow-left" aria-hidden="true" /> Back to merge requests</button>
       </div>
     );
   }
@@ -213,96 +185,130 @@ const MergeRequestDetails: React.FC = () => {
   const completed = status === 'COMPLETED';
   const bothReal = !detail.mergeRequest.sourceInstance.isVirtual && !detail.mergeRequest.targetInstance.isVirtual;
   const data = detail.mergeRequestData;
+  const badge = statusBadge(status);
 
-  const steps: PipeStep[] = [
-    { key: 'schema', label: 'Schema', icon: 'pi pi-shield', done: rank >= 1, current: phase === 'prep' && rank < 1 },
-    { key: 'compare', label: 'Compare', icon: 'pi pi-search', done: rank >= 2, current: phase === 'prep' && rank >= 1 },
-    { key: 'identity', label: 'Identity', icon: 'pi pi-id-card', done: false, current: false, onClick: rank >= 2 && bothReal ? () => setShowReconcile(true) : undefined },
-    { key: 'files', label: 'Files', icon: 'pi pi-images', done: rank >= 3, current: phase === 'merge' && activeStep === 0, onClick: phase === 'merge' ? () => setActiveStep(0) : undefined },
-    { key: 'content', label: 'Content', icon: 'pi pi-database', done: rank >= 5, current: phase === 'merge' && activeStep === 1, onClick: phase === 'merge' ? () => setActiveStep(1) : undefined },
-    { key: 'complete', label: 'Complete', icon: 'pi pi-flag', done: completed, current: phase === 'review' },
-  ];
+  // counts for tabs
+  const fileCount = (data?.files ? (Object.values(data.files).flat() as any[]).filter((f) => f && f.compareState && f.compareState !== 'IDENTICAL').length : 0);
+  const contentCount = (() => {
+    let n = 0;
+    Object.values(data?.singleTypes || {}).forEach((r: any) => { if (r?.compareState && r.compareState !== 'IDENTICAL') n++; });
+    Object.values(data?.collectionTypes || {}).forEach((arr: any) => (arr || []).forEach((r: any) => { if (r?.compareState && r.compareState !== 'IDENTICAL') n++; }));
+    return n;
+  })();
+
+  const Chip: React.FC<{ cls: string; icon: string; label: string; onClick?: () => void }> = ({ cls, icon, label, onClick }) => (
+    <span className={`ss-chip ${cls}`} style={onClick ? { cursor: 'pointer' } : undefined} onClick={onClick}>
+      <i className={icon} aria-hidden="true" /> {label}
+    </span>
+  );
+
+  const schemaChip = detail.isCompatible === true
+    ? <Chip cls="success" icon="pi pi-check" label="Schema compatible" />
+    : detail.isCompatible === false
+      ? <Chip cls="danger" icon="pi pi-times" label="Schema incompatible" />
+      : <Chip cls="" icon="pi pi-shield" label="Schema unchecked" />;
 
   return (
     <div>
       <Toast ref={toast} />
 
-      <div className="ss-page-head">
-        <div className="flex align-items-center gap-3" style={{ minWidth: 0 }}>
-          <Button icon="pi pi-arrow-left" rounded text aria-label="Back" onClick={() => navigate('/merge-requests')} />
-          <div style={{ minWidth: 0 }}>
-            <h2 style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{detail.mergeRequest.name}</h2>
-            <div className="ss-muted text-sm mt-1">
-              {detail.mergeRequest.sourceInstance.name} <i className="pi pi-arrow-right" style={{ fontSize: '.7rem' }} aria-hidden="true" /> {detail.mergeRequest.targetInstance.name}
+      <div className="ss-review">
+        {/* Header */}
+        <div className="ss-review-head">
+          <div className="ss-card-row">
+            <Button icon="pi pi-arrow-left" rounded text aria-label="Back" onClick={() => navigate('/merge-requests')} />
+            <div style={{ minWidth: 0 }}>
+              <div className="ss-card-row" style={{ gap: 9 }}>
+                <span style={{ fontSize: 15, fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 420 }}>{detail.mergeRequest.name}</span>
+                <span className={`ss-badge ${badge.cls}`}>{badge.label}</span>
+              </div>
+              <div className="ss-route" style={{ marginTop: 5 }}>
+                <span className="ss-node"><span className="ss-dot" />{detail.mergeRequest.sourceInstance.name}</span>
+                <i className="pi pi-arrow-right" aria-hidden="true" />
+                <span className="ss-node"><span className="ss-dot target" />{detail.mergeRequest.targetInstance.name}</span>
+              </div>
             </div>
+            <span style={{ marginLeft: 'auto' }} />
+            {phase === 'prep' && (
+              <button className="ss-btn primary" disabled={detail.isCompatible !== true || compareMut.isPending} onClick={compareContent}>
+                <i className="pi pi-search" aria-hidden="true" /> {compareMut.isPending ? 'Comparing…' : 'Compare'}
+              </button>
+            )}
+            {phase === 'merge' && (
+              <>
+                <button className="ss-btn subtle" disabled={compareMut.isPending} onClick={compareContent}><i className="pi pi-refresh" aria-hidden="true" /> Re-compare</button>
+                <button className="ss-btn primary" disabled={completed} onClick={() => updateMergeRequestStatus('REVIEW').then(() => refetch())}>
+                  <i className="pi pi-flag" aria-hidden="true" /> Go to review
+                </button>
+              </>
+            )}
+          </div>
+
+          {/* readiness chips */}
+          <div className="ss-card-row" style={{ gap: 6, marginTop: 11, flexWrap: 'wrap' }}>
+            {schemaChip}
+            {schemaResult && schemaResult.warnings.length > 0 && <Chip cls="warn" icon="pi pi-exclamation-triangle" label={`${schemaResult.warnings.length} warning${schemaResult.warnings.length === 1 ? '' : 's'}`} />}
+            {bothReal && rank >= 2 && <Chip cls="info" icon="pi pi-id-card" label="Reconcile identity" onClick={() => setShowReconcile(true)} />}
+            {rank >= 2 && (
+              <>
+                <span style={{ marginLeft: 'auto' }} />
+                <span className="ss-dim" style={{ fontSize: 11 }}>{fileCount} files · {contentCount} content changes</span>
+              </>
+            )}
           </div>
         </div>
-        <Tag value={status.replace(/_/g, ' ').toLowerCase()} severity={statusSeverity(status)} />
-      </div>
 
-      <Pipeline steps={steps} />
-
-      <div className="mt-3">
+        {/* Body */}
         {phase === 'prep' && (
-          <div className="surface-card border-round p-4" style={{ border: '1px solid var(--surface-border)' }}>
-            <div className="grid">
-              <div className="col-12 md:col-6">
-                <h3 className="mb-2">Schema compatibility</h3>
-                <div className="mb-3 flex gap-2 flex-wrap">
-                  <input type="file" accept="application/json" style={{ display: 'none' }} ref={schemaInputRef} onChange={onSchemaFileSelected} />
-                  <Button label="Import schema JSON" icon="pi pi-upload" outlined size="small" loading={importSchemaMut.isPending} onClick={() => schemaInputRef.current?.click()} />
-                  <input type="file" accept="application/json" style={{ display: 'none' }} ref={prefetchInputRef} onChange={onPrefetchFileSelected} />
-                  <Button label="Import prefetch JSON" icon="pi pi-upload" outlined size="small" loading={importPrefetchMut.isPending} onClick={() => prefetchInputRef.current?.click()} />
-                </div>
-                <SchemaCompatibilityStep schemaCompatible={detail.isCompatible === true} checkingSchema={checkSchemaMut.isPending} checkSchemaCompatibility={checkSchemaCompatibility} />
-              </div>
-              <div className="col-12 md:col-6">
-                <h3 className="mb-2">Content comparison</h3>
-                <ContentComparisonStep comparingContent={compareMut.isPending} schemaCompatible={detail.isCompatible === true} compareContent={compareContent} status={status} />
-              </div>
+          <div style={{ padding: 16 }}>
+            <div className="mb-3 flex gap-2 flex-wrap">
+              <input type="file" accept="application/json" style={{ display: 'none' }} ref={schemaInputRef} onChange={onSchemaFileSelected} />
+              <button className="ss-btn" onClick={() => schemaInputRef.current?.click()} disabled={importSchemaMut.isPending}><i className="pi pi-upload" aria-hidden="true" /> Import schema JSON</button>
+              <input type="file" accept="application/json" style={{ display: 'none' }} ref={prefetchInputRef} onChange={onPrefetchFileSelected} />
+              <button className="ss-btn" onClick={() => prefetchInputRef.current?.click()} disabled={importPrefetchMut.isPending}><i className="pi pi-upload" aria-hidden="true" /> Import prefetch JSON</button>
+            </div>
+            <SchemaCompatibilityStep schemaCompatible={detail.isCompatible === true} checkingSchema={checkSchemaMut.isPending} checkSchemaCompatibility={checkSchemaCompatibility} blocking={schemaResult?.blocking ?? []} warnings={schemaResult?.warnings ?? []} />
+            <div style={{ borderTop: '1px solid var(--ss-border)', marginTop: 16, paddingTop: 16 }}>
+              <ContentComparisonStep comparingContent={compareMut.isPending} schemaCompatible={detail.isCompatible === true} compareContent={compareContent} status={status} />
             </div>
           </div>
         )}
 
         {phase === 'merge' && (
           <>
-            <div className="surface-card border-round p-3" style={{ border: '1px solid var(--surface-border)' }}>
-              {activeStep === 0 && (
-                <MergeFilesStep mergeRequestId={detail.mergeRequest.id} filesData={data?.files} loading={false}
-                  updateAllSelections={updateAllSelections} selections={data?.selections || []} allMergeData={data!} onSaved={patchMergeData} />
-              )}
-              {activeStep === 1 && data && (
-                <MergeContentWorkspace mergeRequestId={idNum} data={data}
-                  updateAllSelections={updateAllSelections} onSaved={() => { refetch(); }} />
-              )}
+            <div className="ss-tabs" style={{ padding: '0 16px', marginBottom: 0 }}>
+              <button className={`ss-tab${activeStep === 0 ? ' active' : ''}`} onClick={() => setActiveStep(0)}>Files <span className="ss-tab-n">{fileCount}</span></button>
+              <button className={`ss-tab${activeStep === 1 ? ' active' : ''}`} onClick={() => setActiveStep(1)}>Content <span className="ss-tab-n">{contentCount}</span></button>
             </div>
-
-            <div className="ss-actionbar">
-              <Button label="Re-compare" icon="pi pi-refresh" text size="small" loading={compareMut.isPending} onClick={compareContent} />
-              <div className="flex gap-2">
-                <Button label="Back" icon="pi pi-arrow-left" outlined disabled={completed || activeStep === 0} onClick={() => setActiveStep(activeStep - 1)} />
-                <Button
-                  label={activeStep === 1 ? 'Go to review' : 'Next'} icon="pi pi-arrow-right" iconPos="right" disabled={completed}
-                  onClick={() => proceedToNextStep(activeStep === 0 ? 1 : 4).catch((e) => showError(apiErrorMessage(e)))}
-                />
-              </div>
-            </div>
+            {activeStep === 0 && (
+              <MergeFilesWorkspace mergeRequestId={detail.mergeRequest.id}
+                sourceInstanceId={detail.mergeRequest.sourceInstance.id} targetInstanceId={detail.mergeRequest.targetInstance.id}
+                filesData={data?.files}
+                updateAllSelections={updateAllSelections} selections={data?.selections || []} allMergeData={data!} onSaved={patchMergeData} />
+            )}
+            {activeStep === 1 && data && (
+              <MergeContentWorkspace mergeRequestId={idNum} data={data}
+                sourceInstanceId={detail.mergeRequest.sourceInstance.id} targetInstanceId={detail.mergeRequest.targetInstance.id}
+                updateAllSelections={updateAllSelections} onSaved={() => { refetch(); }} />
+            )}
           </>
         )}
 
         {phase === 'review' && (
-          <>
+          <div style={{ padding: 16 }}>
             <SnapshotManager mergeRequestId={idNum} onRestoreComplete={() => refetch()} />
-            <div className="surface-card border-round p-3 mt-3" style={{ border: '1px solid var(--surface-border)' }}>
+            <div style={{ marginTop: 16 }}>
               <CompleteMergeStep status={status} completing={completeMut.isPending} completeMerge={completeMerge}
                 selections={data?.selections} allMergeData={data} />
             </div>
             {!completed && (
-              <div className="mt-3">
-                <Button label="Back to wizard" icon="pi pi-arrow-left" outlined onClick={() => { setActiveStep(1); updateMergeRequestStatus('MERGED_COLLECTIONS'); }} />
+              <div style={{ marginTop: 16 }}>
+                <button className="ss-btn" onClick={() => { setActiveStep(1); updateMergeRequestStatus('MERGED_COLLECTIONS').then(() => refetch()); }}>
+                  <i className="pi pi-arrow-left" aria-hidden="true" /> Back to changes
+                </button>
               </div>
             )}
-          </>
+          </div>
         )}
       </div>
 

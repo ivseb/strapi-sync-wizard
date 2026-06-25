@@ -42,7 +42,8 @@ fun Application.configureRouting() {
         configureInstanceRoutes(
             instanceRepository,
             mergeRequestRepository,
-            mergeRequestSelectionsRepository
+            mergeRequestSelectionsRepository,
+            postgresSnapshotService
         )
         configureMergeRequestRoutes(mergeRequestService)
 

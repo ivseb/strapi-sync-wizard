@@ -1,11 +1,5 @@
 import React, { useEffect, useState } from 'react';
 import axios from 'axios';
-import { DataTable } from 'primereact/datatable';
-import { Column } from 'primereact/column';
-import { Button } from 'primereact/button';
-import { Card } from 'primereact/card';
-import { Tag } from 'primereact/tag';
-import { Timeline } from 'primereact/timeline';
 import { Dialog } from 'primereact/dialog';
 import { SnapshotDTO, SnapshotActivityDTO } from '../types';
 
@@ -14,12 +8,19 @@ interface SnapshotManagerProps {
     onRestoreComplete?: () => void;
 }
 
+const fmtDate = (s: string) => new Date(s).toLocaleString();
+
+const statusBadge = (status: string) => {
+    const cls = status === 'SUCCESS' ? 'success' : status === 'FAILED' ? 'danger' : 'info';
+    return <span className={`ss-badge ${cls}`}>{status.replace('_', ' ')}</span>;
+};
+
 const SnapshotManager: React.FC<SnapshotManagerProps> = ({ mergeRequestId, onRestoreComplete }) => {
     const [snapshots, setSnapshots] = useState<SnapshotDTO[]>([]);
     const [history, setHistory] = useState<SnapshotActivityDTO[]>([]);
-    const [loading, setLoading] = useState<boolean>(false);
-    const [actionLoading, setActionLoading] = useState<boolean>(false);
-    const [showHistory, setShowHistory] = useState<boolean>(false);
+    const [loading, setLoading] = useState(false);
+    const [actionLoading, setActionLoading] = useState(false);
+    const [showHistory, setShowHistory] = useState(false);
 
     const fetchData = async () => {
         setLoading(true);
@@ -37,9 +38,7 @@ const SnapshotManager: React.FC<SnapshotManagerProps> = ({ mergeRequestId, onRes
         }
     };
 
-    useEffect(() => {
-        fetchData();
-    }, [mergeRequestId]);
+    useEffect(() => { fetchData(); /* eslint-disable-next-line */ }, [mergeRequestId]);
 
     const takeSnapshot = async () => {
         setActionLoading(true);
@@ -54,15 +53,10 @@ const SnapshotManager: React.FC<SnapshotManagerProps> = ({ mergeRequestId, onRes
     };
 
     const restoreSnapshot = async (schemaName?: string) => {
-        if (!window.confirm('Sei sicuro di voler ripristinare questo snapshot? Tutti i dati correnti nello schema public verranno sovrascritti.')) {
-            return;
-        }
-
+        if (!window.confirm('Sei sicuro di voler ripristinare questo snapshot? Tutti i dati correnti nello schema public verranno sovrascritti.')) return;
         setActionLoading(true);
         try {
-            await axios.post(`/api/merge-requests/${mergeRequestId}/snapshots/restore`, {
-                snapshotSchemaName: schemaName
-            });
+            await axios.post(`/api/merge-requests/${mergeRequestId}/snapshots/restore`, { snapshotSchemaName: schemaName });
             await fetchData();
             if (onRestoreComplete) onRestoreComplete();
         } catch (error) {
@@ -72,88 +66,73 @@ const SnapshotManager: React.FC<SnapshotManagerProps> = ({ mergeRequestId, onRes
         }
     };
 
-    const getStatusTag = (status: string) => {
-        switch (status) {
-            case 'SUCCESS': return <Tag severity="success" value="SUCCESS" />;
-            case 'FAILED': return <Tag severity="danger" value="FAILED" />;
-            case 'IN_PROGRESS': return <Tag severity="info" value="IN PROGRESS" />;
-            default: return <Tag value={status} />;
-        }
-    };
+    return (
+        <div className="ss-review">
+            {/* Header / toolbar */}
+            <div className="ss-review-toolbar">
+                <i className="pi pi-database" style={{ fontSize: 13, color: 'var(--ss-text-2)' }} aria-hidden="true" />
+                <span style={{ fontSize: 13, color: 'var(--ss-text)' }}>Database snapshots</span>
+                {snapshots.length > 0 && <span className="ss-dim" style={{ fontSize: 11.5 }}>{snapshots.length}</span>}
+                <span style={{ marginLeft: 'auto' }} />
+                <button className="ss-btn subtle" onClick={fetchData} disabled={loading} title="Refresh">
+                    <i className={`pi ${loading ? 'pi-spin pi-spinner' : 'pi-refresh'}`} aria-hidden="true" />
+                </button>
+                <button className="ss-btn subtle" onClick={() => setShowHistory(true)}>
+                    <i className="pi pi-history" aria-hidden="true" /> History
+                </button>
+                <button className="ss-btn" onClick={takeSnapshot} disabled={actionLoading}>
+                    <i className={`pi ${actionLoading ? 'pi-spin pi-spinner' : 'pi-camera'}`} aria-hidden="true" /> Take snapshot
+                </button>
+            </div>
 
-    const historyContent = (item: SnapshotActivityDTO) => {
-        return (
-            <div className="flex flex-column gap-2 mb-4 p-3 border-round surface-card shadow-1">
-                <div className="flex justify-content-between align-items-center">
-                    <span className="font-bold text-lg">{item.activityType}</span>
-                    <small className="text-500">{new Date(item.createdAt).toLocaleString()}</small>
+            {/* Snapshot list */}
+            {snapshots.length === 0 ? (
+                <div className="ss-empty" style={{ padding: '28px 16px' }}>
+                    <i className="pi pi-camera" aria-hidden="true" />
+                    No snapshots for this merge request.<br />
+                    <span className="ss-dim" style={{ fontSize: 12 }}>Take one before running the merge to be able to roll back.</span>
                 </div>
-                <div className="flex align-items-center gap-2">
-                    {getStatusTag(item.status)}
-                    {item.snapshotSchemaName && <code className="text-xs">{item.snapshotSchemaName}</code>}
+            ) : snapshots.map((s) => (
+                <div className="ss-erow" key={s.snapshotSchemaName}>
+                    <div className="ss-erow-head" style={{ cursor: 'default' }}>
+                        <i className="pi pi-camera" style={{ fontSize: 12, color: 'var(--ss-text-3)' }} aria-hidden="true" />
+                        <span className="ss-erow-name">{fmtDate(s.createdAt)}</span>
+                        <code className="ss-erow-summary" style={{ flex: '1 1 auto' }}>{s.snapshotSchemaName}</code>
+                        <span style={{ marginLeft: 'auto' }} />
+                        <button className="ss-btn" style={{ color: 'var(--ss-amber)', borderColor: 'var(--ss-amber-bg)' }}
+                            onClick={() => restoreSnapshot(s.snapshotSchemaName)} disabled={actionLoading}>
+                            <i className="pi pi-undo" aria-hidden="true" /> Restore
+                        </button>
+                    </div>
                 </div>
-                {item.message && (
-                    <div className="mt-2 p-2 bg-red-50 text-red-600 border-round text-sm">
-                        {item.message}
+            ))}
+
+            {/* History dialog */}
+            <Dialog header="Snapshot activity history" visible={showHistory} onHide={() => setShowHistory(false)}
+                style={{ width: '50vw' }} breakpoints={{ '960px': '75vw', '641px': '100vw' }} dismissableMask>
+                {history.length === 0 ? (
+                    <div className="ss-dim" style={{ fontSize: 12, padding: 8 }}>No activity yet.</div>
+                ) : (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 4 }}>
+                        {history.map((item) => (
+                            <div key={item.id} style={{ border: '1px solid var(--ss-border)', borderRadius: 'var(--ss-radius-sm)', background: 'var(--ss-surface-2)', padding: '10px 12px' }}>
+                                <div className="ss-card-row" style={{ justifyContent: 'space-between' }}>
+                                    <span style={{ fontSize: 13, color: 'var(--ss-text)' }}>{item.activityType}</span>
+                                    <span className="ss-dim" style={{ fontSize: 11 }}>{fmtDate(item.createdAt)}</span>
+                                </div>
+                                <div className="ss-card-row" style={{ gap: 8, marginTop: 6 }}>
+                                    {statusBadge(item.status)}
+                                    {item.snapshotSchemaName && <code style={{ fontSize: 11, color: 'var(--ss-text-3)' }}>{item.snapshotSchemaName}</code>}
+                                </div>
+                                {item.message && (
+                                    <div style={{ marginTop: 8, fontSize: 12, color: 'var(--ss-red)', background: 'var(--ss-red-bg)', borderRadius: 6, padding: '6px 8px' }}>
+                                        {item.message}
+                                    </div>
+                                )}
+                            </div>
+                        ))}
                     </div>
                 )}
-            </div>
-        );
-    };
-
-    return (
-        <div className="snapshot-manager mt-4">
-            <Card title="Database Snapshots" className="shadow-2">
-                <div className="flex justify-content-between mb-3">
-                    <div className="flex gap-2">
-                        <Button 
-                            label="Crea Snapshot" 
-                            icon="pi pi-camera" 
-                            onClick={takeSnapshot} 
-                            loading={actionLoading}
-                            className="p-button-outlined"
-                        />
-                        <Button 
-                            label="Vedi Storico" 
-                            icon="pi pi-history" 
-                            onClick={() => setShowHistory(true)} 
-                            className="p-button-outlined p-button-secondary"
-                        />
-                    </div>
-                    <Button 
-                        icon="pi pi-refresh" 
-                        onClick={fetchData} 
-                        loading={loading}
-                        className="p-button-text p-button-rounded"
-                    />
-                </div>
-
-                <DataTable value={snapshots} emptyMessage="No snapshots for this merge request." loading={loading} responsiveLayout="scroll">
-                    <Column field="createdAt" header="Created" body={(rowData) => new Date(rowData.createdAt).toLocaleString()} sortable />
-                    <Column field="snapshotSchemaName" header="Schema name" body={(rowData) => <code>{rowData.snapshotSchemaName}</code>} />
-                    <Column header="Actions" body={(rowData) => (
-                        <Button 
-                            label="Ripristina" 
-                            icon="pi pi-undo" 
-                            severity="warning"
-                            size="small"
-                            onClick={() => restoreSnapshot(rowData.snapshotSchemaName)}
-                            loading={actionLoading}
-                        />
-                    )} />
-                </DataTable>
-            </Card>
-
-            <Dialog 
-                header="Snapshot activity history"
-                visible={showHistory} 
-                onHide={() => setShowHistory(false)}
-                style={{ width: '50vw' }}
-                breakpoints={{ '960px': '75vw', '641px': '100vw' }}
-            >
-                <div className="mt-3">
-                    <Timeline value={history} content={historyContent} />
-                </div>
             </Dialog>
         </div>
     );

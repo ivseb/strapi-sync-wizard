@@ -1166,6 +1166,13 @@ class MergeRequestService(
     suspend fun restoreManualSnapshot(id: Int, snapshotSchemaName: String?): Boolean {
         return try {
             postgresSnapshotService.restoreSnapshot(id, snapshotSchemaName)
+            // The restored target no longer contains entries created by previous runs, so any
+            // source->target document mappings for this instance pair are now stale. Clear them so
+            // the next run rebuilds them cleanly instead of pointing at deleted/replaced entries.
+            mergeRequestRepository.getMergeRequestWithInstances(id)?.let { mr ->
+                val removed = MergeRequestDocumentMappingTable.deleteForInstancePair(mr.sourceInstance.id, mr.targetInstance.id)
+                if (removed > 0) logger.info("Cleared $removed stale document mappings after restore of MR $id")
+            }
             true
         } catch (e: Exception) {
             logger.error("Manual restore failed for MR $id: ${e.message}", e)
@@ -1173,7 +1180,7 @@ class MergeRequestService(
         }
     }
 
-    suspend fun completeMergeRequest(id: Int): Boolean {
+    suspend fun completeMergeRequest(id: Int, onlyFailed: Boolean = false, rollbackOnFailure: Boolean = false): MergeResponse {
         // Run cleanup of old merge requests before starting
         dataFileUtils.cleanupOldMergeRequests()
 
@@ -1210,10 +1217,14 @@ class MergeRequestService(
         val schema = dataFileUtils.getSchemaCompatibilityFile(mergeRequest.id)!!.extractedSchema!!
 
         val mergeRequestSelection = mergeRequestSelectionsRepository.getSelectionsForMergeRequest(id)
+            .let { all -> if (onlyFailed) all.filter { it.syncSuccess != true } else all }
+        // Concurrent map: content items within a dependency batch are processed in parallel and may
+        // read/write this mapping concurrently.
         val mappingMap: MutableMap<String, MutableMap<String, MergeRequestDocumentMapping>> =
-            MergeRequestDocumentMappingTable.fetchMappingMap(mergeRequest)
-                .mapValues { (_, v) -> v.toMutableMap() }
-                .toMutableMap()
+            java.util.concurrent.ConcurrentHashMap(
+                MergeRequestDocumentMappingTable.fetchMappingMap(mergeRequest)
+                    .mapValues { (_, v) -> v.toMutableMap() }
+            )
 
         // 2. Retrieve files related to the merge request from the table
         val (mergeRequestFiles, contentSelections) = mergeRequestSelection.partition { it.tableName == "files" }
@@ -1322,11 +1333,26 @@ class MergeRequestService(
 
             // 6. Update the merge request status: COMPLETED if all succeeded, otherwise FAILED (remain locked)
             val latestSelections = mergeRequestSelectionsRepository.getSelectionsForMergeRequest(id)
+            val total = latestSelections.size
+            val succeeded = latestSelections.count { it.syncSuccess == true }
+            val failed = latestSelections.count { it.syncSuccess == false }
             val allSucceeded = latestSelections.isEmpty() || latestSelections.all { it.syncSuccess == true }
-            val result = if (allSucceeded) {
+            if (allSucceeded) {
                 mergeRequestRepository.updateMergeRequestStatus(id, MergeRequestStatus.COMPLETED)
             } else {
                 mergeRequestRepository.updateMergeRequestStatus(id, MergeRequestStatus.FAILED)
+            }
+
+            // Opt-in rollback: restore the pre-run snapshot when the merge did not fully succeed.
+            var rolledBack = false
+            if (!allSucceeded && rollbackOnFailure) {
+                try {
+                    postgresSnapshotService.restoreSnapshot(id)
+                    rolledBack = true
+                    logger.info("Rolled back MR $id after partial failure ($failed failed)")
+                } catch (rb: Exception) {
+                    logger.error("Rollback failed for MR $id: ${rb.message}", rb)
+                }
             }
 
             // Emit final SSE event
@@ -1346,20 +1372,29 @@ class MergeRequestService(
             } catch (_: Exception) { /* ignore */
             }
 
-            return result
+            return MergeResponse(
+                success = allSucceeded,
+                message = when {
+                    allSucceeded -> "Merge completed: $succeeded/$total synchronized"
+                    rolledBack -> "Completed with $failed error(s) — changes rolled back"
+                    else -> "Completed with $failed error(s): $succeeded/$total synchronized"
+                },
+                total = total,
+                succeeded = succeeded,
+                failed = failed
+            )
         } catch (e: Exception) {
             logger.error("Merge request $id failed: ${e.message}", e)
-            
-            // Perform rollback from snapshot - REMOVED AUTOMATIC RESTORE
-            /*
-            try {
-                logger.info("Starting rollback for MR $id")
-                postgresSnapshotService.restoreSnapshot(id)
-                logger.info("Rollback completed for MR $id")
-            } catch (rollbackEx: Exception) {
-                logger.error("Rollback failed for MR $id: ${rollbackEx.message}", rollbackEx)
+
+            // Opt-in rollback from the pre-run snapshot when an unexpected error aborts the merge.
+            if (rollbackOnFailure) {
+                try {
+                    logger.info("Rolling back MR $id from snapshot after failure")
+                    postgresSnapshotService.restoreSnapshot(id)
+                } catch (rollbackEx: Exception) {
+                    logger.error("Rollback failed for MR $id: ${rollbackEx.message}", rollbackEx)
+                }
             }
-            */
 
             // Send final error update
             try {
@@ -1386,6 +1421,83 @@ class MergeRequestService(
             throw e
         }
     }
+
+    /**
+     * Post-sync verification: recompute a FRESH comparison (live, not from cache, not persisted) and
+     * confirm every successfully-synced selection is actually consistent on the target:
+     *  - TO_CREATE / TO_UPDATE -> the source entry now pairs with the target as IDENTICAL
+     *  - TO_DELETE             -> the target entry is gone (no longer ONLY_IN_TARGET)
+     */
+    suspend fun verifyMergeRequest(id: Int): MergeVerificationReport {
+        val mergeRequest = mergeRequestRepository.getMergeRequestWithInstances(id)
+            ?: throw IllegalArgumentException("Merge request not found")
+        // Use the schema captured at compare time (re-checking is blocked once the merge has started).
+        val schema = dataFileUtils.getSchemaCompatibilityFile(id)?.extractedSchema
+            ?: throw IllegalStateException("Schema not available for verification (run compare first)")
+
+        // Fresh, live comparison (does NOT touch the persisted merge comparison cache).
+        val prefetch = prefetchComparisonData(mergeRequest, schema)
+        val fresh = computeComparisonFromPrefetch(mergeRequest, schema, prefetch)
+
+        // Returns the comparison entry (state + both sides' content) for a documentId in a content type.
+        data class FoundEntry(val state: ContentTypeComparisonResultKind, val src: JsonObject?, val tgt: JsonObject?)
+        fun entryOf(ct: String, documentId: String): FoundEntry? {
+            if (ct == "files") {
+                val f = fresh.files.firstOrNull {
+                    it.sourceImage?.metadata?.documentId == documentId || it.targetImage?.metadata?.documentId == documentId
+                } ?: return null
+                return FoundEntry(f.compareState, null, null)
+            }
+            fresh.singleTypes[ct]?.let { e ->
+                if (e.sourceContent?.metadata?.documentId == documentId || e.targetContent?.metadata?.documentId == documentId)
+                    return FoundEntry(e.compareState, e.sourceContent?.cleanData, e.targetContent?.cleanData)
+            }
+            return fresh.collectionTypes[ct]?.firstOrNull {
+                it.sourceContent?.metadata?.documentId == documentId || it.targetContent?.metadata?.documentId == documentId
+            }?.let { FoundEntry(it.compareState, it.sourceContent?.cleanData, it.targetContent?.cleanData) }
+        }
+
+        val synced = mergeRequestSelectionsRepository.getSelectionsForMergeRequest(id).filter { it.syncSuccess == true }
+        val items = synced.map { sel ->
+            val found = entryOf(sel.tableName, sel.documentId)
+            val state = found?.state
+            if (sel.direction == Direction.TO_DELETE) {
+                val stillThere = state == ContentTypeComparisonResultKind.ONLY_IN_TARGET
+                MergeVerificationItem(
+                    contentType = sel.tableName, documentId = sel.documentId, direction = sel.direction.name,
+                    expected = "ABSENT", actual = if (stillThere) "ONLY_IN_TARGET" else "ABSENT",
+                    consistent = !stillThere, severity = if (stillThere) "mismatch" else "ok",
+                    reason = if (stillThere) "still present on target" else null
+                )
+            } else if (state == ContentTypeComparisonResultKind.IDENTICAL) {
+                MergeVerificationItem(sel.tableName, sel.documentId, sel.direction.name, "IDENTICAL", "IDENTICAL", true, "ok", null)
+            } else if (state == ContentTypeComparisonResultKind.DIFFERENT) {
+                // Distinguish a real value mismatch from "differs only in source-only fields the target
+                // schema can't store" (auto-dropped on apply by design) — the latter is not a failure.
+                val (okDespite, reason) = VerificationDiff.classify(found?.src, found?.tgt)
+                MergeVerificationItem(
+                    contentType = sel.tableName, documentId = sel.documentId, direction = sel.direction.name,
+                    expected = "IDENTICAL", actual = "DIFFERENT",
+                    consistent = okDespite, severity = if (okDespite) "schema_gap" else "mismatch", reason = reason
+                )
+            } else {
+                MergeVerificationItem(
+                    contentType = sel.tableName, documentId = sel.documentId, direction = sel.direction.name,
+                    expected = "IDENTICAL", actual = state?.name ?: "NOT_FOUND",
+                    consistent = false, severity = "mismatch", reason = "not found / not applied on target"
+                )
+            }
+        }
+        return MergeVerificationReport(
+            mergeRequestId = id,
+            total = items.size,
+            consistent = items.count { it.severity == "ok" },
+            schemaGap = items.count { it.severity == "schema_gap" },
+            inconsistent = items.count { it.severity == "mismatch" },
+            items = items
+        )
+    }
+
 
     // ----------------------
     // Sync Plan DTOs and API

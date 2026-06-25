@@ -12,7 +12,63 @@ import kotlinx.serialization.json.*
 import kotlin.collections.forEach
 
 object ContentJsonUtils {
-    private fun resolveTargetDocIdForLink(
+    // Precomputed lookup indices for a comparison snapshot, so link resolution is O(1) instead of
+    // scanning every file/collection entry per link. Built once per comparisonDataMap and memoized.
+    internal class ResolveIndex(cmp: ContentTypeComparisonResultMapWithRelationships) {
+        // numeric id -> documentId, per table. SOURCE and TARGET ids are kept in SEPARATE maps:
+        // numeric ids collide across instances (both start at 1), so a single map with a "first wins"
+        // policy would resolve a source-id reference to an unrelated target doc. Source ids always win.
+        val srcIdToDoc: MutableMap<String, MutableMap<Int, String>> = HashMap()
+        val tgtIdToDoc: MutableMap<String, MutableMap<Int, String>> = HashMap()
+        // source documentId -> target documentId, from the compare-time pairing (per table).
+        val sourceDocToTargetDoc: MutableMap<String, MutableMap<String, String>> = HashMap()
+        // single types: table -> target documentId (legacy fallback).
+        val singleTypeTargetDoc: MutableMap<String, String> = HashMap()
+
+        private fun putSrc(table: String, id: Int?, doc: String?) {
+            if (id == null || doc == null) return
+            srcIdToDoc.getOrPut(table) { HashMap() }.putIfAbsent(id, doc)
+        }
+        private fun putTgt(table: String, id: Int?, doc: String?) {
+            if (id == null || doc == null) return
+            tgtIdToDoc.getOrPut(table) { HashMap() }.putIfAbsent(id, doc)
+        }
+        private fun putPair(table: String, srcDoc: String?, tgtDoc: String?) {
+            if (srcDoc == null || tgtDoc == null) return
+            sourceDocToTargetDoc.getOrPut(table) { HashMap() }[srcDoc] = tgtDoc
+        }
+
+        init {
+            cmp.files.forEach { f ->
+                val s = f.sourceImage?.metadata
+                val t = f.targetImage?.metadata
+                putSrc("files", s?.id, s?.documentId)
+                putTgt("files", t?.id, t?.documentId)
+                putPair("files", s?.documentId, t?.documentId)
+            }
+            cmp.singleTypes.forEach { (table, st) ->
+                putSrc(table, st.sourceContent?.metadata?.id, st.sourceContent?.metadata?.documentId)
+                putTgt(table, st.targetContent?.metadata?.id, st.targetContent?.metadata?.documentId)
+                putPair(table, st.sourceContent?.metadata?.documentId, st.targetContent?.metadata?.documentId)
+                st.targetContent?.metadata?.documentId?.let { singleTypeTargetDoc[table] = it }
+            }
+            cmp.collectionTypes.forEach { (table, list) ->
+                list.forEach { e ->
+                    putSrc(table, e.sourceContent?.metadata?.id, e.sourceContent?.metadata?.documentId)
+                    putTgt(table, e.targetContent?.metadata?.id, e.targetContent?.metadata?.documentId)
+                    putPair(table, e.sourceContent?.metadata?.documentId, e.targetContent?.metadata?.documentId)
+                }
+            }
+        }
+    }
+
+    private val indexCache: MutableMap<ContentTypeComparisonResultMapWithRelationships, ResolveIndex> =
+        java.util.Collections.synchronizedMap(java.util.IdentityHashMap())
+
+    internal fun indexFor(cmp: ContentTypeComparisonResultMapWithRelationships): ResolveIndex =
+        indexCache[cmp] ?: ResolveIndex(cmp).also { indexCache[cmp] = it }
+
+    internal fun resolveTargetDocIdForLink(
         table: String,
         targetCollectionUID: String,
         id: Int?,
@@ -20,39 +76,22 @@ object ContentJsonUtils {
         mappingMap: Map<String, Map<String, MergeRequestDocumentMapping>> = emptyMap()
     ): String? {
         if (id == null) return null
-        // Step 1: find the SOURCE documentId for the provided numeric id
-        var sourceDocId: String? = null
-        when (table) {
-            "files" -> {
-                comparisonDataMap.files.forEach { cmp ->
-                    val s = cmp.sourceImage?.metadata
-                    if (s?.id == id) sourceDocId = s.documentId
-                    val t = cmp.targetImage?.metadata
-                    // if only target match is found, keep that as fallback
-                    if (sourceDocId == null && t?.id == id) sourceDocId = t.documentId
-                }
-            }
-
-            else -> {
-                comparisonDataMap.singleTypes[table]?.let { st ->
-                    if (st.sourceContent?.metadata?.id == id) sourceDocId = st.sourceContent.metadata.documentId
-                    if (sourceDocId == null && st.targetContent?.metadata?.id == id) sourceDocId =
-                        st.targetContent.metadata.documentId
-                }
-                if (sourceDocId == null) {
-                    comparisonDataMap.collectionTypes[table]?.forEach { e ->
-                        if (e.sourceContent?.metadata?.id == id) sourceDocId = e.sourceContent.metadata.documentId
-                        if (sourceDocId == null && e.targetContent?.metadata?.id == id) sourceDocId =
-                            e.targetContent.metadata.documentId
-                    }
-                }
-            }
+        val idx = indexFor(comparisonDataMap)
+        // The numeric id is a SOURCE id (content being synced comes from source). Resolve source-first.
+        val srcDoc = idx.srcIdToDoc[table]?.get(id)
+        if (srcDoc != null) {
+            // map SOURCE -> TARGET via mappingMap (entities synced in this run)...
+            mappingMap[targetCollectionUID]?.get(srcDoc)?.targetDocumentId?.let { return it }
+            // ...then via the compare-time pairing (covers IDENTICAL/DIFFERENT entries not re-synced,
+            // which have no mapping row) so references to pre-existing entries resolve.
+            idx.sourceDocToTargetDoc[table]?.get(srcDoc)?.let { return it }
+            // Single-type legacy fallback.
+            idx.singleTypeTargetDoc[table]?.let { return it }
+            return error("Missing mapping for $srcDoc -> $targetCollectionUID")
         }
-        val src = sourceDocId ?: return null
-        // Step 2: map SOURCE -> TARGET using mappingMap (if present)
-        val mappingForType = mappingMap[targetCollectionUID]
-        val targetDoc = mappingForType?.get(src)?.targetDocumentId?: comparisonDataMap.singleTypes[table]?.targetContent?.metadata?.documentId
-        return targetDoc ?: error("Missing mapping for $src -> $targetCollectionUID")
+        // Fallback: the id matched a TARGET entry directly → it already is the target documentId.
+        idx.tgtIdToDoc[table]?.get(id)?.let { return it }
+        return null
     }
 
     fun processJsonElementNew(
@@ -117,7 +156,6 @@ object ContentJsonUtils {
                         }
                     }
                     for ((key, value) in element) {
-                        println(key)
                         if (TECHNICAL_FIELDS.contains(key) || key == "document_id" || key == "__order" || key == "__links" || key == "id") continue
                         val normalized = normalizeKeyName(key)
                         val mappedKey = currentResolver?.get(normalized) ?: key

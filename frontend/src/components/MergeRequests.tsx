@@ -1,14 +1,11 @@
-import React, { useRef, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Button } from 'primereact/button';
-import { Message } from 'primereact/message';
 import { Toast } from 'primereact/toast';
 import { Dialog } from 'primereact/dialog';
 import { InputText } from 'primereact/inputtext';
 import { Dropdown } from 'primereact/dropdown';
 import { InputTextarea } from 'primereact/inputtextarea';
-import { Tag } from 'primereact/tag';
-import { SelectButton } from 'primereact/selectbutton';
 import { ProgressSpinner } from 'primereact/progressspinner';
 import { confirmDialog, ConfirmDialog } from 'primereact/confirmdialog';
 import { useMergeRequests, useCreateMergeRequest, useDeleteMergeRequest } from '../api/mergeRequests';
@@ -26,40 +23,70 @@ interface MergeRequestRow {
   updatedAt: string;
 }
 
-const statusMeta = (status: string, schemaCompatible: boolean | null): { label: string; severity: 'success' | 'info' | 'warning' | 'danger' } => {
+type BadgeCls = '' | 'info' | 'success' | 'warn' | 'danger';
+
+const statusMeta = (status: string, schemaCompatible: boolean | null): { label: string; cls: BadgeCls; progress: number } => {
   switch (status) {
-    case 'CREATED': return { label: 'created', severity: 'info' };
-    case 'SCHEMA_CHECKED': return schemaCompatible ? { label: 'schema ok', severity: 'success' } : { label: 'schema incompatible', severity: 'danger' };
-    case 'COMPARED': return { label: 'compared', severity: 'info' };
-    case 'MERGED_FILES': return { label: 'files merged', severity: 'info' };
-    case 'MERGED_SINGLES': return { label: 'singles merged', severity: 'info' };
-    case 'MERGED_COLLECTIONS': return { label: 'collections merged', severity: 'info' };
-    case 'REVIEW': return { label: 'review', severity: 'warning' };
-    case 'IN_PROGRESS': return { label: 'in progress', severity: 'warning' };
-    case 'COMPLETED': return { label: 'completed', severity: 'success' };
-    case 'FAILED': return { label: 'failed', severity: 'danger' };
-    default: return { label: status.replace(/_/g, ' ').toLowerCase(), severity: 'info' };
+    case 'CREATED': return { label: 'Created', cls: '', progress: 8 };
+    case 'SCHEMA_CHECKED': return schemaCompatible === false
+      ? { label: 'Schema incompatible', cls: 'danger', progress: 20 }
+      : { label: 'Schema checked', cls: 'success', progress: 22 };
+    case 'COMPARED': return { label: 'Compared', cls: 'warn', progress: 45 };
+    case 'MERGED_FILES': return { label: 'Files merged', cls: 'info', progress: 60 };
+    case 'MERGED_SINGLES': return { label: 'Singles merged', cls: 'info', progress: 72 };
+    case 'MERGED_COLLECTIONS': return { label: 'Collections merged', cls: 'info', progress: 88 };
+    case 'REVIEW': return { label: 'Review', cls: 'warn', progress: 90 };
+    case 'IN_PROGRESS': return { label: 'In progress', cls: 'warn', progress: 90 };
+    case 'COMPLETED': return { label: 'Completed', cls: 'success', progress: 100 };
+    case 'FAILED': return { label: 'Failed', cls: 'danger', progress: 100 };
+    default: return { label: status.replace(/_/g, ' ').toLowerCase(), cls: 'info', progress: 50 };
   }
 };
 
-const iconColor = (sev: string) =>
-  sev === 'success' ? 'var(--green-400)' : sev === 'danger' ? 'var(--red-400)' : sev === 'warning' ? 'var(--yellow-400)' : 'var(--primary-color)';
+const relTime = (iso: string): string => {
+  const d = new Date(iso).getTime();
+  if (!Number.isFinite(d)) return '';
+  const s = Math.round((Date.now() - d) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  if (s < 86400 * 7) return `${Math.round(s / 86400)}d ago`;
+  return new Date(iso).toLocaleDateString();
+};
+
+type TabKey = 'progress' | 'completed' | 'all';
 
 const MergeRequests: React.FC = () => {
   const navigate = useNavigate();
   const toast = useRef<Toast>(null);
-  const [completed, setCompleted] = useState<boolean>(false);
+  const [tab, setTab] = useState<TabKey>('progress');
+  const [search, setSearch] = useState('');
   const [showCreate, setShowCreate] = useState(false);
   const [form, setForm] = useState<{ name: string; description: string; sourceInstanceId: number | null; targetInstanceId: number | null }>({
     name: '', description: '', sourceInstanceId: null, targetInstanceId: null,
   });
 
-  const { data: mergeRequests = [], isLoading } = useMergeRequests({ completed, sortBy: 'updatedAt', sortOrder: 'DESC' });
+  const completedParam = tab === 'all' ? undefined : tab === 'completed';
+  const { data: mergeRequests = [], isLoading } = useMergeRequests({ completed: completedParam, sortBy: 'updatedAt', sortOrder: 'DESC' } as any);
+  const { data: allForCounts = [] } = useMergeRequests({ sortBy: 'updatedAt', sortOrder: 'DESC' } as any);
   const { data: instances = [] } = useInstances();
   const createMut = useCreateMergeRequest();
   const deleteMut = useDeleteMergeRequest();
 
-  const rows = mergeRequests as MergeRequestRow[];
+  const counts = useMemo(() => {
+    const all = allForCounts as MergeRequestRow[];
+    const completed = all.filter((m) => m.status === 'COMPLETED').length;
+    return { all: all.length, completed, progress: all.length - completed };
+  }, [allForCounts]);
+
+  const rows = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return (mergeRequests as MergeRequestRow[]).filter((m) =>
+      !q || m.name.toLowerCase().includes(q) ||
+      m.sourceInstance?.name?.toLowerCase().includes(q) ||
+      m.targetInstance?.name?.toLowerCase().includes(q)
+    );
+  }, [mergeRequests, search]);
 
   const submit = async () => {
     if (!form.name.trim() || form.sourceInstanceId == null || form.targetInstanceId == null) {
@@ -103,59 +130,67 @@ const MergeRequests: React.FC = () => {
     });
   };
 
+  const Tab: React.FC<{ k: TabKey; label: string; n: number }> = ({ k, label, n }) => (
+    <button className={`ss-tab${tab === k ? ' active' : ''}`} onClick={() => setTab(k)}>
+      {label} <span className="ss-tab-n">{n}</span>
+    </button>
+  );
+
   return (
     <>
       <Toast ref={toast} />
       <ConfirmDialog />
 
       <div className="ss-page-head">
-        <h2>Merge requests</h2>
-        <Button label="New" icon="pi pi-plus" onClick={() => setShowCreate(true)} />
+        <h1>Merge requests</h1>
+        <span className="ss-spacer" />
+        <button className="ss-btn primary" onClick={() => setShowCreate(true)}>
+          <i className="pi pi-plus" aria-hidden="true" /> New
+        </button>
       </div>
 
-      <SelectButton
-        value={completed}
-        onChange={(e) => e.value !== null && setCompleted(e.value)}
-        options={[{ label: 'In progress', value: false }, { label: 'Completed', value: true }]}
-        className="mb-3"
-      />
+      <div className="ss-tabs">
+        <Tab k="progress" label="In progress" n={counts.progress} />
+        <Tab k="completed" label="Completed" n={counts.completed} />
+        <Tab k="all" label="All" n={counts.all} />
+        <span className="ss-spacer" />
+        <div className="ss-search" style={{ width: 200, paddingBottom: 6 }}>
+          <i className="pi pi-search" aria-hidden="true" />
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search…" />
+        </div>
+      </div>
 
       {isLoading ? (
         <div className="flex justify-content-center p-5"><ProgressSpinner /></div>
       ) : rows.length === 0 ? (
-        <Message severity="info" text={completed ? 'No completed merge requests.' : 'No merge requests yet. Create your first one.'} className="w-full" />
+        <div className="ss-empty">
+          <i className="pi pi-git-pull-request" aria-hidden="true" />
+          {search ? 'No merge requests match your search.' : tab === 'completed' ? 'No completed merge requests.' : 'No merge requests yet — create your first one.'}
+        </div>
       ) : (
-        <div className="flex flex-column gap-2">
+        <div className="ss-list">
           {rows.map((mr) => {
             const meta = statusMeta(mr.status, mr.schemaCompatible);
             return (
-              <div
-                key={mr.id}
-                onClick={() => navigate(`/merge-requests/${mr.id}`)}
-                className="surface-card border-round p-3 flex align-items-center gap-3 cursor-pointer"
-                style={{ border: '1px solid var(--surface-border)' }}
-              >
-                <i className="pi pi-arrows-h" style={{ fontSize: '1.1rem', color: iconColor(meta.severity) }} aria-hidden="true" />
-                <div style={{ minWidth: 0, maxWidth: 420 }}>
-                  <div style={{ fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{mr.name}</div>
-                  <div className="ss-muted text-sm mt-1" style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    {mr.sourceInstance?.name || '?'} <i className="pi pi-arrow-right" style={{ fontSize: '.7rem', verticalAlign: 'baseline' }} aria-hidden="true" /> {mr.targetInstance?.name || '?'}
-                  </div>
+              <div key={mr.id} className="ss-card clickable" onClick={() => navigate(`/merge-requests/${mr.id}`)}>
+                <div className="ss-card-row">
+                  <span className="ss-card-title" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 360 }}>{mr.name}</span>
+                  <span className={`ss-badge ${meta.cls}`}>{meta.label}</span>
+                  <span className="ss-spacer" style={{ marginLeft: 'auto' }} />
+                  <span className="ss-dim" style={{ fontSize: 11, whiteSpace: 'nowrap' }}>{relTime(mr.updatedAt)}</span>
+                  {tab !== 'completed' && (
+                    <Button icon="pi pi-trash" rounded text severity="danger" aria-label="Delete" onClick={(e) => onDelete(e, mr.id)} />
+                  )}
+                  <i className="pi pi-chevron-right ss-dim" aria-hidden="true" />
                 </div>
-                <Tag value={meta.label} severity={meta.severity} />
-                <span className="flex-1" />
-                <span className="ss-muted text-sm" style={{ whiteSpace: 'nowrap' }}>
-                  {new Date(mr.updatedAt).toLocaleDateString()}
-                </span>
-                {!completed && (
-                  <Button
-                    icon="pi pi-trash"
-                    rounded text severity="danger"
-                    aria-label="Delete"
-                    onClick={(e) => onDelete(e, mr.id)}
-                  />
-                )}
-                <i className="pi pi-chevron-right ss-muted" aria-hidden="true" />
+                <div className="ss-route" style={{ marginTop: 8 }}>
+                  <span className="ss-node"><span className="ss-dot" />{mr.sourceInstance?.name || '?'}</span>
+                  <i className="pi pi-arrow-right" aria-hidden="true" />
+                  <span className="ss-node"><span className="ss-dot target" />{mr.targetInstance?.name || '?'}</span>
+                </div>
+                <div className={`ss-progress${meta.progress >= 100 ? ' done' : ''}`} style={{ marginTop: 9 }}>
+                  <span style={{ width: `${meta.progress}%` }} />
+                </div>
               </div>
             );
           })}

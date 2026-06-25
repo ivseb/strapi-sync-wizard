@@ -73,13 +73,15 @@ object IdentityReconciliationService {
             comparison.singleTypes.values + comparison.collectionTypes.values.flatten()
 
         val actions = mutableListOf<IdentityReconciliationAction>()
-        for (e in pairs) {
-            val s: StrapiContent = e.sourceContent ?: continue
-            val t: StrapiContent = e.targetContent ?: continue // only entries present on BOTH sides
-            val uid = e.contentType
-            val ss = s.metadata.syncId?.takeIf { it.isNotBlank() }
-            val ts = t.metadata.syncId?.takeIf { it.isNotBlank() }
 
+        // Link one confirmed source<->target pair, writing a shared sync_id where missing.
+        // Only entries paired on BOTH sides are reconciled (conservative: ambiguous/one-sided
+        // entries are never auto-linked).
+        suspend fun linkPair(
+            uid: String,
+            sDoc: String, sLocale: String?, ss: String?,
+            tDoc: String, tLocale: String?, ts: String?,
+        ) {
             val (canonical, kind) = when {
                 ss != null && ts != null && ss == ts -> ss to ReconciliationActionKind.ALREADY_LINKED
                 ss != null && ts == null -> ss to ReconciliationActionKind.LINK_TARGET_TO_SOURCE
@@ -87,34 +89,55 @@ object IdentityReconciliationService {
                 ss == null && ts != null -> ts to ReconciliationActionKind.LINK_SOURCE_TO_TARGET
                 else -> UUID.randomUUID().toString() to ReconciliationActionKind.ASSIGN_NEW_BOTH
             }
-
             if (apply && kind != ReconciliationActionKind.ALREADY_LINKED) {
                 when (kind) {
                     ReconciliationActionKind.LINK_TARGET_TO_SOURCE,
                     ReconciliationActionKind.CONFLICT_PREFER_SOURCE ->
-                        SyncIdentityService.upsertIdentity(target, uid, t.metadata.documentId, t.metadata.locale, canonical)
+                        SyncIdentityService.upsertIdentity(target, uid, tDoc, tLocale, canonical)
 
                     ReconciliationActionKind.LINK_SOURCE_TO_TARGET ->
-                        SyncIdentityService.upsertIdentity(source, uid, s.metadata.documentId, s.metadata.locale, canonical)
+                        SyncIdentityService.upsertIdentity(source, uid, sDoc, sLocale, canonical)
 
                     ReconciliationActionKind.ASSIGN_NEW_BOTH -> {
-                        SyncIdentityService.upsertIdentity(source, uid, s.metadata.documentId, s.metadata.locale, canonical)
-                        SyncIdentityService.upsertIdentity(target, uid, t.metadata.documentId, t.metadata.locale, canonical)
+                        SyncIdentityService.upsertIdentity(source, uid, sDoc, sLocale, canonical)
+                        SyncIdentityService.upsertIdentity(target, uid, tDoc, tLocale, canonical)
                     }
 
                     ReconciliationActionKind.ALREADY_LINKED -> {}
                 }
             }
-
             actions.add(
                 IdentityReconciliationAction(
                     contentType = uid,
-                    sourceDocumentId = s.metadata.documentId,
-                    targetDocumentId = t.metadata.documentId,
-                    locale = s.metadata.locale ?: t.metadata.locale,
+                    sourceDocumentId = sDoc,
+                    targetDocumentId = tDoc,
+                    locale = sLocale ?: tLocale,
                     canonicalSyncId = canonical,
                     kind = kind.name
                 )
+            )
+        }
+
+        // Content (single + collection) pairs.
+        for (e in pairs) {
+            val s: StrapiContent = e.sourceContent ?: continue
+            val t: StrapiContent = e.targetContent ?: continue // only entries present on BOTH sides
+            linkPair(
+                e.contentType,
+                s.metadata.documentId, s.metadata.locale, s.metadata.syncId?.takeIf { it.isNotBlank() },
+                t.metadata.documentId, t.metadata.locale, t.metadata.syncId?.takeIf { it.isNotBlank() },
+            )
+        }
+
+        // File pairs (uid plugin::upload.file). Only matched-on-both-sides pairs are reconciled;
+        // ambiguous duplicates / one-sided files are left for manual review.
+        for (f in comparison.files) {
+            val s = f.sourceImage ?: continue
+            val t = f.targetImage ?: continue
+            linkPair(
+                it.sebi.models.STRAPI_FILE_CONTENT_TYPE_NAME,
+                s.metadata.documentId, s.metadata.locale, s.metadata.syncId?.takeIf { it.isNotBlank() },
+                t.metadata.documentId, t.metadata.locale, t.metadata.syncId?.takeIf { it.isNotBlank() },
             )
         }
 
