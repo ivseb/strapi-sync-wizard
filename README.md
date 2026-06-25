@@ -9,6 +9,13 @@
 
 StrapiSync is a synchronization tool for [Strapi CMS](https://strapi.io/) that allows you to manage and synchronize content between different Strapi instances. It provides a user-friendly interface for reviewing, selecting, and merging content changes across environments.
 
+## Links
+
+- 🌐 **GitHub Pages (project page & Helm repo)**: [https://ivseb.github.io/strapi-sync-wizard/](https://ivseb.github.io/strapi-sync-wizard/)
+- 📦 **Helm chart repository**: [https://ivseb.github.io/strapi-sync-wizard/charts](https://ivseb.github.io/strapi-sync-wizard/charts)
+- 🐳 **Docker image**: [ivseb/strapi-sync-wizard](https://hub.docker.com/r/ivseb/strapi-sync-wizard)
+- 🏷️ **Releases**: [github.com/ivseb/strapi-sync-wizard/releases](https://github.com/ivseb/strapi-sync-wizard/releases)
+
 ## Features
 
 - **Instance Management**: Configure and manage multiple Strapi instances
@@ -107,13 +114,15 @@ docker run -p 8080:8080 ivseb/strapi-sync-wizard:latest
 
 ### Helm Chart
 
-StrapiSyncWizard can be deployed on Kubernetes using the provided Helm chart. The chart is hosted on GitHub Pages at [https://ivseb.github.io/StrapiSyncWizard](https://ivseb.github.io/StrapiSyncWizard).
+StrapiSyncWizard can be deployed on Kubernetes using the provided Helm chart. The chart repository is
+published via **GitHub Pages** at [https://ivseb.github.io/strapi-sync-wizard/charts](https://ivseb.github.io/strapi-sync-wizard/charts)
+(project page: [https://ivseb.github.io/strapi-sync-wizard/](https://ivseb.github.io/strapi-sync-wizard/)).
 
 To use the Helm chart:
 
 ```bash
 # Add the Helm repository
-helm repo add strapi-sync-wizard https://ivseb.github.io/StrapiSyncWizard
+helm repo add strapi-sync-wizard https://ivseb.github.io/strapi-sync-wizard/charts
 
 # Update the repository
 helm repo update
