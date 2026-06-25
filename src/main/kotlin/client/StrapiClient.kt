@@ -790,12 +790,20 @@ class StrapiClient(
         data: JsonObject,
         kind: StrapiContentTypeKind,
         sourceDocumentId:String,
-        targetDocumentId:String? = null
+        targetDocumentId:String? = null,
+        /**
+         * Draft & Publish channel selector (Strapi v5). `null` = default write (the entry is
+         * created/updated and published, producing a draft+published pair). `"draft"` writes ONLY
+         * the draft version (`?status=draft`), leaving the published version untouched — this is how
+         * we reproduce a divergent "modified" draft, or create a draft-only entry.
+         */
+        status: String? = null
     ): JsonObject {
+        val statusQuery = status?.let { "?status=$it" } ?: ""
         val url = if (kind == StrapiContentTypeKind.SingleType) {
-            "$baseUrl/api/$contentType"
+            "$baseUrl/api/$contentType$statusQuery"
         } else {
-            "$baseUrl/api/$contentType"+ (targetDocumentId?.let { "/$it" } ?: "")
+            "$baseUrl/api/$contentType"+ (targetDocumentId?.let { "/$it" } ?: "") + statusQuery
         }
 
         logger.debug("Updating content entry for $contentType with kind $kind")
@@ -904,6 +912,64 @@ class StrapiClient(
             )
         }
         return success
+    }
+
+    /**
+     * Publish the current draft of a document via the admin content-manager API (Strapi v5).
+     * Recreates/refreshes the published row from the draft. Used to reconcile a target that should
+     * be published but currently isn't. `apiUid` is the content-type UID (e.g. api::news.article).
+     */
+    suspend fun publishEntry(apiUid: String, documentId: String, kind: StrapiContentTypeKind): Boolean =
+        publishAction(apiUid, documentId, kind, publish = true)
+
+    /**
+     * Unpublish a document via the admin content-manager API (Strapi v5): removes the published row
+     * while keeping the draft. Used to reproduce a source document that was explicitly unpublished
+     * (state 4: was published, now draft-only).
+     */
+    suspend fun unpublishEntry(apiUid: String, documentId: String, kind: StrapiContentTypeKind): Boolean =
+        publishAction(apiUid, documentId, kind, publish = false)
+
+    private suspend fun publishAction(
+        apiUid: String,
+        documentId: String,
+        kind: StrapiContentTypeKind,
+        publish: Boolean
+    ): Boolean {
+        val token = getLoginToken().token
+        val action = if (publish) "publish" else "unpublish"
+        val url = if (kind == StrapiContentTypeKind.SingleType) {
+            "$baseUrl/content-manager/single-types/$apiUid/actions/$action"
+        } else {
+            "$baseUrl/content-manager/collection-types/$apiUid/$documentId/actions/$action"
+        }
+        val callType = "content_$action"
+        return try {
+            val ok = selector.getClientForUrl(url).post(url) {
+                headers {
+                    append(HttpHeaders.Authorization, "Bearer $token")
+                    append(HttpHeaders.ContentType, "application/json")
+                }
+                setBody("{}")
+            }.status.isSuccess()
+            logHttpRequest(
+                callType = callType, method = "POST", url = url,
+                authHeader = "Bearer $token", responseStatus = "200 OK", identifier = documentId
+            )
+            ok
+        } catch (e: ClientRequestException) {
+            logHttpRequest(
+                callType = callType, method = "POST", url = url,
+                authHeader = "Bearer $token", resp = e.response, error = e, identifier = documentId
+            )
+            throw e
+        } catch (e: ServerResponseException) {
+            logHttpRequest(
+                callType = callType, method = "POST", url = url,
+                authHeader = "Bearer $token", resp = e.response, error = e, identifier = documentId
+            )
+            throw e
+        }
     }
 
 

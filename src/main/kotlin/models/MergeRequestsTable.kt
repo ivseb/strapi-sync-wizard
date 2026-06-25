@@ -38,6 +38,7 @@ data class MergeRequest(
     val sourceInstanceId: Int,
     val targetInstanceId: Int,
     val status: MergeRequestStatus = MergeRequestStatus.CREATED,
+    val includeDrafts: Boolean = false,
     @Contextual val createdAt: OffsetDateTime = OffsetDateTime.now(),
     @Contextual val updatedAt: OffsetDateTime = OffsetDateTime.now()
 )
@@ -52,7 +53,8 @@ data class MergeRequestDTO(
     val description: String? = null,
     val sourceInstanceId: Int,
     val targetInstanceId: Int,
-    val status: MergeRequestStatus? = null
+    val status: MergeRequestStatus? = null,
+    val includeDrafts: Boolean? = null
 )
 
 /**
@@ -66,6 +68,7 @@ data class MergeRequestWithInstancesDTO(
     val sourceInstance: StrapiInstance,
     val targetInstance: StrapiInstance,
     val status: MergeRequestStatus,
+    val includeDrafts: Boolean = false,
     @Contextual val createdAt: OffsetDateTime,
     @Contextual val updatedAt: OffsetDateTime
 )

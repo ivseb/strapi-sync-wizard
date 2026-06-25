@@ -6,6 +6,7 @@ import { Dialog } from 'primereact/dialog';
 import { InputText } from 'primereact/inputtext';
 import { Dropdown } from 'primereact/dropdown';
 import { InputTextarea } from 'primereact/inputtextarea';
+import { Checkbox } from 'primereact/checkbox';
 import { ProgressSpinner } from 'primereact/progressspinner';
 import { confirmDialog, ConfirmDialog } from 'primereact/confirmdialog';
 import { useMergeRequests, useCreateMergeRequest, useDeleteMergeRequest } from '../api/mergeRequests';
@@ -62,8 +63,8 @@ const MergeRequests: React.FC = () => {
   const [tab, setTab] = useState<TabKey>('progress');
   const [search, setSearch] = useState('');
   const [showCreate, setShowCreate] = useState(false);
-  const [form, setForm] = useState<{ name: string; description: string; sourceInstanceId: number | null; targetInstanceId: number | null }>({
-    name: '', description: '', sourceInstanceId: null, targetInstanceId: null,
+  const [form, setForm] = useState<{ name: string; description: string; sourceInstanceId: number | null; targetInstanceId: number | null; includeDrafts: boolean }>({
+    name: '', description: '', sourceInstanceId: null, targetInstanceId: null, includeDrafts: false,
   });
 
   const completedParam = tab === 'all' ? undefined : tab === 'completed';
@@ -103,9 +104,10 @@ const MergeRequests: React.FC = () => {
         description: (form.description || '').trim(),
         sourceInstanceId: form.sourceInstanceId,
         targetInstanceId: form.targetInstanceId,
+        includeDrafts: form.includeDrafts,
       });
       setShowCreate(false);
-      setForm({ name: '', description: '', sourceInstanceId: null, targetInstanceId: null });
+      setForm({ name: '', description: '', sourceInstanceId: null, targetInstanceId: null, includeDrafts: false });
       if (created?.id) navigate(`/merge-requests/${created.id}`);
     } catch (e) {
       toast.current?.show({ severity: 'error', summary: 'Error', detail: apiErrorMessage(e), life: 4000 });
@@ -227,6 +229,17 @@ const MergeRequests: React.FC = () => {
             <label htmlFor="mr-tgt">Target instance</label>
             <Dropdown id="mr-tgt" value={form.targetInstanceId} options={instances as any[]} optionLabel="name" optionValue="id"
               onChange={(e) => setForm({ ...form, targetInstanceId: e.value })} placeholder="Select target" />
+          </div>
+          <div className="field">
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+              <Checkbox inputId="mr-drafts" checked={form.includeDrafts}
+                onChange={(e) => setForm({ ...form, includeDrafts: !!e.checked })} />
+              <label htmlFor="mr-drafts" style={{ margin: 0, cursor: 'pointer' }}>Include drafts (Strapi Draft &amp; Publish)</label>
+            </div>
+            <small className="ss-muted" style={{ display: 'block', marginTop: '0.35rem' }}>
+              Sync the draft channel too: divergent “modified” drafts, draft-only entries and unpublished
+              state are reproduced on the target. Leave off to sync only published content.
+            </small>
           </div>
         </div>
       </Dialog>

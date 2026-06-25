@@ -233,8 +233,8 @@ suspend fun prefetchComparisonData(
     val tgtRelDef: Deferred<List<FilesRelatedMph>> = async { fetchFilesRelatedMph(mergeRequest.targetInstance) }
     val srcCMPSDef: Deferred<CmpsMap> = async { fetchCMPS(mergeRequest.sourceInstance, dbSchema) }
     val tgtCMPSDef: Deferred<CmpsMap> = async { fetchCMPS(mergeRequest.targetInstance, dbSchema) }
-    val scrTablesDef: Deferred<TableMap> = async { fetchTables(mergeRequest.sourceInstance, dbSchema) }
-    val tgtTablesDef: Deferred<TableMap> = async { fetchTables(mergeRequest.targetInstance, dbSchema) }
+    val scrTablesDef: Deferred<TableMap> = async { fetchTables(mergeRequest.sourceInstance, dbSchema, mergeRequest.includeDrafts) }
+    val tgtTablesDef: Deferred<TableMap> = async { fetchTables(mergeRequest.targetInstance, dbSchema, mergeRequest.includeDrafts) }
     val srcCompDef: Deferred<MutableMap<String, MutableMap<Int, JsonObject>>> =
         async { fetchComponents(mergeRequest.sourceInstance, dbSchema) }
     val tgtCompDef: Deferred<MutableMap<String, MutableMap<Int, JsonObject>>> =
@@ -289,8 +289,9 @@ suspend fun prefetchComparisonData(
                 cmpsMap = sourceCMPSMap,
                 componentTableCache = srcCompMap,
                 tableMap = sourceTableMap,
-                fileCache = sourceFiles.associate { it.metadata.id to it.metadata.documentId }
-            ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata, excludedFields) }
+                fileCache = sourceFiles.associate { it.metadata.id to it.metadata.documentId },
+                includeDrafts = mergeRequest.includeDrafts
+            ).let { rowsToContent(it, table.metadata, excludedFields, mergeRequest.includeDrafts) }
         }
 
         val targetRowsDef = async(Dispatchers.IO) {
@@ -302,8 +303,9 @@ suspend fun prefetchComparisonData(
                 cmpsMap = targetCMPSMap,
                 componentTableCache = tgtCompMap,
                 tableMap = targetTableMap,
-                fileCache = targetFiles.associate { it.metadata.id to it.metadata.documentId }
-            ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata, excludedFields) }
+                fileCache = targetFiles.associate { it.metadata.id to it.metadata.documentId },
+                includeDrafts = mergeRequest.includeDrafts
+            ).let { rowsToContent(it, table.metadata, excludedFields, mergeRequest.includeDrafts) }
         }
 
         val (sourceRows, targetRows) = awaitAll(sourceRowsDef, targetRowsDef)
@@ -333,7 +335,8 @@ suspend fun prefetchComparisonData(
 @Suppress("RedundantSuspendModifier")
 suspend fun exportSourcePrefetch(
     instance: StrapiInstance,
-    dbSchema: DbSchema
+    dbSchema: DbSchema,
+    includeDrafts: Boolean = false
 ): ComparisonPrefetchCache = coroutineScope {
     val logger = LoggerFactory.getLogger("SyncServiceDb")
     logger.info("Exporting source-only prefetch for instance '${instance.name}'")
@@ -346,7 +349,7 @@ suspend fun exportSourcePrefetch(
     val filesDef: Deferred<List<StrapiImage>> = async { fetchFilesFromDb(instance) }
     val relDef: Deferred<List<FilesRelatedMph>> = async { fetchFilesRelatedMph(instance) }
     val cmpsDef: Deferred<CmpsMap> = async { fetchCMPS(instance, dbSchema) }
-    val tablesDef: Deferred<TableMap> = async { fetchTables(instance, dbSchema) }
+    val tablesDef: Deferred<TableMap> = async { fetchTables(instance, dbSchema, includeDrafts) }
     val compDef: Deferred<MutableMap<String, MutableMap<Int, JsonObject>>> = async { fetchComponents(instance, dbSchema) }
     // New: folders snapshot from source Strapi (via HTTP API)
     val foldersDef: Deferred<List<StrapiFolder>> = async {
@@ -384,8 +387,9 @@ suspend fun exportSourcePrefetch(
             cmpsMap = cmpsMap,
             componentTableCache = compMap,
             tableMap = tableMap,
-            fileCache = filesWithFp.associate { it.metadata.id to it.metadata.documentId }
-        ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata) }
+            fileCache = filesWithFp.associate { it.metadata.id to it.metadata.documentId },
+            includeDrafts = includeDrafts
+        ).let { rowsToContent(it, table.metadata, includeDrafts = includeDrafts) }
         sourceRowsByUid[uid] = rows
     }
 

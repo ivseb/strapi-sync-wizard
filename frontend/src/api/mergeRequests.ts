@@ -28,6 +28,7 @@ export interface CreateMergeRequestDTO {
   description?: string;
   sourceInstanceId: number;
   targetInstanceId: number;
+  includeDrafts?: boolean;
 }
 
 export interface UnifiedSelection {
@@ -45,6 +46,7 @@ export interface UpdateMergeRequestDTO {
   sourceInstanceId: number;
   targetInstanceId: number;
   status?: string;
+  includeDrafts?: boolean;
 }
 
 export interface MergeRequestListParams {

@@ -133,6 +133,24 @@ const MergeRequestDetails: React.FC = () => {
     } catch (err) { showError(apiErrorMessage(err) || 'Failed to update status'); return false; }
   };
 
+  const toggleIncludeDrafts = async () => {
+    if (!mr) return;
+    const next = !mr.mergeRequest.includeDrafts;
+    try {
+      await updateMut.mutateAsync({
+        id: mr.mergeRequest.id, name: mr.mergeRequest.name, description: mr.mergeRequest.description,
+        sourceInstanceId: mr.mergeRequest.sourceInstance.id, targetInstanceId: mr.mergeRequest.targetInstance.id,
+        status: mr.mergeRequest.status, includeDrafts: next,
+      });
+      await refetch();
+      toast.current?.show({
+        severity: 'success', summary: next ? 'Drafts included' : 'Drafts excluded',
+        detail: next ? 'Re-run Compare to pick up modified/draft-only changes.' : 'Re-run Compare to refresh.',
+        life: 4500,
+      });
+    } catch (err) { showError(apiErrorMessage(err) || 'Failed to update include-drafts'); }
+  };
+
   const proceedToNextStep = async (nextStep: number) => {
     if (!mr) return;
     const status = mr.mergeRequest.status;
@@ -247,6 +265,14 @@ const MergeRequestDetails: React.FC = () => {
           {/* readiness chips */}
           <div className="ss-card-row" style={{ gap: 6, marginTop: 11, flexWrap: 'wrap' }}>
             {schemaChip}
+            {!completed && (
+              <Chip
+                cls={detail.mergeRequest.includeDrafts ? 'info' : ''}
+                icon={detail.mergeRequest.includeDrafts ? 'pi pi-check-circle' : 'pi pi-circle'}
+                label={detail.mergeRequest.includeDrafts ? 'Drafts: on' : 'Drafts: off'}
+                onClick={toggleIncludeDrafts}
+              />
+            )}
             {schemaResult && schemaResult.warnings.length > 0 && <Chip cls="warn" icon="pi pi-exclamation-triangle" label={`${schemaResult.warnings.length} warning${schemaResult.warnings.length === 1 ? '' : 's'}`} />}
             {bothReal && rank >= 2 && <Chip cls="info" icon="pi pi-id-card" label="Reconcile identity" onClick={() => setShowReconcile(true)} />}
             {rank >= 2 && (

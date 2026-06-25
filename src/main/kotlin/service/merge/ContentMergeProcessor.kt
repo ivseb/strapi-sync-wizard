@@ -325,6 +325,67 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
         }
     }
 
+    /**
+     * Draft & Publish fidelity (Strapi v5), run AFTER the primary published write succeeds:
+     *  - MODIFIED (source has a divergent draft overlay): write the draft body to the same target
+     *    document with `?status=draft`, so the target reproduces the "modified" state (published v1
+     *    + pending draft v2) without re-publishing.
+     *  - DRAFT_ONLY (source has no published row): the primary write already went to the draft channel
+     *    (status=draft); here we additionally unpublish the target if it still has a published row
+     *    (e.g. it was previously published), so it ends up draft-only like the source.
+     * No-op when includeDrafts is off (no overlay, not draft-only).
+     */
+    private suspend fun applyDraftFidelity(
+        sourceEntry: it.sebi.models.StrapiContent,
+        targetContent: it.sebi.models.StrapiContent?,
+        targetDocumentId: String,
+        contentTypeSchema: DbTable,
+        dbSchema: DbSchema,
+        kind: StrapiContentTypeKind,
+        targetClient: StrapiClient,
+        comparisonDataMap: ContentTypeComparisonResultMapWithRelationships,
+        contentTypeMappingByTable: Map<String, DbTable>,
+        excludeLinks: Set<StrapiLinkRef>,
+        allTargetFileIdByDoc: Map<String, Int>,
+        mappingMap: MutableMap<String, MutableMap<String, MergeRequestDocumentMapping>>
+    ) {
+        if (targetDocumentId.isBlank()) return
+        val apiUid = contentTypeSchema.metadata!!.apiUid
+        if (sourceEntry.metadata.isDraftOnly) {
+            // Source is draft-only: make sure the target has no lingering published row.
+            if (targetContent != null && !targetContent.metadata.isDraftOnly) {
+                try {
+                    targetClient.unpublishEntry(apiUid, targetDocumentId, kind)
+                } catch (e: Exception) {
+                    logger.error("Draft fidelity: failed to unpublish $apiUid/$targetDocumentId: ${e.message}", e)
+                    throw e
+                }
+            }
+            return
+        }
+        // MODIFIED: apply the divergent draft overlay on top of the just-published version.
+        val overlay = sourceEntry.draft ?: return
+        val draftLinks = overlay.links.filterNot { excludeLinks.contains(it) }
+        val draftPayload = ContentJsonUtils.processJsonElementNew(
+            comparisonDataMap,
+            overlay.rawData,
+            contentTypeSchema,
+            dbSchema,
+            contentTypeMappingByTable,
+            draftLinks,
+            allTargetFileIdByDoc,
+            mappingMap
+        ).jsonObject
+        targetClient.upsertContentEntry(
+            contentTypeSchema.metadata!!.queryName,
+            dropForeignFields(contentTypeSchema.name, draftPayload),
+            kind,
+            sourceEntry.metadata.documentId,
+            targetDocumentId,
+            status = "draft"
+        )
+    }
+
     private suspend fun processSingleType(
         contentTypeUid: String,
         contentTypeSchema: DbTable,
@@ -360,12 +421,16 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                     // re-run updates in place instead of duplicating / hitting unique-field errors.
                     val targetDocForUpsert = comparisonResult.targetContent?.metadata?.documentId
                         ?: mappingMap[contentTypeSchema.metadata!!.apiUid]?.get(sourceEntry.metadata.documentId)?.targetDocumentId
+                    // Draft & Publish fidelity (v5): a draft-only source writes to the draft channel and
+                    // is NOT published; everything else writes+publishes the published body as usual.
+                    val primaryStatus = if (sourceEntry.metadata.isDraftOnly) "draft" else null
                     val response = targetClient.upsertContentEntry(
                         contentTypeSchema.metadata!!.queryName,
                         dropForeignFields(contentTypeSchema.name, dataToCreate),
                         StrapiContentTypeKind.SingleType,
                         sourceEntry.metadata.documentId,
-                        targetDocForUpsert
+                        targetDocForUpsert,
+                        status = primaryStatus
                     )
                     val data = response["data"]?.jsonObject
                     val targetDocumentId = data?.get("documentId")?.jsonPrimitive?.contentOrNull ?: ""
@@ -429,6 +494,13 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                             srcSyncId
                         )
                     }
+                    // Draft & Publish fidelity: write the divergent draft overlay (modified) or ensure
+                    // the target is unpublished (draft-only). No-op when includeDrafts is off.
+                    applyDraftFidelity(
+                        sourceEntry, comparisonResult.targetContent, targetDocumentId,
+                        contentTypeSchema, dbSchema, StrapiContentTypeKind.SingleType, targetClient,
+                        comparisonDataMap, contentTypeMappingByTable, excludeLinks, allTargetFileIdByDoc, mappingMap
+                    )
                     mergeRequestSelectionsRepository.updateSyncStatus(selection.id, true, null)
                     true
                 } catch (clex: ClientRequestException) {
@@ -517,12 +589,16 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                     // duplicate (or hitting a unique-field ValidationError).
                     val targetDocForUpsert = entry.targetContent?.metadata?.documentId
                         ?: mappingMap[contentTypeSchema.metadata!!.apiUid]?.get(sourceContent.metadata.documentId)?.targetDocumentId
+                    // Draft & Publish fidelity (v5): a draft-only source writes to the draft channel and
+                    // is NOT published; everything else writes+publishes the published body as usual.
+                    val primaryStatus = if (sourceContent.metadata.isDraftOnly) "draft" else null
                     val response = targetClient.upsertContentEntry(
                         contentTypeSchema.metadata!!.queryName,
                         dropForeignFields(contentTypeSchema.name, dataToCreate),
                         StrapiContentTypeKind.CollectionType,
                         sourceContent.metadata.documentId,
-                        targetDocForUpsert
+                        targetDocForUpsert,
+                        status = primaryStatus
                     )
                     val data = response["data"]?.jsonObject
                     val targetDocumentId = data?.get("documentId")?.jsonPrimitive?.contentOrNull ?: ""
@@ -585,6 +661,13 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                             srcSyncId
                         )
                     }
+                    // Draft & Publish fidelity: write the divergent draft overlay (modified) or ensure
+                    // the target is unpublished (draft-only). No-op when includeDrafts is off.
+                    applyDraftFidelity(
+                        sourceContent, entry.targetContent, targetDocumentId,
+                        contentTypeSchema, dbSchema, StrapiContentTypeKind.CollectionType, targetClient,
+                        comparisonDataMap, contentTypeMappingByTable, excludeLinks, allTargetFileIdByDoc, mappingMap
+                    )
                     mergeRequestSelectionsRepository.updateSyncStatus(selection.id, true, null)
                     true
                 } catch (e: Exception) {

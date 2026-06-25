@@ -43,6 +43,7 @@ interface ChangeRow {
   targetRefs?: Record<string, ResolvedRef[]>;
   sourceDoc?: string;
   targetDoc?: string;
+  draftBadge?: 'modified' | 'draft-only' | null;
 }
 
 const labelOf = (r: ContentTypeComparisonResultWithRelationships): string => {
@@ -241,9 +242,18 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
         sourceId: r.sourceContent?.metadata?.id, targetId: r.targetContent?.metadata?.id,
         label: labelOf(r), state: r.compareState,
         syncId: r.sourceContent?.metadata?.syncId || r.targetContent?.metadata?.syncId || null,
-        source: r.sourceContent?.cleanData, target: r.targetContent?.cleanData,
+        // For a "modified" entry the published bodies match — the real change is in the draft channel.
+        // Show the source DRAFT body so the side-by-side reflects what will actually change.
+        source: (r.sourceContent as any)?.draft?.cleanData ?? r.sourceContent?.cleanData,
+        target: r.targetContent?.cleanData,
         sourceRefs: r.sourceRefs, targetRefs: r.targetRefs,
         sourceDoc: r.sourceContent?.metadata?.documentId, targetDoc: r.targetContent?.metadata?.documentId,
+        draftBadge: (() => {
+          const sc: any = r.sourceContent;
+          if (sc?.metadata?.isDraftOnly) return 'draft-only';
+          if (sc?.draft) return 'modified';
+          return null;
+        })(),
       };
       const g = map.get(r.contentType) || { uid: r.contentType, tableName: r.tableName, kind, displayName: r.contentType.split('.').pop() || r.contentType, rows: [] };
       g.rows.push(row);
@@ -378,6 +388,14 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
                       <span className={`ss-state-dot ${stateClass(r.state)}`} />
                       <span className={`ss-erow-name${r.state === 'ONLY_IN_TARGET' ? ' del' : ''}`} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 280, textDecoration: excluded ? 'line-through' : undefined }}>{r.label}</span>
                       <span className="ss-erow-summary">{rowSummary(r)}</span>
+                      {r.draftBadge && (
+                        <span className="ss-badge" style={{ fontSize: 9, background: 'rgba(245,166,35,0.18)', color: '#f5a623', borderColor: 'rgba(245,166,35,0.4)' }}
+                          title={r.draftBadge === 'draft-only'
+                            ? 'Draft-only: this entry has no published version (it will be created/kept as a draft on the target)'
+                            : 'Modified: the working draft differs from the published version (both are reproduced on the target)'}>
+                          <i className="pi pi-pencil" style={{ fontSize: 8 }} aria-hidden="true" /> {r.draftBadge}
+                        </span>
+                      )}
                       {r.syncId && <i className="pi pi-link ss-dim" title="identity linked" style={{ fontSize: 11 }} aria-hidden="true" />}
                       {referrers.length > 0 && <span className="ss-badge" title={`Referenced by ${referrers.length}`} style={{ fontSize: 10 }}><i className="pi pi-arrow-up-right" style={{ fontSize: 9 }} aria-hidden="true" /> {referrers.length}</span>}
                       <span style={{ marginLeft: 'auto' }} />

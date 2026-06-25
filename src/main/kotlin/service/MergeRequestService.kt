@@ -916,7 +916,7 @@ class MergeRequestService(
                         )
                         val tgtRel = fetchFilesRelatedMph(mergeRequest.targetInstance)
                         val tgtCmps = fetchCMPS(mergeRequest.targetInstance, dbSchema)
-                        val tgtTables = fetchTables(mergeRequest.targetInstance, dbSchema)
+                        val tgtTables = fetchTables(mergeRequest.targetInstance, dbSchema, mergeRequest.includeDrafts)
                         val tgtCompDef = fetchComponents(mergeRequest.targetInstance, dbSchema)
                         val targetRowsByUid = mutableMapOf<String, List<StrapiContent>>()
                         for (table in dbSchema.tables) {
@@ -931,8 +931,9 @@ class MergeRequestService(
                                 cmpsMap = tgtCmps,
                                 componentTableCache = tgtCompDef,
                                 tableMap = tgtTables,
-                                fileCache = tgtFiles.associate { it.metadata.id to it.metadata.documentId }
-                            ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata) }
+                                fileCache = tgtFiles.associate { it.metadata.id to it.metadata.documentId },
+                                includeDrafts = mergeRequest.includeDrafts
+                            ).let { rowsToContent(it, table.metadata, includeDrafts = mergeRequest.includeDrafts) }
                             targetRowsByUid[uid] = rows
                         }
                         val merged = ComparisonPrefetch(
@@ -973,7 +974,7 @@ class MergeRequestService(
                         computeFingerprints(mergeRequest.targetInstance, fetchFilesFromDb(mergeRequest.targetInstance))
                     val tgtRel = fetchFilesRelatedMph(mergeRequest.targetInstance)
                     val tgtCmps = fetchCMPS(mergeRequest.targetInstance, dbSchema)
-                    val tgtTables = fetchTables(mergeRequest.targetInstance, dbSchema)
+                    val tgtTables = fetchTables(mergeRequest.targetInstance, dbSchema, mergeRequest.includeDrafts)
                     val tgtCompDef = fetchComponents(mergeRequest.targetInstance, dbSchema)
                     val targetRowsByUid = mutableMapOf<String, List<StrapiContent>>()
                     for (table in dbSchema.tables) {
@@ -988,8 +989,9 @@ class MergeRequestService(
                             cmpsMap = tgtCmps,
                             componentTableCache = tgtCompDef,
                             tableMap = tgtTables,
-                            fileCache = tgtFiles.associate { it.metadata.id to it.metadata.documentId }
-                        ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata) }
+                            fileCache = tgtFiles.associate { it.metadata.id to it.metadata.documentId },
+                            includeDrafts = mergeRequest.includeDrafts
+                        ).let { rowsToContent(it, table.metadata, includeDrafts = mergeRequest.includeDrafts) }
                         targetRowsByUid[uid] = rows
                     }
                     val prefetch = ComparisonPrefetch(
@@ -1029,7 +1031,7 @@ class MergeRequestService(
                         )
                         val tgtRel = fetchFilesRelatedMph(mergeRequest.targetInstance)
                         val tgtCmps = fetchCMPS(mergeRequest.targetInstance, dbSchema)
-                        val tgtTables = fetchTables(mergeRequest.targetInstance, dbSchema)
+                        val tgtTables = fetchTables(mergeRequest.targetInstance, dbSchema, mergeRequest.includeDrafts)
                         val tgtCompDef = fetchComponents(mergeRequest.targetInstance, dbSchema)
                         val targetRowsByUid = mutableMapOf<String, List<StrapiContent>>()
                         for (table in dbSchema.tables) {
@@ -1044,8 +1046,9 @@ class MergeRequestService(
                                 cmpsMap = tgtCmps,
                                 componentTableCache = tgtCompDef,
                                 tableMap = tgtTables,
-                                fileCache = tgtFiles.associate { it.metadata.id to it.metadata.documentId }
-                            ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata) }
+                                fileCache = tgtFiles.associate { it.metadata.id to it.metadata.documentId },
+                                includeDrafts = mergeRequest.includeDrafts
+                            ).let { rowsToContent(it, table.metadata, includeDrafts = mergeRequest.includeDrafts) }
                             targetRowsByUid[uid] = rows
                         }
                         ComparisonPrefetch(

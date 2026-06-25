@@ -120,6 +120,14 @@ export interface StrapiContentMetadata {
     locale?: string | null;
     uniqueKey?: string;
     syncId?: string | null;
+    // Strapi v5 Draft & Publish: true when the document has no published row (draft-only/unpublished).
+    isDraftOnly?: boolean;
+}
+
+export interface StrapiDraftChannel {
+    rawData: JsonObject;
+    cleanData: JsonObject;
+    links: StrapiLinkRef[];
 }
 
 export interface StrapiLinkRef {
@@ -136,6 +144,9 @@ export interface StrapiContent {
     rawData: JsonObject;
     cleanData: JsonObject;
     links: StrapiLinkRef[];
+    // Divergent draft overlay (Strapi v5 "modified" state): present only when the published version
+    // and the working draft differ. Null otherwise.
+    draft?: StrapiDraftChannel | null;
 }
 
 export interface DifferentFile {
@@ -251,6 +262,7 @@ export interface MergeRequestDetail {
         sourceInstance: StrapiInstance;
         targetInstance: StrapiInstance;
         status: string;
+        includeDrafts?: boolean;
         createdAt: string;
         updatedAt: string;
     };

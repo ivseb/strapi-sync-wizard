@@ -40,7 +40,13 @@ data class StrapiContentMetadata(
     val uniqueKey: String,
     val locale: String?,
     // Stable, cross-instance identity (Phase 1). Null when not yet assigned/reconciled.
-    val syncId: String? = null
+    val syncId: String? = null,
+    /**
+     * Draft & Publish state (Strapi v5). When true, the document has NO published row — the primary
+     * body (rawData/cleanData) holds the DRAFT version (draft-only / explicitly unpublished). When
+     * false, the primary body is the published version (the normal case, and all non-D&P types).
+     */
+    val isDraftOnly: Boolean = false
 )
 
 @Serializable
@@ -58,6 +64,29 @@ data class StrapiLinkRef(
 @Serializable
 data class StrapiContent(
     val metadata: StrapiContentMetadata,
+    val rawData: JsonObject,
+    val cleanData: JsonObject,
+    val links: List<StrapiLinkRef> = emptyList(),
+    /**
+     * Divergent draft overlay (Strapi v5 "modified" state): present ONLY when the document is
+     * published AND its working draft differs from the published version. Null in every other case
+     * (clean published, draft-only, or non-D&P types) so the common path is unchanged and collapses.
+     */
+    val draft: StrapiDraftChannel? = null,
+) {
+    /** The published body for comparison: null when the document is draft-only (no published row). */
+    fun publishedClean(): JsonObject? = if (metadata.isDraftOnly) null else cleanData
+
+    /** The working/draft body for comparison: the divergent draft if present, else the primary body. */
+    fun draftClean(): JsonObject = draft?.cleanData ?: cleanData
+}
+
+/**
+ * The draft channel of a document when it diverges from the published version. Carries its own
+ * raw/clean bodies and links because the draft entity row has independent components/relations.
+ */
+@Serializable
+data class StrapiDraftChannel(
     val rawData: JsonObject,
     val cleanData: JsonObject,
     val links: List<StrapiLinkRef> = emptyList(),

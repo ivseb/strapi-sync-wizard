@@ -264,9 +264,12 @@ suspend fun fetchCMPS(instance: StrapiInstance, dbSchema: DbSchema): CmpsMap = w
     cmpsByEntityField
 }
 
-suspend fun fetchTables(instance: StrapiInstance, dbSchema: DbSchema): TableMap = withContext(Dispatchers.IO) {
+suspend fun fetchTables(instance: StrapiInstance, dbSchema: DbSchema, includeDrafts: Boolean = false): TableMap = withContext(Dispatchers.IO) {
     val logger = LoggerFactory.getLogger("SyncServiceDb")
     val tableMap: TableMap = mutableMapOf()
+    // Draft & Publish (v5): by default only published rows; with includeDrafts also the draft-shadow
+    // rows (published_at IS NULL). Downstream mergeDraftChannels pairs them per (document_id, locale).
+    val publishedFilter = if (includeDrafts) "" else "AND t.published_at IS NOT NULL"
 
     val tablesQuery = dbSchema.tables.filter { it.metadata?.apiUid?.startsWith("api::") ?: false }.map { table ->
         // Identity layer (Phase 1): attach the shared sync_id as "__sync_id" here too, since this
@@ -280,7 +283,7 @@ suspend fun fetchTables(instance: StrapiInstance, dbSchema: DbSchema): TableMap 
                     to_jsonb(t) || jsonb_build_object('__sync_id', si.sync_id) AS obj
                     FROM "${table.name}" t
                     $syncIdJoin
-                    WHERE t.document_id IS NOT NULL AND t.published_at IS NOT NULL
+                    WHERE t.document_id IS NOT NULL $publishedFilter
                     """
 
     }.joinToString("\nUNION\n") { it }
@@ -299,7 +302,12 @@ suspend fun fetchTables(instance: StrapiInstance, dbSchema: DbSchema): TableMap 
                     val documentId = rs.getString("document_id") ?: continue
                     val objStr = rs.getString("obj") ?: continue
                     val obj = parseJsonObject(objStr)
-                    tableMap.getOrPut(tableName) { mutableMapOf() }.put(documentId, obj)
+                    // Key by the row-unique entity id (not documentId): with Draft & Publish a document
+                    // has TWO rows (draft + published) sharing one documentId — keying by documentId
+                    // would collide them and drop the draft. The only consumer iterates .values, so the
+                    // key choice is otherwise irrelevant. Fall back to documentId if id is somehow absent.
+                    val rowKey = obj["id"]?.jsonPrimitive?.intOrNull?.toString() ?: documentId
+                    tableMap.getOrPut(tableName) { mutableMapOf() }.put(rowKey, obj)
 
                 }
             }
@@ -579,7 +587,8 @@ suspend fun fetchPublishedRowsAsJson(
     fileRelations: List<FilesRelatedMph>? = null,
     componentTableCache: MutableMap<String, MutableMap<Int, JsonObject>>,
     fileCache: Map<Int, String>,
-    tableMap: TableMap
+    tableMap: TableMap,
+    includeDrafts: Boolean = false
 ): List<Pair<JsonObject, List<StrapiLinkRef>>> = withContext(Dispatchers.IO) {
     try {
         // Identity layer: attach the shared sync_id (Phase 1) into each row JSON as "__sync_id".
@@ -598,8 +607,8 @@ suspend fun fetchPublishedRowsAsJson(
                            to_jsonb(t) || jsonb_build_object('__sync_id', si.sync_id) AS obj
                     FROM "$table" t
                     $syncIdJoin
-                    WHERE t.document_id IS NOT NULL AND t.published_at IS NOT NULL
-                    ORDER BY t.document_id, t.published_at DESC, t.id DESC
+                    WHERE t.document_id IS NOT NULL ${if (includeDrafts) "" else "AND t.published_at IS NOT NULL"}
+                    ORDER BY t.document_id, t.published_at DESC NULLS LAST, t.id DESC
                     """.trimIndent()
             ) { rs ->
                 val list = mutableListOf<JsonObject>()
@@ -1096,6 +1105,64 @@ fun toStrapiContent(
     )
 }
 
+/**
+ * Group raw fetched rows — which, when includeDrafts is on, contain BOTH the published and the
+ * draft-shadow row per document — into one StrapiContent per (document_id, locale):
+ *  - published + draft identical  -> just the published content (the draft collapses away)
+ *  - published + draft divergent  -> published content + a StrapiDraftChannel overlay (MODIFIED)
+ *  - published only               -> published content (clean published / non-D&P types)
+ *  - draft only (no published row) -> the draft content, flagged isDraftOnly (draft-only/unpublished)
+ * With includeDrafts off, each group is a single published row, so this reduces to the legacy 1:1.
+ * The collapse relies on cleanData excluding published_at/timestamps/id, so identical content matches.
+ */
+fun mergeDraftChannels(
+    rows: List<Pair<JsonObject, List<StrapiLinkRef>>>,
+    metadata: DbTableMetadata,
+    excludedFields: Set<String> = emptySet()
+): List<StrapiContent> {
+    val groups = LinkedHashMap<Pair<String, String?>, MutableList<Pair<JsonObject, List<StrapiLinkRef>>>>()
+    for (row in rows) {
+        val obj = row.first
+        val did = obj["document_id"]?.jsonPrimitive?.contentOrNull ?: ""
+        val loc = obj["locale"]?.jsonPrimitive?.contentOrNull
+        groups.getOrPut(did to loc) { mutableListOf() }.add(row)
+    }
+    fun isPublished(p: Pair<JsonObject, List<StrapiLinkRef>>) =
+        p.first["published_at"]?.jsonPrimitive?.contentOrNull != null
+    return groups.values.mapNotNull { group ->
+        val published = group.firstOrNull { isPublished(it) }
+        val draft = group.firstOrNull { !isPublished(it) }
+        when {
+            published != null -> {
+                val primary = toStrapiContent(published.first, published.second, metadata, excludedFields)
+                if (draft == null) primary
+                else {
+                    val draftContent = toStrapiContent(draft.first, draft.second, metadata, excludedFields)
+                    if (draftContent.cleanData == primary.cleanData) primary
+                    else primary.copy(
+                        draft = StrapiDraftChannel(draftContent.rawData, draftContent.cleanData, draftContent.links)
+                    )
+                }
+            }
+            draft != null -> {
+                val c = toStrapiContent(draft.first, draft.second, metadata, excludedFields)
+                c.copy(metadata = c.metadata.copy(isDraftOnly = true))
+            }
+            else -> null
+        }
+    }
+}
+
+/** Convert raw fetched rows to StrapiContent, pairing draft+published when includeDrafts is on. */
+fun rowsToContent(
+    rows: List<Pair<JsonObject, List<StrapiLinkRef>>>,
+    metadata: DbTableMetadata,
+    excludedFields: Set<String> = emptySet(),
+    includeDrafts: Boolean
+): List<StrapiContent> =
+    if (includeDrafts) mergeDraftChannels(rows, metadata, excludedFields)
+    else rows.map { (obj, links) -> toStrapiContent(obj, links, metadata, excludedFields) }
+
 
 fun buildStatusMaps(
     singleTypes: Map<String, ContentTypeComparisonResultWithRelationships>,
@@ -1342,22 +1409,34 @@ fun compareSingleType(
                 .mapNotNull { it.fieldPath }
                 .toSet()
 
-            val sourceObjMap = sourceObj!!.cleanData.toMutableMap()
-            sourceObjMap.remove("document_id")
+            // Normalize a cleaned body for comparison: drop document_id and rewrite relation/media
+            // references to the cross-instance identity (sync_id) so the SAME logical target compares
+            // equal across instances. Falls back to "doc:<id>" when no sync_id is assigned yet.
+            fun normalizeForCompare(cd: JsonObject, syncByDoc: Map<String, String>): JsonObject {
+                val m = cleanObject(cd, excludedFields).toMutableMap()
+                m.remove("document_id")
+                normalizeLinksBySyncId(m, syncByDoc)
+                return cleanObject(JsonObject(m), excludedFields)
+            }
 
-            val targetObjMap = cleanObject(targetObj!!.cleanData, excludedFields).toMutableMap()
-            targetObjMap.remove("document_id")
+            // Draft & Publish fidelity (v5): compare BOTH channels.
+            //  - Published channel: null when the side is draft-only (no published row).
+            //  - Working/draft channel: the divergent draft overlay if present, else the primary body.
+            // With includeDrafts off there is no draft overlay and neither side is draft-only, so both
+            // channels reduce to the published body and this matches the legacy single-body compare.
+            val srcPub = sourceObj!!.publishedClean()
+            val tgtPub = targetObj!!.publishedClean()
+            val publishedSame = when {
+                srcPub == null && tgtPub == null -> true
+                srcPub != null && tgtPub != null ->
+                    normalizeForCompare(srcPub, srcSyncByDoc) == normalizeForCompare(tgtPub, tgtSyncByDoc)
+                else -> false // one side published, the other draft-only -> a real state difference
+            }
+            val draftSame = normalizeForCompare(sourceObj.draftClean(), srcSyncByDoc) ==
+                normalizeForCompare(targetObj.draftClean(), tgtSyncByDoc)
 
-            // Normalize relation/media references to a cross-instance identity (sync_id): the SAME
-            // logical target (different per-instance documentId) compares equal, while a genuinely
-            // different reference still surfaces as a change. Falls back to "doc:<id>" when the
-            // referenced entity has no sync_id yet (so it stays comparable, just not cross-env).
-            normalizeLinksBySyncId(sourceObjMap, srcSyncByDoc)
-            normalizeLinksBySyncId(targetObjMap, tgtSyncByDoc)
-
-            val sourceObjToCompare = cleanObject(JsonObject(sourceObjMap), excludedFields)
-            val targetObjToCompare = JsonObject(targetObjMap)
-            if (sourceObjToCompare == targetObjToCompare) ContentTypeComparisonResultKind.IDENTICAL else ContentTypeComparisonResultKind.DIFFERENT
+            if (publishedSame && draftSame) ContentTypeComparisonResultKind.IDENTICAL
+            else ContentTypeComparisonResultKind.DIFFERENT
         }
     }
 
