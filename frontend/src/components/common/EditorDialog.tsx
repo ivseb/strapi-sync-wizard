@@ -10,6 +10,7 @@ import {InputText} from 'primereact/inputtext';
 import {Tree} from 'primereact/tree';
 import {TreeNode} from 'primereact/treenode';
 import { getRepresentativeAttributes } from '../../utils/attributeUtils';
+import FieldDiff from './FieldDiff';
 
 interface EditorDialogProps {
     visible: boolean;
@@ -181,21 +182,21 @@ const EditorDialog: React.FC<EditorDialogProps> = ({
                     <div className="flex flex-column mb-2 p-2 bg-gray-100 border-round">
                         <div className="flex align-items-center gap-2 mb-1">
                             <i className="pi pi-ban text-warning"></i>
-                            <span className="text-sm font-bold">Vincola Campo:</span>
-                            <InputText 
-                                value={excludePathInput} 
-                                onChange={(e) => setExcludePathInput(e.target.value)} 
-                                placeholder="es. metadata.name o rawData.title" 
+                            <span className="text-sm">Exclude field:</span>
+                            <InputText
+                                value={excludePathInput}
+                                onChange={(e) => setExcludePathInput(e.target.value)}
+                                placeholder="e.g. title or seo.metaTitle"
                                 className="p-inputtext-sm flex-1"
                             />
-                            <Button 
-                                icon="pi pi-search" 
-                                className="p-button-sm p-button-text p-button-secondary" 
-                                tooltip="Seleziona path dall'albero"
+                            <Button
+                                icon="pi pi-search"
+                                className="p-button-sm p-button-text p-button-secondary"
+                                tooltip="Pick from tree"
                                 onClick={() => setShowPathPicker(!showPathPicker)}
                             />
-                            <Button 
-                                label="Escludi" 
+                            <Button
+                                label="Exclude"
                                 icon="pi pi-plus" 
                                 className="p-button-sm p-button-warning" 
                                 onClick={() => {
@@ -210,7 +211,7 @@ const EditorDialog: React.FC<EditorDialogProps> = ({
                         </div>
                         {showPathPicker && (
                             <div className="border-1 border-300 border-round p-2 mt-1 bg-white overflow-auto" style={{ maxHeight: '200px' }}>
-                                <div className="text-xs text-500 mb-2">Clicca su una chiave per selezionare il path completo:</div>
+                                <div className="text-xs text-500 mb-2">Click a key to select its full path:</div>
                                 <Tree 
                                     value={treeNodes} 
                                     selectionMode="single" 
@@ -254,12 +255,17 @@ const EditorDialog: React.FC<EditorDialogProps> = ({
                                         </TabPanel>
                                     </TabView>
                                 ) : (
-                                    <div className="flex flex-column h-full">
-                                        <div className="flex flex-row mb-2">
-                                            <div className="flex-1 font-bold text-center">Source</div>
-                                            <div className="flex-1 font-bold text-center">Destination</div>
-                                        </div>
-                                        <div style={{flex: 1, minHeight: 0}}>
+                                    <TabView>
+                                        <TabPanel header="Fields">
+                                            <div className="p-2" style={{ maxHeight: 'calc(80vh - 12rem)', overflowY: 'auto' }}>
+                                                <FieldDiff source={originalContent} target={modifiedContent} />
+                                            </div>
+                                        </TabPanel>
+                                        <TabPanel header="JSON">
+                                            <div className="flex flex-row mb-2">
+                                                <div className="flex-1 text-center ss-muted">Source</div>
+                                                <div className="flex-1 text-center ss-muted">Destination</div>
+                                            </div>
                                             <DiffEditor
                                                 height="60vh"
                                                 language="json"
@@ -273,8 +279,8 @@ const EditorDialog: React.FC<EditorDialogProps> = ({
                                                     scrollBeyondLastLine: false
                                                 }}
                                             />
-                                        </div>
-                                    </div>
+                                        </TabPanel>
+                                    </TabView>
                                 )
                             ) : (
                                 <TabView>

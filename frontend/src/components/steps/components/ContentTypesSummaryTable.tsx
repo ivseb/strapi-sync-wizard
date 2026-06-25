@@ -96,7 +96,7 @@ const ContentTypesSummaryTable: React.FC<Props> = ({
                             type="search"
                             value={globalFilter}
                             onChange={(e) => setGlobalFilter(e.target.value)}
-                            placeholder="Cerca..."
+                            placeholder="Search..."
                         />
                     </span>
                 </div>

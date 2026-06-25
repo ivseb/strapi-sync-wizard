@@ -7,6 +7,7 @@ import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.dao.id.IntIdTable
 import org.jetbrains.exposed.v1.core.inList
 import org.jetbrains.exposed.v1.javatime.timestampWithTimeZone
+import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import java.time.OffsetDateTime
 
@@ -68,4 +69,15 @@ object MergeRequestDocumentMappingTable : IntIdTable("strapi_document_mapping") 
     suspend fun fetchMappingMap(mergeRequest: MergeRequestWithInstancesDTO): Map<String, Map<String, MergeRequestDocumentMapping>> =
         fetchMappingList(mergeRequest).groupBy { it.contentType }
             .mapValues { (_, v) -> v.associateBy { it.sourceDocumentId!! } }
+
+    /**
+     * Delete all mappings between a pair of instances (both directions). Used after a snapshot
+     * restore: the restored target no longer contains the entries those mappings point to, so the
+     * stale source->target ids would otherwise mislead subsequent runs.
+     */
+    suspend fun deleteForInstancePair(instanceA: Int, instanceB: Int): Int = dbQuery {
+        deleteWhere {
+            (sourceStrapiId inList listOf(instanceA, instanceB)) and (targetStrapiId inList listOf(instanceA, instanceB))
+        }
+    }
 }

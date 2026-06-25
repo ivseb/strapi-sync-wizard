@@ -13,6 +13,15 @@ data class SnapshotDTO(
 )
 
 @Serializable
+data class InstanceSnapshotDTO(
+    val id: Int,
+    val mergeRequestId: Int,
+    val mergeRequestName: String,
+    val snapshotSchemaName: String,
+    @Contextual val createdAt: OffsetDateTime
+)
+
+@Serializable
 data class SnapshotActivityDTO(
     val id: Int,
     val mergeRequestId: Int,

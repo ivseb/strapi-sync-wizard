@@ -1,6 +1,6 @@
 package it.sebi.utils
 
-import org.apache.pdfbox.pdmodel.PDDocument
+import org.apache.pdfbox.Loader
 import org.apache.pdfbox.text.PDFTextStripper
 import java.awt.Color
 import java.awt.Image
@@ -98,7 +98,7 @@ object FileFingerprintUtil {
      * Extract text from PDF and return SHA-256 of normalized text + page count.
      */
     private fun pdfTextHash(bytes: ByteArray): String {
-        PDDocument.load(ByteArrayInputStream(bytes)).use { doc ->
+        Loader.loadPDF(bytes).use { doc ->
             val stripper = PDFTextStripper()
             val text = stripper.getText(doc)
             val normalized = text.replace("\\s+".toRegex(), " ").trim().lowercase()

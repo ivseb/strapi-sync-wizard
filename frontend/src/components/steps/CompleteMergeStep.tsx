@@ -1,19 +1,9 @@
-import React, { useState, useEffect, useRef } from 'react';
-import {Button} from 'primereact/button';
-import {Message} from 'primereact/message';
-import {Tag} from 'primereact/tag';
-import {Tooltip} from 'primereact/tooltip';
-import {ProgressBar} from 'primereact/progressbar';
-import {Toast} from 'primereact/toast';
-import {DataTable} from 'primereact/datatable';
-import {Column} from 'primereact/column';
-import {TabView, TabPanel} from 'primereact/tabview';
-import {Card} from 'primereact/card';
-import {MergeRequestSelectionDTO, MergeRequestData, MergeRequestSelection, StrapiContent, SyncPlanDTO} from '../../types';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { Toast } from 'primereact/toast';
+import { MergeRequestSelectionDTO, MergeRequestData, MergeRequestSelection, StrapiContent, SyncPlanDTO } from '../../types';
 import { getRepresentativeAttributes } from '../../utils/attributeUtils';
 import EditorDialog from '../common/EditorDialog';
 import SyncPlanGraph from './components/SyncPlanGraph';
-
 
 // Interface for sync progress updates from the WebSocket
 interface SyncProgressUpdate {
@@ -30,10 +20,57 @@ interface SyncProgressUpdate {
 interface CompleteMergeStepProps {
     status: string;
     completing: boolean;
-    completeMerge: () => void;
+    completeMerge: (opts?: { onlyFailed?: boolean; rollbackOnFailure?: boolean }) => void;
     selections?: MergeRequestSelectionDTO[];
     allMergeData?: MergeRequestData;
 }
+
+type Operation = 'create' | 'update' | 'delete';
+type EffStatus = 'success' | 'failed' | 'processing' | 'pending';
+
+interface ReviewItem {
+    contentType: string;
+    documentId: string;
+    operation: Operation;
+    statusInfo?: MergeRequestSelection;
+}
+
+const shortType = (ct: string) => (ct === 'files' ? 'files' : ct.substring(ct.lastIndexOf('.') + 1));
+
+// Recursive search for a readable label inside a (possibly relation-/component-only) entry,
+// mirroring the backend's contentLabelOf: prefer fields whose name hints at a title, then any
+// short text. Returns null when nothing usable is found (caller falls back to the documentId).
+const LABEL_HINTS = ['title', 'name', 'label', 'heading', 'subject', 'slug', 'code', 'key', 'question', 'testo', 'descrizione', 'description'];
+const LABEL_TECH = new Set(['id', 'documentId', 'document_id', '__sync_id', '__component', '__links', '__order',
+    'createdAt', 'updatedAt', 'publishedAt', 'created_at', 'updated_at', 'published_at', 'locale',
+    'hash', 'ext', 'mime', 'provider', 'url', 'previewUrl']);
+const isShortText = (v: any): v is string => typeof v === 'string' && v.trim().length >= 1 && v.trim().length <= 80;
+
+const deepLabel = (obj: any, hintedOnly = true, depth = 0): string | null => {
+    if (obj == null || depth > 5) return null;
+    if (Array.isArray(obj)) {
+        for (const v of obj) { const r = deepLabel(v, hintedOnly, depth + 1); if (r) return r; }
+        return null;
+    }
+    if (typeof obj === 'object') {
+        // own scalar string fields first
+        for (const [k, v] of Object.entries(obj)) {
+            if (LABEL_TECH.has(k)) continue;
+            if (isShortText(v)) {
+                const hinted = LABEL_HINTS.some((h) => k.toLowerCase().includes(h));
+                if (!hintedOnly || hinted) return (v as string).trim();
+            }
+        }
+        // then descend into nested objects/arrays
+        for (const [k, v] of Object.entries(obj)) {
+            if (LABEL_TECH.has(k)) continue;
+            if (v && typeof v === 'object') { const r = deepLabel(v, hintedOnly, depth + 1); if (r) return r; }
+        }
+        // top-level call: retry without the hint requirement before giving up
+        if (hintedOnly && depth === 0) return deepLabel(obj, false, 0);
+    }
+    return null;
+};
 
 const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                                                                  status,
@@ -42,969 +79,569 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                                                                  selections = [],
                                                                  allMergeData
                                                              }) => {
-    // Count total items for each operation type
-    const totalToCreate = selections.reduce((sum, dto) => sum + ((dto.selections || []).filter(s => s.direction === 'TO_CREATE').length), 0);
-    const totalToUpdate = selections.reduce((sum, dto) => sum + ((dto.selections || []).filter(s => s.direction === 'TO_UPDATE').length), 0);
-    const totalToDelete = selections.reduce((sum, dto) => sum + ((dto.selections || []).filter(s => s.direction === 'TO_DELETE').length), 0);
+    // ---- counts -------------------------------------------------------------
+    const totalToCreate = selections.reduce((s, dto) => s + ((dto.selections || []).filter(x => x.direction === 'TO_CREATE').length), 0);
+    const totalToUpdate = selections.reduce((s, dto) => s + ((dto.selections || []).filter(x => x.direction === 'TO_UPDATE').length), 0);
+    const totalToDelete = selections.reduce((s, dto) => s + ((dto.selections || []).filter(x => x.direction === 'TO_DELETE').length), 0);
     const totalItems = totalToCreate + totalToUpdate + totalToDelete;
 
-    // State for editor modal
-    const [editorDialogVisible, setEditorDialogVisible] = useState<boolean>(false);
+    // ---- editor / logs dialog ----------------------------------------------
+    const [editorDialogVisible, setEditorDialogVisible] = useState(false);
     const [editorContent, setEditorContent] = useState<any>(null);
-    const [isDiffEditor, setIsDiffEditor] = useState<boolean>(false);
+    const [isDiffEditor, setIsDiffEditor] = useState(false);
     const [originalContent, setOriginalContent] = useState<any>(null);
     const [modifiedContent, setModifiedContent] = useState<any>(null);
-    const [editorDialogHeader, setEditorDialogHeader] = useState<string>("View Content");
+    const [editorDialogHeader, setEditorDialogHeader] = useState('View Content');
     const [editorErrorMessage, setEditorErrorMessage] = useState<string | undefined>(undefined);
-    const [httpLogs, setHttpLogs] = useState<{fileName: string, content: string, timestamp: string}[] | undefined>(undefined);
+    const [httpLogs, setHttpLogs] = useState<{ fileName: string, content: string, timestamp: string }[] | undefined>(undefined);
 
-    // State for sync progress
+    // ---- sync progress ------------------------------------------------------
     const [syncProgress, setSyncProgress] = useState<SyncProgressUpdate | null>(null);
-    const [syncInProgress, setSyncInProgress] = useState<boolean>(false);
-    const [syncCompleted, setSyncCompleted] = useState<boolean>(false);
-    const [syncFailed, setSyncFailed] = useState<boolean>(false);
+    const [syncInProgress, setSyncInProgress] = useState(false);
+    const [syncCompleted, setSyncCompleted] = useState(false);
+    const [syncFailed, setSyncFailed] = useState(false);
     const [syncItemsStatus, setSyncItemsStatus] = useState<Record<string, { status: string, message?: string }>>({});
-
-    // Reference for EventSource connection
+    const [rollbackOnFailure, setRollbackOnFailure] = useState(false);
+    const [verifying, setVerifying] = useState(false);
+    const [verifyReport, setVerifyReport] = useState<{ total: number; consistent: number; schemaGap: number; inconsistent: number; items: Array<{ contentType: string; documentId: string; direction: string; actual: string; severity: string; reason?: string | null }> } | null>(null);
     const eventSourceRef = useRef<EventSource | null>(null);
-
-    // Reference for Toast component
     const toast = useRef<Toast>(null);
 
-    // Sync plan state
+    // ---- sync plan ----------------------------------------------------------
     const [syncPlan, setSyncPlan] = useState<SyncPlanDTO | null>(null);
-    const [planLoading, setPlanLoading] = useState<boolean>(false);
+    const [planLoading, setPlanLoading] = useState(false);
     const [planError, setPlanError] = useState<string | null>(null);
+    const [showPlan, setShowPlan] = useState(false);
 
-    // Load sync plan to preview order before starting
+    // ---- view filters -------------------------------------------------------
+    const [query, setQuery] = useState('');
+    const [opFilter, setOpFilter] = useState<Set<Operation>>(new Set(['create', 'update', 'delete']));
+    const [statusFilter, setStatusFilter] = useState<'all' | EffStatus>('all');
+    const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+
     const loadPlan = () => {
-        const urlParts = window.location.pathname.split('/');
-        const last = urlParts[urlParts.length - 1];
-        const mergeRequestId = parseInt(last, 10);
+        const parts = window.location.pathname.split('/');
+        const mergeRequestId = parseInt(parts[parts.length - 1], 10);
         if (isNaN(mergeRequestId)) return;
         setPlanLoading(true);
         setPlanError(null);
         fetch(`/api/merge-requests/${mergeRequestId}/sync-plan`)
-            .then(res => {
-                if (!res.ok) throw new Error(`Failed to load sync plan (HTTP ${res.status})`);
-                return res.json();
-            })
+            .then(res => { if (!res.ok) throw new Error(`Failed to load sync plan (HTTP ${res.status})`); return res.json(); })
             .then((data: SyncPlanDTO) => setSyncPlan(data))
             .catch(err => setPlanError(err.message || 'Failed to load sync plan'))
             .finally(() => setPlanLoading(false));
     };
 
-    useEffect(() => {
-        loadPlan();
-        // re-load if selection counts change
-    }, [selections?.length]);
+    useEffect(() => { loadPlan(); /* eslint-disable-next-line */ }, [selections?.length]);
 
-    // Align initial node statuses with existing selection state when graph loads
+    // Align initial node statuses with existing selection state
     useEffect(() => {
         if (!syncPlan || syncInProgress) return;
-        // Build key set of plan items
         const planKeys = new Set<string>();
-        (syncPlan.batches || []).forEach(batch => {
-            batch.forEach(it => {
-                planKeys.add(`${it.tableName}:${it.documentId}`);
-            });
-        });
+        (syncPlan.batches || []).forEach(b => b.forEach(it => planKeys.add(`${it.tableName}:${it.documentId}`)));
         const initial: Record<string, { status: string; message?: string }> = {};
-        (selections || []).forEach(dto => {
-            (dto.selections || []).forEach(sel => {
-                const key = `${dto.tableName}:${sel.documentId}`;
-                if (!planKeys.has(key)) return;
-                if (sel.syncSuccess === true) {
-                    initial[key] = { status: 'SUCCESS' };
-                } else if (sel.syncSuccess === false) {
-                    initial[key] = { status: 'ERROR', message: sel.syncFailureResponse || undefined };
-                }
-            });
-        });
-        // Merge with existing statuses without overriding live SSE updates
+        (selections || []).forEach(dto => (dto.selections || []).forEach(sel => {
+            const key = `${dto.tableName}:${sel.documentId}`;
+            if (!planKeys.has(key)) return;
+            if (sel.syncSuccess === true) initial[key] = { status: 'SUCCESS' };
+            else if (sel.syncSuccess === false) initial[key] = { status: 'ERROR', message: sel.syncFailureResponse || undefined };
+        }));
         setSyncItemsStatus(prev => ({ ...initial, ...prev }));
     }, [syncPlan, selections, syncInProgress]);
 
-    // Effect to handle EventSource connection and cleanup
-    useEffect(() => {
-        return () => {
-            // Cleanup EventSource connection when component unmounts
-            if (eventSourceRef.current) {
-                eventSourceRef.current.close();
-                eventSourceRef.current = null;
-            }
-        };
-    }, []);
+    useEffect(() => () => { if (eventSourceRef.current) { eventSourceRef.current.close(); eventSourceRef.current = null; } }, []);
 
-    const isDevelopment = window.location.hostname === 'localhost' && window.location.port === '3000';
-
-    // Function to start the SSE connection for sync progress updates
-    const startSyncProgressSSE = (mergeRequestId: number) => {
-        // Close existing connection if any
-        if (eventSourceRef.current) {
-            eventSourceRef.current.close();
-            eventSourceRef.current = null;
+    const applyUpdate = (update: SyncProgressUpdate, eventSource: EventSource) => {
+        setSyncProgress(update);
+        const reserved = ['Starting synchronization', 'Processing content types', 'Content types processed', 'Synchronization completed', 'Synchronization failed'];
+        if (update.currentItem && !reserved.includes(update.currentItem)) {
+            const parts = update.currentItem.split(':');
+            const key = parts.length >= 2 ? `${parts[0]}:${parts.slice(1).join(':')}` : update.currentItem;
+            setSyncItemsStatus(prev => ({ ...prev, [key]: { status: update.status, message: update.message } }));
         }
+        if (update.status === 'SUCCESS' && update.currentOperation === 'COMPLETED') {
+            setSyncInProgress(false); setSyncCompleted(true); eventSource.close();
+        } else if (update.status === 'ERROR') {
+            setSyncInProgress(false); setSyncFailed(true); eventSource.close();
+        }
+    };
 
-        // Reset sync state
+    const startSyncProgressSSE = (mergeRequestId: number) => {
+        if (eventSourceRef.current) { eventSourceRef.current.close(); eventSourceRef.current = null; }
         setSyncProgress(null);
         setSyncInProgress(true);
         setSyncCompleted(false);
         setSyncFailed(false);
         setSyncItemsStatus({});
 
-        // Create new EventSource connection
-        let sseUrl = `/api/sync-progress/${mergeRequestId}`;
-        if(isDevelopment)
-            sseUrl = `http://localhost:8080${sseUrl}`;
-        const eventSource = new EventSource(sseUrl);
+        // Relative URL on purpose: in dev the Vite proxy forwards /api to the backend, in prod the
+        // backend serves the frontend. A hardcoded host:port here bypassed the proxy and silently
+        // broke all live progress (wrong port → EventSource never connected).
+        const eventSource = new EventSource(`/api/sync-progress/${mergeRequestId}`);
 
-        // Handle connection open
-        eventSource.onopen = () => {
-            console.log('SSE connection established');
-        };
-
-        // Handle connected event
-        eventSource.addEventListener('connected', (event) => {
-            console.log('SSE connected event received:', event);
-        });
-
-        // Handle default message events (Ktor SSE sends unnamed events by default)
         eventSource.onmessage = (event) => {
-            if (!event.data) return;
-            if (event.data === 'connected') return;
-            if (event.data === 'heartbeat') return;
-            console.log('SSE message received:', event);
-            try {
-                const update: SyncProgressUpdate = JSON.parse(event.data);
-                console.log('Received sync progress update (message):', update);
-
-                // Update sync progress state
-                setSyncProgress(update);
-
-                // Update item status (use composite key table:documentId)
-                if (update.currentItem && update.currentItem !== 'Starting synchronization' && 
-                    update.currentItem !== 'Processing content types' && 
-                    update.currentItem !== 'Content types processed' &&
-                    update.currentItem !== 'Synchronization completed' &&
-                    update.currentItem !== 'Synchronization failed') {
-                    // Expect format "table:documentId"
-                    const parts = update.currentItem.split(':');
-                    const key = parts.length >= 2 ? `${parts[0]}:${parts.slice(1).join(':')}` : update.currentItem;
-                    setSyncItemsStatus(prev => ({
-                        ...prev,
-                        [key]: {
-                            status: update.status,
-                            message: update.message
-                        }
-                    }));
-                }
-
-                // Handle completion or failure
-                if (update.status === 'SUCCESS' && update.currentOperation === 'COMPLETED') {
-                    setSyncInProgress(false);
-                    setSyncCompleted(true);
-
-                    // Close EventSource connection
-                    eventSource.close();
-                } else if (update.status === 'ERROR') {
-                    setSyncInProgress(false);
-                    setSyncFailed(true);
-
-                    // Close EventSource connection
-                    eventSource.close();
-                }
-            } catch (error) {
-                console.error('Error parsing SSE message:', error);
-            }
+            if (!event.data || event.data === 'connected' || event.data === 'heartbeat') return;
+            try { applyUpdate(JSON.parse(event.data) as SyncProgressUpdate, eventSource); }
+            catch (e) { console.error('Error parsing SSE message:', e); }
         };
-
-        // Backward compatibility: handle named 'progress' events if server uses them
-        eventSource.addEventListener('progress', (event) => {
-            try {
-                const update: SyncProgressUpdate = JSON.parse(event.data);
-                console.log('Received sync progress update (progress event):', update);
-
-                // Update sync progress state
-                setSyncProgress(update);
-
-                // Update item status (use composite key table:documentId)
-                if (update.currentItem && update.currentItem !== 'Starting synchronization' && 
-                    update.currentItem !== 'Processing content types' && 
-                    update.currentItem !== 'Content types processed' &&
-                    update.currentItem !== 'Synchronization completed' &&
-                    update.currentItem !== 'Synchronization failed') {
-                    // Expect format "table:documentId"
-                    const parts = update.currentItem.split(':');
-                    const key = parts.length >= 2 ? `${parts[0]}:${parts.slice(1).join(':')}` : update.currentItem;
-                    setSyncItemsStatus(prev => ({
-                        ...prev,
-                        [key]: {
-                            status: update.status,
-                            message: update.message
-                        }
-                    }));
-                }
-
-                // Handle completion or failure
-                if (update.status === 'SUCCESS' && update.currentOperation === 'COMPLETED') {
-                    setSyncInProgress(false);
-                    setSyncCompleted(true);
-
-                    // Close EventSource connection
-                    eventSource.close();
-                } else if (update.status === 'ERROR') {
-                    setSyncInProgress(false);
-                    setSyncFailed(true);
-
-                    // Close EventSource connection
-                    eventSource.close();
-                }
-            } catch (error) {
-                console.error('Error parsing SSE message:', error);
-            }
+        eventSource.addEventListener('progress', (event: MessageEvent) => {
+            try { applyUpdate(JSON.parse(event.data) as SyncProgressUpdate, eventSource); }
+            catch (e) { console.error('Error parsing SSE message:', e); }
         });
-
-        // Handle errors
-        eventSource.onerror = (error) => {
-            console.error('SSE error:', error);
-            setSyncInProgress(false);
-            setSyncFailed(true);
-
-            // Close EventSource connection
-            eventSource.close();
-        };
-
+        eventSource.onerror = () => { setSyncInProgress(false); setSyncFailed(true); eventSource.close(); };
         eventSourceRef.current = eventSource;
     };
 
-    // Function to handle the complete merge button click
-    const handleCompleteMerge = () => {
-        // Get merge request ID from the URL
-        const urlParts = window.location.pathname.split('/');
-        const mergeRequestId = parseInt(urlParts[urlParts.length - 1], 10);
-
-
-        if (!isNaN(mergeRequestId)) {
-            // Start SSE connection for progress updates
-            startSyncProgressSSE(mergeRequestId);
-
-            // Call the original completeMerge function
-            completeMerge();
-        } else {
-            console.error('Could not determine merge request ID from URL');
-
-            // Show error toast
-            toast.current?.show({
-                severity: 'error',
-                summary: 'Error',
-                detail: 'Could not determine merge request ID.',
-                life: 5000
-            });
-        }
+    const verifyDestination = () => {
+        const parts = window.location.pathname.split('/');
+        const mergeRequestId = parseInt(parts[parts.length - 1], 10);
+        if (isNaN(mergeRequestId)) return;
+        setVerifying(true);
+        setVerifyReport(null);
+        fetch(`/api/merge-requests/${mergeRequestId}/verify`, { method: 'POST' })
+            .then(res => res.json())
+            .then((r) => {
+                setVerifyReport(r);
+                const sev = r.inconsistent > 0 ? 'warn' : 'success';
+                toast.current?.show({
+                    severity: sev,
+                    summary: r.inconsistent > 0 ? `${r.inconsistent} real mismatch(es)` : 'Destination consistent',
+                    detail: `${r.consistent} ok · ${r.schemaGap} schema-gap · ${r.inconsistent} mismatch`,
+                    life: 6000,
+                });
+            })
+            .catch(() => toast.current?.show({ severity: 'error', summary: 'Verification failed', life: 5000 }))
+            .finally(() => setVerifying(false));
     };
 
-    // Function to find an entry in allMergeData based on contentType and documentId
-    const findEntry = (contentType: string, documentId: string) => {
+    const handleCompleteMerge = (opts?: { onlyFailed?: boolean }) => {
+        const parts = window.location.pathname.split('/');
+        const mergeRequestId = parseInt(parts[parts.length - 1], 10);
+        if (!isNaN(mergeRequestId)) { startSyncProgressSSE(mergeRequestId); completeMerge({ ...opts, rollbackOnFailure }); }
+        else toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Could not determine merge request ID.', life: 5000 });
+    };
+
+    // ---- entry lookups (unchanged logic) -----------------------------------
+    const findEntry = (contentType: string, documentId: string): any => {
         if (!allMergeData) return null;
-
-        // Handle file content type
         if (contentType === 'files') {
-            // Check ONLY_IN_SOURCE
-            const sourceFile = allMergeData.files.find(f => f.compareState === 'ONLY_IN_SOURCE' && f.sourceImage?.metadata.documentId === documentId)?.sourceImage;
-            if (sourceFile) return sourceFile;
-
-            // Check DIFFERENT
-            const diffEntry = allMergeData.files.find(f => f.compareState === 'DIFFERENT' && f.sourceImage?.metadata.documentId === documentId);
-            if (diffEntry?.sourceImage) return diffEntry.sourceImage;
-
-            // Check ONLY_IN_TARGET
-            const targetFile = allMergeData.files.find(f => f.compareState === 'ONLY_IN_TARGET' && f.targetImage?.metadata.documentId === documentId)?.targetImage;
-            if (targetFile) return targetFile;
-
+            const s = allMergeData.files.find(f => f.compareState === 'ONLY_IN_SOURCE' && f.sourceImage?.metadata.documentId === documentId)?.sourceImage;
+            if (s) return s;
+            const d = allMergeData.files.find(f => f.compareState === 'DIFFERENT' && f.sourceImage?.metadata.documentId === documentId);
+            if (d?.sourceImage) return d.sourceImage;
+            const t = allMergeData.files.find(f => f.compareState === 'ONLY_IN_TARGET' && f.targetImage?.metadata.documentId === documentId)?.targetImage;
+            if (t) return t;
             return null;
         }
-
-        // Handle single content types
         if (allMergeData.singleTypes[contentType]) {
-            const singleType = allMergeData.singleTypes[contentType];
-
-            if (singleType.sourceContent && singleType.sourceContent.metadata.documentId === documentId) {
-                return singleType.sourceContent.cleanData;
-            }
-            if (singleType.targetContent && singleType.targetContent.metadata.documentId === documentId) {
-                return singleType.targetContent.cleanData;
-            }
+            const st = allMergeData.singleTypes[contentType];
+            if (st.sourceContent && st.sourceContent.metadata.documentId === documentId) return st.sourceContent.cleanData;
+            if (st.targetContent && st.targetContent.metadata.documentId === documentId) return st.targetContent.cleanData;
             return null;
         }
-
-        // Handle collection content types (list-based)
         if (allMergeData.collectionTypes[contentType]) {
             const entries = allMergeData.collectionTypes[contentType];
-
-            // ONLY_IN_SOURCE -> return source
             const src = entries.find(e => e.compareState === 'ONLY_IN_SOURCE' && e.sourceContent?.metadata.documentId === documentId)?.sourceContent;
             if (src) return src.cleanData;
-
-            // DIFFERENT -> return source
             const diff = entries.find(e => e.compareState === 'DIFFERENT' && e.sourceContent?.metadata.documentId === documentId)?.sourceContent;
             if (diff) return diff.cleanData;
-
-            // ONLY_IN_TARGET -> return target
             const tgt = entries.find(e => e.compareState === 'ONLY_IN_TARGET' && e.targetContent?.metadata.documentId === documentId)?.targetContent;
             if (tgt) return tgt.cleanData;
-
-            // IDENTICAL -> return either
             const ident = entries.find(e => e.compareState === 'IDENTICAL' && ((e.sourceContent && e.sourceContent.metadata.documentId === documentId) || (e.targetContent && e.targetContent.metadata.documentId === documentId)));
             if (ident) return ident.sourceContent?.cleanData ?? ident.targetContent?.cleanData;
-
             return null;
         }
-
         return null;
     };
 
-    // Function to find status info for a document
-    const findStatusInfo = (contentType: string, documentId: string, operation: 'create' | 'update' | 'delete'): MergeRequestSelection | undefined => {
-        const dto = selections.find(s => s.tableName === contentType);
-        if (!dto) return undefined;
-        const dir = operation === 'create' ? 'TO_CREATE' : operation === 'update' ? 'TO_UPDATE' : 'TO_DELETE';
-        return (dto.selections || []).find(s => s.documentId === documentId && s.direction === dir);
-    };
-
-    // Function to render status badge
-    const renderStatusBadge = (status: MergeRequestSelection | undefined, contentType: string, documentId: string) => {
-        // Check if we have live status from SSE (composite key table:documentId)
-        const liveStatus = syncItemsStatus[`${contentType}:${documentId}`];
-
-        if (liveStatus) {
-            if (liveStatus.status === 'SUCCESS') {
-                return <Tag severity="success" value="Success" />;
-            } else if (liveStatus.status === 'ERROR') {
-                return (
-                    <div className="flex align-items-center">
-                        <Tag 
-                            className={`failed-tag-${documentId}`}
-                            severity="danger" 
-                            value="Failed" 
-                            data-pr-tooltip={liveStatus.message || "Unknown error"}
-                        />
-                        <Tooltip target={`.failed-tag-${documentId}`} position="top" />
-                    </div>
-                );
-            } else if (liveStatus.status === 'IN_PROGRESS') {
-                return (
-                    <div className="flex align-items-center">
-                        <i className="pi pi-spin pi-spinner mr-2"></i>
-                        <Tag severity="info" value="Processing" />
-                    </div>
-                );
-            }
-        }
-
-        // Fall back to original status if no live status
-        if (!status || status.syncSuccess === null) {
-            return <Tag severity="info" value="Pending" />;
-        }
-
-        if (status.syncSuccess) {
-            return <Tag severity="success" value="Success" />;
-        } else {
-            return (
-                <div className="flex align-items-center">
-                    <Tag 
-                        className={`failed-tag-${documentId}`}
-                        severity="danger" 
-                        value="Failed" 
-                        data-pr-tooltip={status.syncFailureResponse || "Unknown error"}
-                    />
-                    <Tooltip target={`.failed-tag-${documentId}`} position="top" />
-                </div>
-            );
-        }
-    };
-
-    // Function to render representative attributes or images for an entry
-    const renderRepresentativeContent = (contentType: string, documentId: string, operation: 'create' | 'update' | 'delete') => {
-        const entry = findEntry(contentType, documentId);
-
-        if (!entry) {
-            return (
-                <div className="flex align-items-center justify-content-between">
-                    <span className="font-medium">{documentId}</span>
-                </div>
-            );
-        }
-
-        // Check if this is an update entry
-        const { isUpdate, source, target } = isUpdateEntry(contentType, documentId);
-
-        // Handle file content type (show image)
+    const isUpdateEntry = (contentType: string, documentId: string): { isUpdate: boolean, source: any, target: any } => {
+        if (!allMergeData) return { isUpdate: false, source: null, target: null };
         if (contentType === 'files') {
-            // Type guard to check if metadata has url and name properties (StrapiImageMetadata)
-            const hasImageProperties = 'url' in entry.metadata && 'name' in entry.metadata;
-
-            return (
-                <div className="flex align-items-center justify-content-between">
-                    <div className="flex align-items-center">
-                        {hasImageProperties ? (
-                            <>
-                                <img 
-                                    src={(entry.metadata as any).url} 
-                                    alt={(entry.metadata as any).name || 'Image'} 
-                                    style={{ maxWidth: '50px', maxHeight: '50px', objectFit: 'contain', marginRight: '10px' }}
-                                />
-                                <span className="font-medium">{(entry.metadata as any).name || documentId}</span>
-                            </>
-                        ) : (
-                            <span className="font-medium">{documentId}</span>
-                        )}
-                    </div>
-                </div>
-            );
+            const d = allMergeData.files.find(f => f.compareState === 'DIFFERENT' && f.sourceImage?.metadata.documentId === documentId);
+            if (d && d.sourceImage && d.targetImage) return { isUpdate: true, source: d.sourceImage, target: d.targetImage };
         }
-
-        // Handle other content types (show representative attributes)
-        const attributes = getRepresentativeAttributes(entry as StrapiContent);
-
-        if (attributes.length === 0) {
-            return (
-                <div className="flex align-items-center justify-content-between">
-                    <span className="font-medium">{documentId}</span>
-                </div>
-            );
+        if (allMergeData.singleTypes[contentType]) {
+            const st = allMergeData.singleTypes[contentType];
+            if (st.compareState === 'DIFFERENT' && st.sourceContent && st.targetContent && st.sourceContent.metadata.documentId === documentId)
+                return { isUpdate: true, source: st.sourceContent.cleanData, target: st.targetContent.cleanData };
         }
-
-        return (
-            <div className="flex align-items-start justify-content-between">
-                <div>
-                    {attributes.map((attr, index) => (
-                        <div key={index} className="mb-1">
-                            <span className="font-bold">{attr.key}: </span>
-                            <span>{attr.value}</span>
-                        </div>
-                    ))}
-                </div>
-            </div>
-        );
+        if (allMergeData.collectionTypes[contentType]) {
+            const d = allMergeData.collectionTypes[contentType].find(e => e.compareState === 'DIFFERENT' && e.sourceContent?.metadata.documentId === documentId);
+            if (d && d.sourceContent && d.targetContent) return { isUpdate: true, source: d.sourceContent.cleanData, target: d.targetContent.cleanData };
+        }
+        return { isUpdate: false, source: null, target: null };
     };
 
-    // Function to open the editor dialog
-    const openEditorDialog = (
-        content: any,
-        isDiff: boolean = false,
-        source: any = null,
-        target: any = null,
-        header: string = "View Content",
-        tableName?: string,
-        documentId?: string
-    ) => {
-        const urlParts = window.location.pathname.split('/');
-        const last = urlParts[urlParts.length - 1];
-        const mergeRequestId = parseInt(last, 10);
+    // Single-line human label for an item.
+    const itemLabel = (contentType: string, documentId: string): string => {
+        const entry = findEntry(contentType, documentId);
+        if (!entry) return documentId;
+        if (contentType === 'files') {
+            const meta: any = entry.metadata;
+            return (meta && 'name' in meta && meta.name) ? meta.name : documentId;
+        }
+        const attrs = getRepresentativeAttributes(entry as StrapiContent);
+        if (attrs.length > 0) {
+            const v = attrs[0].value;
+            if (v != null && v !== '') return String(v);
+        }
+        // Fallback: the representative attributes only look at top-level primitives; many entries
+        // (relation-/component-only) have their text nested. Search recursively for a readable label.
+        const deep = deepLabel(entry);
+        return deep || documentId;
+    };
 
+    const fileThumbUrl = (contentType: string, documentId: string): string | null => {
+        if (contentType !== 'files') return null;
+        const entry: any = findEntry(contentType, documentId);
+        const meta = entry?.metadata;
+        return meta && 'url' in meta && /^image\//.test(meta.mime || '') ? meta.url : null;
+    };
+
+    const openEditorDialog = (content: any, isDiff: boolean, source: any, target: any, header: string, tableName?: string, documentId?: string) => {
+        const parts = window.location.pathname.split('/');
+        const mergeRequestId = parseInt(parts[parts.length - 1], 10);
         if (!isNaN(mergeRequestId) && documentId) {
             fetch(`/api/merge-requests/${mergeRequestId}/logs?identifier=${documentId}`)
-                .then(res => res.json())
-                .then(data => setHttpLogs(data))
-                .catch(err => console.error("Error fetching logs", err));
-        } else {
-            setHttpLogs(undefined);
-        }
+                .then(res => res.json()).then(d => setHttpLogs(d)).catch(err => console.error('Error fetching logs', err));
+        } else setHttpLogs(undefined);
 
         if (isDiff) {
-            setIsDiffEditor(true);
-            setOriginalContent(source);
-            setModifiedContent(target);
-            setEditorErrorMessage(undefined);
+            setIsDiffEditor(true); setOriginalContent(source); setModifiedContent(target); setEditorErrorMessage(undefined);
         } else {
-            setIsDiffEditor(false);
-            setEditorContent(content);
-            // compute error message from live status or stored selection failure
+            setIsDiffEditor(false); setEditorContent(content);
             if (tableName && documentId) {
-                const key = `${tableName}:${documentId}`;
-                const live = syncItemsStatus[key];
-                let err: string | undefined = undefined;
-                if (live && live.status === 'ERROR') {
-                    err = live.message || 'Unknown error';
-                } else {
+                const live = syncItemsStatus[`${tableName}:${documentId}`];
+                let err: string | undefined;
+                if (live && live.status === 'ERROR') err = live.message || 'Unknown error';
+                else {
                     const dto = selections.find(s => s.tableName === tableName);
                     const sel = dto?.selections?.find(s => s.documentId === documentId && s.syncSuccess === false);
                     if (sel && sel.syncFailureResponse) err = sel.syncFailureResponse;
                 }
                 setEditorErrorMessage(err);
-            } else {
-                setEditorErrorMessage(undefined);
-            }
+            } else setEditorErrorMessage(undefined);
         }
         setEditorDialogHeader(header);
         setEditorDialogVisible(true);
-    };
-
-    // Function to determine if an entry is an update (has both source and target)
-    const isUpdateEntry = (contentType: string, documentId: string): { isUpdate: boolean, source: any, target: any } => {
-        if (!allMergeData) return { isUpdate: false, source: null, target: null };
-
-        // Handle file content type
-        if (contentType === 'files') {
-            const diffEntry = allMergeData.files.find(f => f.compareState === 'DIFFERENT' && f.sourceImage?.metadata.documentId === documentId);
-            if (diffEntry && diffEntry.sourceImage && diffEntry.targetImage) return { isUpdate: true, source: diffEntry.sourceImage, target: diffEntry.targetImage };
-        }
-
-        // Handle single content types
-        if (allMergeData.singleTypes[contentType]) {
-            const singleType = allMergeData.singleTypes[contentType];
-            if (singleType.compareState === 'DIFFERENT' && singleType.sourceContent && singleType.targetContent && singleType.sourceContent.metadata.documentId === documentId) {
-                return { isUpdate: true, source: singleType.sourceContent.cleanData, target: singleType.targetContent.cleanData};
-            }
-        }
-
-        // Handle collection content types (list-based)
-        if (allMergeData.collectionTypes[contentType]) {
-            const entries = allMergeData.collectionTypes[contentType];
-            const diffEntry = entries.find(e => e.compareState === 'DIFFERENT' && e.sourceContent?.metadata.documentId === documentId);
-            if (diffEntry && diffEntry.sourceContent && diffEntry.targetContent) return { isUpdate: true, source: diffEntry.sourceContent.cleanData, target: diffEntry.targetContent.cleanData };
-        }
-
-        return { isUpdate: false, source: null, target: null };
-    };
-
-    // Prepare data for DataTable
-    const prepareItemsForDataTable = () => {
-        const items: any[] = [];
-
-        selections.forEach(dto => {
-            (dto.selections || []).forEach(sel => {
-                const operation = sel.direction === 'TO_CREATE' ? 'create' : sel.direction === 'TO_UPDATE' ? 'update' : 'delete';
-                items.push({
-                    contentType: dto.tableName,
-                    documentId: sel.documentId,
-                    operation,
-                    statusInfo: findStatusInfo(dto.tableName, sel.documentId, operation)
-                });
-            });
-        });
-
-        return items;
-    };
-
-    const allItems = prepareItemsForDataTable();
-    const createItems = allItems.filter(item => item.operation === 'create');
-    const updateItems = allItems.filter(item => item.operation === 'update');
-    const deleteItems = allItems.filter(item => item.operation === 'delete');
-
-    // Function to render operation icon
-    const renderOperationIcon = (operation: string) => {
-        switch (operation) {
-            case 'create':
-                return <i className="pi pi-plus-circle text-success mr-2"></i>;
-            case 'update':
-                return <i className="pi pi-sync text-warning mr-2"></i>;
-            case 'delete':
-                return <i className="pi pi-trash text-danger mr-2"></i>;
-            default:
-                return null;
-        }
-    };
-
-    // Function to render operation badge
-    const renderOperationBadge = (operation: string) => {
-        switch (operation) {
-            case 'create':
-                return <Tag severity="success" value="Create" />;
-            case 'update':
-                return <Tag severity="warning" value="Update" />;
-            case 'delete':
-                return <Tag severity="danger" value="Delete" />;
-            default:
-                return null;
-        }
-    };
-
-    // Function to render content
-    const renderContent = (rowData: any) => {
-        return renderRepresentativeContent(rowData.contentType, rowData.documentId, rowData.operation as 'create' | 'update' | 'delete');
-    };
-
-    // Function to render status
-    const renderStatus = (rowData: any) => {
-        return renderStatusBadge(rowData.statusInfo, rowData.contentType, rowData.documentId);
-    };
-
-    // Function to render view button
-    const renderViewButton = (rowData: any) => {
-        const entry = findEntry(rowData.contentType, rowData.documentId);
-        if (!entry) return null;
-
-        const { isUpdate, source, target } = isUpdateEntry(rowData.contentType, rowData.documentId);
-
-        return (
-            <Button
-                icon="pi pi-eye"
-                className="p-button-text p-button-sm"
-                tooltip="View Details"
-                onClick={() => {
-                    if (isUpdate) {
-                        openEditorDialog(null, true, source, target, "View Differences", rowData.contentType, rowData.documentId);
-                    } else {
-                        openEditorDialog(entry, false, null, null, "View Content", rowData.contentType, rowData.documentId);
-                    }
-                }}
-            />
-        );
     };
 
     const inspectItem = (tableName: string, documentId: string) => {
         const entry = findEntry(tableName, documentId);
         if (!entry) return;
         const diff = isUpdateEntry(tableName, documentId);
-        if (diff.isUpdate) {
-            openEditorDialog(null, true, diff.source, diff.target, 'View Differences', tableName, documentId);
-        } else {
-            openEditorDialog(entry, false, null, null, 'View Content', tableName, documentId);
-        }
+        if (diff.isUpdate) openEditorDialog(null, true, diff.source, diff.target, 'View differences', tableName, documentId);
+        else openEditorDialog(entry, false, null, null, 'View content', tableName, documentId);
     };
 
+    // ---- derived: items + status -------------------------------------------
+    const allItems: ReviewItem[] = useMemo(() => {
+        const items: ReviewItem[] = [];
+        selections.forEach(dto => (dto.selections || []).forEach(sel => {
+            const operation: Operation = sel.direction === 'TO_CREATE' ? 'create' : sel.direction === 'TO_UPDATE' ? 'update' : 'delete';
+            items.push({ contentType: dto.tableName, documentId: sel.documentId, operation, statusInfo: sel });
+        }));
+        return items;
+    }, [selections]);
+
+    const effStatus = (it: ReviewItem): EffStatus => {
+        const live = syncItemsStatus[`${it.contentType}:${it.documentId}`];
+        if (live) {
+            if (live.status === 'SUCCESS') return 'success';
+            if (live.status === 'ERROR') return 'failed';
+            if (live.status === 'IN_PROGRESS') return 'processing';
+        }
+        if (it.statusInfo && it.statusInfo.syncSuccess === true) return 'success';
+        if (it.statusInfo && it.statusInfo.syncSuccess === false) return 'failed';
+        return 'pending';
+    };
+
+    const statusMessage = (it: ReviewItem): string | undefined => {
+        const live = syncItemsStatus[`${it.contentType}:${it.documentId}`];
+        if (live && live.status === 'ERROR') return live.message || 'Unknown error';
+        return it.statusInfo?.syncFailureResponse || undefined;
+    };
+
+    const statusCounts = useMemo(() => {
+        const c = { success: 0, failed: 0, processing: 0, pending: 0 } as Record<EffStatus, number>;
+        allItems.forEach(it => { c[effStatus(it)]++; });
+        return c;
+    }, [allItems, syncItemsStatus]);
+
+    const anyRunData = statusCounts.success + statusCounts.failed + statusCounts.processing > 0;
+
+    // ---- filtering + grouping ----------------------------------------------
+    const filtered = useMemo(() => {
+        const q = query.trim().toLowerCase();
+        return allItems.filter(it => {
+            if (!opFilter.has(it.operation)) return false;
+            if (statusFilter !== 'all' && effStatus(it) !== statusFilter) return false;
+            if (q) {
+                const hay = `${shortType(it.contentType)} ${itemLabel(it.contentType, it.documentId)} ${it.documentId}`.toLowerCase();
+                if (!hay.includes(q)) return false;
+            }
+            return true;
+        });
+    }, [allItems, opFilter, statusFilter, query, syncItemsStatus]);
+
+    const groups = useMemo(() => {
+        const m = new Map<string, ReviewItem[]>();
+        filtered.forEach(it => { const a = m.get(it.contentType) || []; a.push(it); m.set(it.contentType, a); });
+        return Array.from(m.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+    }, [filtered]);
+
+    const toggleOp = (op: Operation) => setOpFilter(prev => {
+        const n = new Set(prev);
+        if (n.has(op)) n.delete(op); else n.add(op);
+        if (n.size === 0) return new Set(['create', 'update', 'delete']);
+        return n;
+    });
+    const toggleGroup = (ct: string) => setCollapsed(prev => { const n = new Set(prev); n.has(ct) ? n.delete(ct) : n.add(ct); return n; });
+
+    // ---- small render helpers ----------------------------------------------
+    const opDot = (op: Operation) => <span className={`ss-state-dot ${op === 'create' ? 'add' : op === 'update' ? 'upd' : 'del'}`} />;
+    const opLabel = (op: Operation) => op === 'create' ? 'Create' : op === 'update' ? 'Update' : 'Delete';
+
+    const statusChip = (it: ReviewItem) => {
+        const es = effStatus(it);
+        if (es === 'success') return <span className="ss-badge success">OK</span>;
+        if (es === 'processing') return <span className="ss-badge info"><i className="pi pi-spin pi-spinner" style={{ fontSize: 9, marginRight: 4 }} />Running</span>;
+        if (es === 'failed') return <span className="ss-badge danger" title={statusMessage(it) || 'Failed'}>Failed</span>;
+        return <span className="ss-dim" style={{ fontSize: 11 }}>pending</span>;
+    };
+
+    const Pill: React.FC<{ op: Operation; n: number }> = ({ op, n }) => {
+        const cls = op === 'create' ? 'add' : op === 'update' ? 'upd' : 'del';
+        return (
+            <button className={`ss-pill ${cls}${opFilter.has(op) ? ' active' : ''}`} onClick={() => toggleOp(op)}>
+                {opLabel(op)} {n}
+            </button>
+        );
+    };
+
+    const pct = syncProgress && syncProgress.totalItems > 0
+        ? Math.round((syncProgress.processedItems / syncProgress.totalItems) * 100) : 0;
+
+    const runnable = ['MERGED_COLLECTIONS', 'FAILED', 'IN_PROGRESS', 'REVIEW'].includes(status);
+    const completed = status === 'COMPLETED';
+
+    if (totalItems === 0) {
+        return (
+            <div className="ss-review">
+                <div className="ss-empty">
+                    <i className="pi pi-inbox" aria-hidden="true" />
+                    No items selected for synchronization.<br />
+                    <span className="ss-dim" style={{ fontSize: 12 }}>Go back to the changes step and pick what to sync.</span>
+                </div>
+                <Toast ref={toast} position="top-right" />
+            </div>
+        );
+    }
+
     return (
-        <div>
-            <h3>Complete Merge</h3>
-            <p>
-                This step completes the merge process and finalizes the synchronization between the source and target
-                instances.
-            </p>
+        <div className="ss-review">
+            {/* Toolbar: search + operation filters + plan toggle */}
+            <div className="ss-review-toolbar">
+                <div className="ss-search" style={{ width: 200 }}>
+                    <i className="pi pi-search" aria-hidden="true" />
+                    <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search items…" />
+                </div>
+                <Pill op="create" n={totalToCreate} />
+                <Pill op="update" n={totalToUpdate} />
+                <Pill op="delete" n={totalToDelete} />
 
-            <h4>Merge Summary</h4>
-            <p>The following items will be synchronized between the source and target instances:</p>
+                {anyRunData && (
+                    <>
+                        <span style={{ width: 1, height: 18, background: 'var(--ss-border)', margin: '0 2px' }} />
+                        <button className={`ss-pill${statusFilter === 'all' ? ' active' : ''}`} onClick={() => setStatusFilter('all')}>All</button>
+                        {statusCounts.success > 0 && <button className={`ss-pill${statusFilter === 'success' ? ' active' : ''}`} onClick={() => setStatusFilter('success')}><i className="pi pi-check" style={{ fontSize: 10, color: 'var(--ss-green)' }} /> {statusCounts.success}</button>}
+                        {statusCounts.failed > 0 && <button className={`ss-pill${statusFilter === 'failed' ? ' active' : ''}`} onClick={() => setStatusFilter('failed')}><i className="pi pi-times" style={{ fontSize: 10, color: 'var(--ss-red)' }} /> {statusCounts.failed}</button>}
+                    </>
+                )}
 
-            <div className="flex justify-content-between mb-3">
-                <div className="flex align-items-center">
-                    <i className="pi pi-plus-circle text-success mr-2" style={{fontSize: '1.5rem'}}></i>
-                    <span><strong>{totalToCreate}</strong> items to create</span>
-                </div>
-                <div className="flex align-items-center">
-                    <i className="pi pi-sync text-warning mr-2" style={{fontSize: '1.5rem'}}></i>
-                    <span><strong>{totalToUpdate}</strong> items to update</span>
-                </div>
-                <div className="flex align-items-center">
-                    <i className="pi pi-trash text-danger mr-2" style={{fontSize: '1.5rem'}}></i>
-                    <span><strong>{totalToDelete}</strong> items to delete</span>
-                </div>
+                <span style={{ marginLeft: 'auto' }} />
+                <button className={`ss-btn subtle${showPlan ? ' active' : ''}`} onClick={() => setShowPlan(v => !v)}>
+                    <i className={`pi ${showPlan ? 'pi-chevron-up' : 'pi-sitemap'}`} aria-hidden="true" /> Execution order
+                </button>
             </div>
 
-            {totalItems === 0 && (
-                <Message severity="info" text="No items selected for synchronization." className="w-full mb-3"/>
-            )}
-
-            {/* Execution Plan (batches with live status) */}
-            <TabView>
-                <TabPanel header="Graph">
-            <Card className="mb-4">
-                <div className="flex align-items-center justify-content-between mb-3">
-                    <h4 className="m-0">Execution Plan</h4>
-                    <div className="flex gap-2">
-                        <Button label="Recompute Plan" icon="pi pi-refresh" className="p-button-text" onClick={loadPlan} disabled={planLoading} />
-                    </div>
-                </div>
-                {planLoading && (
-                    <Message severity="info" text="Loading sync plan..." className="w-full mb-3" />
-                )}
-                {planError && (
-                    <Message severity="error" text={planError} className="w-full mb-3" />
-                )}
-                {!planLoading && !planError && syncPlan && (
-                    <div>
-                        {syncPlan.batches.length === 0 ? (
-                            <Message severity="info" text="No content dependencies to resolve. Items will be processed directly." className="w-full" />
-                        ) : (
-                            <div>
-                                <p className="text-600 mb-3">The graph groups items by table. Each table has a single container listing its selected items; item colors indicate the operation (create/update/delete), and the icon next to each id shows the live status. Arrows represent dependencies; dashed arrows indicate circular dependencies handled in a second pass.</p>
-                                <SyncPlanGraph syncPlan={syncPlan} syncItemsStatus={syncItemsStatus} onInspect={inspectItem} />
-                            </div>
-                        )}
-
-                        {syncPlan.missingDependencies.length > 0 && (
-                            <div className="mt-3">
-                                <Message severity="warn" text="Some items have missing dependencies. They may fail during synchronization." className="w-full mb-2" />
-                                <ul className="pl-3">
-                                    {syncPlan.missingDependencies.map((m, midx) => (
-                                        <li key={midx} className="mb-1">
-                                            <span className="font-medium">{m.fromTable}:{m.fromDocumentId}</span>
-                                            <span className="ml-2">requires</span>
-                                            <Tag value={`${m.linkTargetTable}.${m.linkField}`} className="ml-2 mr-2" />
-                                            <span>- {m.reason}</span>
-                                        </li>
-                                    ))}
-                                </ul>
-                            </div>
-                        )}
-
-                        {syncPlan.circularEdges.length > 0 && (
-                            <div className="mt-3">
-                                <Message severity="info" text="Detected circular dependencies. These are handled with a second pass when possible." className="w-full mb-2" />
-                                <ul className="pl-3">
-                                    {syncPlan.circularEdges.map((c, cidx) => (
-                                        <li key={cidx} className="mb-1">
-                                            <span className="font-medium">{c.fromTable}:{c.fromDocumentId}</span>
-                                            <i className="pi pi-arrow-right mx-2"></i>
-                                            <span className="font-medium">{c.toTable}:{c.toDocumentId}</span>
-                                            <Tag value={`via ${c.viaField}`} className="ml-2" />
-                                        </li>
-                                    ))}
-                                </ul>
-                            </div>
-                        )}
-                    </div>
-                )}
-            </Card>
-                </TabPanel>
-
-
-                <TabPanel header="Data">
-            {totalItems > 0 && (
-                <Card>
-                    <TabView>
-                        <TabPanel header={`All Items (${totalItems})`}>
-                            <DataTable 
-                                value={allItems}
-                                paginator 
-                                rows={10} 
-                                rowsPerPageOptions={[5, 10, 25, 50]}
-                                sortField="contentType"
-                                sortOrder={1}
-                                filterDisplay="row"
-                                emptyMessage="No items selected for synchronization."
-                                className="p-datatable-sm"
-                            >
-                                <Column 
-                                    field="contentType" 
-                                    header="Content Type" 
-                                    sortable 
-                                    filter 
-                                    filterPlaceholder="Search by content type"
-                                    style={{ width: '20%' }}
-                                />
-                                <Column 
-                                    field="operation" 
-                                    header="Operation" 
-                                    sortable 
-                                    filter 
-                                    filterPlaceholder="Search by operation"
-                                    style={{ width: '10%' }}
-                                    body={rowData => renderOperationBadge(rowData.operation)}
-                                />
-                                <Column 
-                                    header="Content"
-                                    body={renderContent}
-                                    style={{ width: '50%' }}
-                                />
-                                <Column 
-                                    header="Status" 
-                                    body={renderStatus}
-                                    style={{ width: '10%' }}
-                                />
-                                <Column 
-                                    header="Actions" 
-                                    body={renderViewButton}
-                                    style={{ width: '10%' }}
-                                />
-                            </DataTable>
-                        </TabPanel>
-
-                        <TabPanel header={`Create (${totalToCreate})`}>
-                            <DataTable 
-                                value={createItems}
-                                paginator 
-                                rows={10} 
-                                rowsPerPageOptions={[5, 10, 25, 50]}
-                                sortField="contentType"
-                                sortOrder={1}
-                                filterDisplay="row"
-                                emptyMessage="No items to create."
-                                className="p-datatable-sm"
-                            >
-                                <Column 
-                                    field="contentType" 
-                                    header="Content Type" 
-                                    sortable 
-                                    filter 
-                                    filterPlaceholder="Search by content type"
-                                    style={{ width: '20%' }}
-                                />
-                                <Column 
-                                    header="Content"
-                                    body={renderContent}
-                                    style={{ width: '60%' }}
-                                />
-                                <Column 
-                                    header="Status" 
-                                    body={renderStatus}
-                                    style={{ width: '10%' }}
-                                />
-                                <Column 
-                                    header="Actions" 
-                                    body={renderViewButton}
-                                    style={{ width: '10%' }}
-                                />
-                            </DataTable>
-                        </TabPanel>
-
-                        <TabPanel header={`Update (${totalToUpdate})`}>
-                            <DataTable 
-                                value={updateItems}
-                                paginator 
-                                rows={10} 
-                                rowsPerPageOptions={[5, 10, 25, 50]}
-                                sortField="contentType"
-                                sortOrder={1}
-                                filterDisplay="row"
-                                emptyMessage="No items to update."
-                                className="p-datatable-sm"
-                            >
-                                <Column 
-                                    field="contentType" 
-                                    header="Content Type" 
-                                    sortable 
-                                    filter 
-                                    filterPlaceholder="Search by content type"
-                                    style={{ width: '20%' }}
-                                />
-                                <Column 
-                                    header="Content" 
-                                    body={renderContent}
-                                    style={{ width: '60%' }}
-                                />
-                                <Column 
-                                    header="Status" 
-                                    body={renderStatus}
-                                    style={{ width: '10%' }}
-                                />
-                                <Column 
-                                    header="Actions" 
-                                    body={renderViewButton}
-                                    style={{ width: '10%' }}
-                                />
-                            </DataTable>
-                        </TabPanel>
-
-                        <TabPanel header={`Delete (${totalToDelete})`}>
-                            <DataTable 
-                                value={deleteItems}
-                                paginator 
-                                rows={10} 
-                                rowsPerPageOptions={[5, 10, 25, 50]}
-                                sortField="contentType"
-                                sortOrder={1}
-                                filterDisplay="row"
-                                emptyMessage="No items to delete."
-                                className="p-datatable-sm"
-                            >
-                                <Column 
-                                    field="contentType" 
-                                    header="Content Type" 
-                                    sortable 
-                                    filter 
-                                    filterPlaceholder="Search by content type"
-                                    style={{ width: '20%' }}
-                                />
-                                <Column 
-                                    header="Content" 
-                                    body={renderContent}
-                                    style={{ width: '60%' }}
-                                />
-                                <Column 
-                                    header="Status" 
-                                    body={renderStatus}
-                                    style={{ width: '10%' }}
-                                />
-                                <Column 
-                                    header="Actions" 
-                                    body={renderViewButton}
-                                    style={{ width: '10%' }}
-                                />
-                            </DataTable>
-                        </TabPanel>
-                    </TabView>
-                </Card>
-            )}
-                </TabPanel>
-            </TabView>
-
-            {/* Sync Progress Section */}
+            {/* Live progress strip — visible as soon as the run starts, even before the first event */}
             {(syncInProgress || syncCompleted || syncFailed) && (
-                <div className="my-4 p-3 border-1 border-round surface-border">
-                    <h4 className="mb-3">Synchronization Progress</h4>
+                <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--ss-border)', background: 'var(--ss-surface-2)' }}>
+                    <div className="ss-card-row" style={{ justifyContent: 'space-between', marginBottom: 6 }}>
+                        <span style={{ fontSize: 12, color: 'var(--ss-text-2)' }}>
+                            <i className={`pi ${syncInProgress ? 'pi-spin pi-spinner' : syncCompleted ? 'pi-check-circle' : 'pi-times-circle'}`}
+                               style={{ marginRight: 6, color: syncCompleted ? 'var(--ss-green)' : syncFailed ? 'var(--ss-red)' : 'var(--ss-info)' }} />
+                            {syncProgress
+                                ? <>{syncProgress.processedItems} / {syncProgress.totalItems} processed{syncProgress.currentItem && syncInProgress && <span className="ss-dim"> · {syncProgress.currentItem}</span>}</>
+                                : (syncInProgress ? 'Starting synchronization…' : syncFailed ? 'Synchronization failed' : 'Done')}
+                        </span>
+                        {syncProgress && <span style={{ fontSize: 12, color: 'var(--ss-text-2)' }}>{pct}%</span>}
+                    </div>
+                    <div style={{ height: 6, borderRadius: 999, background: 'var(--ss-surface-3)', overflow: 'hidden' }}>
+                        <div style={{ width: syncProgress ? `${pct}%` : '15%', height: '100%', background: syncFailed ? 'var(--ss-red)' : 'var(--ss-accent)', transition: 'width .25s', opacity: syncProgress ? 1 : 0.5 }} />
+                    </div>
+                    {syncProgress?.message && syncFailed && (
+                        <div style={{ marginTop: 8, fontSize: 12, color: 'var(--ss-red)' }}>{syncProgress.message}</div>
+                    )}
+                </div>
+            )}
 
-                    {syncProgress && (
-                        <div className="mb-3">
-                            <div className="flex justify-content-between align-items-center mb-2">
-                                <span className="font-medium">
-                                    {syncProgress.processedItems} of {syncProgress.totalItems} items processed
-                                </span>
-                                <span className="font-medium">
-                                    {Math.round((syncProgress.processedItems / syncProgress.totalItems) * 100)}%
-                                </span>
-                            </div>
-                            <ProgressBar 
-                                value={Math.round((syncProgress.processedItems / syncProgress.totalItems) * 100)} 
-                                showValue={false}
-                                className="mb-2"
-                            />
+            {/* Execution plan (collapsible) */}
+            {showPlan && (
+                <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--ss-border)', background: 'var(--ss-surface-2)' }}>
+                    <div className="ss-card-row" style={{ justifyContent: 'space-between', marginBottom: 8 }}>
+                        <span style={{ fontSize: 12, color: 'var(--ss-text-2)' }}>Items are processed in dependency order. Dashed arrows = circular dependencies handled in a second pass.</span>
+                        <button className="ss-btn subtle" onClick={loadPlan} disabled={planLoading}>
+                            <i className="pi pi-refresh" aria-hidden="true" /> {planLoading ? 'Loading…' : 'Recompute'}
+                        </button>
+                    </div>
+                    {planError && <div style={{ fontSize: 12, color: 'var(--ss-red)' }}>{planError}</div>}
+                    {!planLoading && !planError && syncPlan && (syncPlan.batches.length === 0
+                        ? <div className="ss-dim" style={{ fontSize: 12 }}>No dependencies to resolve — items are processed directly.</div>
+                        : <SyncPlanGraph syncPlan={syncPlan} syncItemsStatus={syncItemsStatus} onInspect={inspectItem} labelFor={itemLabel} />)}
 
-                            <div className="p-2 border-1 border-round surface-border mb-3">
-                                <div className="flex align-items-center">
-                                    <i className={`pi ${syncProgress.status === 'IN_PROGRESS' ? 'pi-spin pi-spinner' : syncProgress.status === 'SUCCESS' ? 'pi-check-circle text-success' : 'pi-times-circle text-danger'} mr-2`}></i>
-                                    <span className="font-medium">{syncProgress.currentItem}</span>
-                                </div>
-                                {syncProgress.message && (
-                                    <div className="mt-2 p-2 bg-red-50 text-red-700 border-round">
-                                        {syncProgress.message}
-                                    </div>
-                                )}
-                            </div>
+                    {syncPlan && syncPlan.missingDependencies.length > 0 && (
+                        <div style={{ marginTop: 10 }}>
+                            <span className="ss-chip warn"><i className="pi pi-exclamation-triangle" /> {syncPlan.missingDependencies.length} missing dependencies</span>
+                            <ul style={{ margin: '6px 0 0', paddingLeft: 18, fontSize: 12, color: 'var(--ss-text-2)' }}>
+                                {syncPlan.missingDependencies.map((m, i) => (
+                                    <li key={i}>{shortType(m.fromTable)}:{m.fromDocumentId} requires <code>{shortType(m.linkTargetTable)}.{m.linkField}</code> — {m.reason}</li>
+                                ))}
+                            </ul>
                         </div>
                     )}
-
-                    {/* Status messages */}
-                    {syncCompleted && (
-                        <Message severity="success" text="Synchronization completed successfully!" className="w-full mb-3" />
-                    )}
-                    {syncFailed && (
-                        <Message severity="error" text="Synchronization failed. Please check the logs for details." className="w-full mb-3" />
+                    {syncPlan && syncPlan.circularEdges.length > 0 && (
+                        <div style={{ marginTop: 10 }}>
+                            <span className="ss-chip info"><i className="pi pi-replay" /> {syncPlan.circularEdges.length} circular dependencies</span>
+                        </div>
                     )}
                 </div>
             )}
 
-            <div className="flex flex-column align-items-center my-5">
-                {status === 'COMPLETED' && !syncInProgress && !syncFailed && (
-                    <div className="mb-3">
-                        <Message
-                            severity="success"
-                            text="Merge request completed successfully!"
-                            className="w-full"
-                        />
+            {/* Item list grouped by content type */}
+            {groups.length === 0 ? (
+                <div className="ss-empty"><i className="pi pi-filter-slash" aria-hidden="true" />No items match the current filters.</div>
+            ) : groups.map(([ct, items]) => {
+                const isCollapsed = collapsed.has(ct);
+                const nC = items.filter(i => i.operation === 'create').length;
+                const nU = items.filter(i => i.operation === 'update').length;
+                const nD = items.filter(i => i.operation === 'delete').length;
+                return (
+                    <div key={ct}>
+                        <div className="ss-group-head">
+                            <button onClick={() => toggleGroup(ct)}>
+                                <i className={`pi ${isCollapsed ? 'pi-chevron-right' : 'pi-chevron-down'}`} style={{ fontSize: 10 }} />
+                                {shortType(ct)}
+                                <span className="ss-dim" style={{ textTransform: 'none', letterSpacing: 0 }}>{items.length}</span>
+                            </button>
+                            <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 8 }}>
+                                {nC > 0 && <span className="ss-count add">+{nC}</span>}
+                                {nU > 0 && <span className="ss-count upd">~{nU}</span>}
+                                {nD > 0 && <span className="ss-count del">−{nD}</span>}
+                            </span>
+                        </div>
+                        {!isCollapsed && items.map(it => {
+                            const thumb = fileThumbUrl(it.contentType, it.documentId);
+                            return (
+                                <div className="ss-erow" key={`${it.contentType}:${it.documentId}:${it.operation}`}>
+                                    <div className="ss-erow-head" onClick={() => inspectItem(it.contentType, it.documentId)}>
+                                        {opDot(it.operation)}
+                                        {thumb && <span className="ss-thumb"><img src={thumb} alt="" /></span>}
+                                        <span className={`ss-erow-name${it.operation === 'delete' ? ' del' : ''}`} style={{ flex: '0 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                            {itemLabel(it.contentType, it.documentId)}
+                                        </span>
+                                        <span className="ss-erow-summary">{opLabel(it.operation)}</span>
+                                        <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 10 }}>
+                                            {statusChip(it)}
+                                            <button className="ss-link" onClick={(e) => { e.stopPropagation(); inspectItem(it.contentType, it.documentId); }} title="Inspect">
+                                                <i className="pi pi-eye" />
+                                            </button>
+                                        </span>
+                                    </div>
+                                </div>
+                            );
+                        })}
                     </div>
+                );
+            })}
+
+            {/* Verification report */}
+            {verifyReport && (
+                <div style={{ padding: '10px 16px', borderTop: '1px solid var(--ss-border)', background: 'var(--ss-surface-2)' }}>
+                    <div className="ss-card-row" style={{ gap: 10, marginBottom: verifyReport.inconsistent > 0 ? 8 : 0, flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: 12, color: 'var(--ss-text-2)' }}><i className="pi pi-verified" style={{ marginRight: 6, color: verifyReport.inconsistent > 0 ? 'var(--ss-red)' : 'var(--ss-green)' }} />Post-sync verification</span>
+                        <span className="ss-badge success">{verifyReport.consistent} consistent</span>
+                        {verifyReport.schemaGap > 0 && <span className="ss-badge warn" title="Differ only in source-only fields the target schema can't store (auto-dropped by design).">{verifyReport.schemaGap} schema-gap</span>}
+                        {verifyReport.inconsistent > 0
+                            ? <span className="ss-badge danger">{verifyReport.inconsistent} real mismatch</span>
+                            : <span className="ss-dim" style={{ fontSize: 11.5 }}>no real mismatches</span>}
+                    </div>
+                    {verifyReport.items.filter(i => i.severity !== 'ok').map((it, idx) => (
+                        <div key={idx} style={{ fontSize: 11.5, color: it.severity === 'mismatch' ? 'var(--ss-red)' : 'var(--ss-text-3)', padding: '2px 0' }}>
+                            <span className={`ss-state-dot ${it.severity === 'mismatch' ? 'del' : 'upd'}`} style={{ display: 'inline-block', marginRight: 6 }} />
+                            <code>{it.contentType}</code> · {it.documentId} — {it.reason || it.actual}
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {/* Action bar */}
+            <div className="ss-actionbar">
+                <span style={{ fontSize: 12, color: 'var(--ss-text-2)' }}>
+                    <strong style={{ color: 'var(--ss-text)' }}>{totalItems}</strong> items
+                    <span className="ss-count add" style={{ marginLeft: 10 }}>+{totalToCreate}</span>
+                    <span className="ss-count upd" style={{ marginLeft: 8 }}>~{totalToUpdate}</span>
+                    <span className="ss-count del" style={{ marginLeft: 8 }}>−{totalToDelete}</span>
+                    {anyRunData && (
+                        <>
+                            <span style={{ margin: '0 8px', color: 'var(--ss-border)' }}>|</span>
+                            {statusCounts.success > 0 && <span style={{ color: 'var(--ss-green)' }}>{statusCounts.success} ok</span>}
+                            {statusCounts.failed > 0 && (
+                                <button className="ss-link" style={{ marginLeft: 8, color: 'var(--ss-red)' }} onClick={() => setStatusFilter('failed')}>
+                                    {statusCounts.failed} failed →
+                                </button>
+                            )}
+                        </>
+                    )}
+                </span>
+                <span style={{ marginLeft: 'auto' }} />
+                {anyRunData && !syncInProgress && (
+                    <button className="ss-btn subtle" onClick={verifyDestination} disabled={verifying} title="Recompute the comparison and confirm the target is actually consistent for synced items.">
+                        <i className={`pi ${verifying ? 'pi-spin pi-spinner' : 'pi-verified'}`} aria-hidden="true" /> {verifying ? 'Verifying…' : 'Verify destination'}
+                    </button>
                 )}
-                {(status === 'MERGED_COLLECTIONS' || status === 'FAILED'|| status === 'IN_PROGRESS' || status === 'REVIEW') && !syncInProgress && (
-                    <Button
-                        label="Complete Merge"
-                        icon="pi pi-check"
-                        loading={completing}
-                        disabled={completing}
-                        onClick={handleCompleteMerge}
-                    />
+                {completed && !syncInProgress && statusCounts.failed === 0 && (
+                    <span className="ss-chip success"><i className="pi pi-check-circle" /> Merge completed</span>
+                )}
+                {runnable && !syncInProgress && (
+                    <label className="ss-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer', color: 'var(--ss-text-2)' }} title="If the run does not fully succeed, restore the pre-run snapshot.">
+                        <input type="checkbox" checked={rollbackOnFailure} onChange={(e) => setRollbackOnFailure(e.target.checked)} />
+                        Rollback on failure
+                    </label>
+                )}
+                {runnable && !syncInProgress && statusCounts.failed > 0 && (
+                    <button className="ss-btn" disabled={completing} onClick={() => handleCompleteMerge({ onlyFailed: true })}>
+                        <i className="pi pi-replay" aria-hidden="true" /> Retry failed ({statusCounts.failed})
+                    </button>
+                )}
+                {runnable && !syncInProgress && (
+                    <button className="ss-btn primary" disabled={completing} onClick={() => handleCompleteMerge()}>
+                        <i className={`pi ${completing ? 'pi-spin pi-spinner' : statusCounts.failed > 0 ? 'pi-refresh' : 'pi-check'}`} aria-hidden="true" />
+                        {completing ? 'Starting…' : statusCounts.failed > 0 ? 'Re-run all' : 'Complete merge'}
+                    </button>
+                )}
+                {syncInProgress && (
+                    <button className="ss-btn primary" disabled>
+                        <i className="pi pi-spin pi-spinner" aria-hidden="true" /> Running… {syncProgress ? `${syncProgress.processedItems}/${syncProgress.totalItems}` : ''}
+                    </button>
                 )}
             </div>
 
-            {/* Toast for notifications */}
             <Toast ref={toast} position="top-right" />
-
-            {/* Editor Dialog */}
             <EditorDialog
                 visible={editorDialogVisible}
-                onHide={() => {
-                    setEditorDialogVisible(false);
-                    setHttpLogs(undefined);
-                }}
+                onHide={() => { setEditorDialogVisible(false); setHttpLogs(undefined); }}
                 header={editorDialogHeader}
                 content={editorContent}
                 isDiff={isDiffEditor}

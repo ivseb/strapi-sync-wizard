@@ -118,6 +118,16 @@ export interface StrapiContentMetadata {
     id: number | null;
     documentId: string;
     locale?: string | null;
+    uniqueKey?: string;
+    syncId?: string | null;
+    // Strapi v5 Draft & Publish: true when the document has no published row (draft-only/unpublished).
+    isDraftOnly?: boolean;
+}
+
+export interface StrapiDraftChannel {
+    rawData: JsonObject;
+    cleanData: JsonObject;
+    links: StrapiLinkRef[];
 }
 
 export interface StrapiLinkRef {
@@ -134,6 +144,9 @@ export interface StrapiContent {
     rawData: JsonObject;
     cleanData: JsonObject;
     links: StrapiLinkRef[];
+    // Divergent draft overlay (Strapi v5 "modified" state): present only when the published version
+    // and the working draft differ. Null otherwise.
+    draft?: StrapiDraftChannel | null;
 }
 
 export interface DifferentFile {
@@ -174,6 +187,17 @@ export interface ContentRelationship {
     isBidirectional: boolean;
 }
 
+export interface ResolvedRef {
+    documentId: string;
+    label: string;
+    syncId?: string | null;
+    isFile?: boolean;
+    fileId?: number | null;
+    mime?: string | null;
+    contentHash?: string | null;
+    refType?: string | null;
+}
+
 export interface ContentTypeComparisonResultWithRelationships {
     id: string; // unique id used for selection
     tableName: string;
@@ -182,6 +206,8 @@ export interface ContentTypeComparisonResultWithRelationships {
     targetContent?: StrapiContent | null;
     compareState: ContentTypeComparisonResultKind;
     kind: StrapiContentTypeKind;
+    sourceRefs?: Record<string, ResolvedRef[]>;
+    targetRefs?: Record<string, ResolvedRef[]>;
 }
 
 
@@ -236,6 +262,7 @@ export interface MergeRequestDetail {
         sourceInstance: StrapiInstance;
         targetInstance: StrapiInstance;
         status: string;
+        includeDrafts?: boolean;
         createdAt: string;
         updatedAt: string;
     };
@@ -295,4 +322,32 @@ export interface SnapshotActivityDTO {
     snapshotSchemaName: string | null;
     message: string | null;
     createdAt: string;
+}
+
+// --- Identity layer (Phase 1) ---
+export type ReconciliationActionKind =
+    | 'ALREADY_LINKED'
+    | 'LINK_TARGET_TO_SOURCE'
+    | 'LINK_SOURCE_TO_TARGET'
+    | 'ASSIGN_NEW_BOTH'
+    | 'CONFLICT_PREFER_SOURCE';
+
+export interface IdentityReconciliationAction {
+    contentType: string;
+    sourceDocumentId: string | null;
+    targetDocumentId: string | null;
+    locale: string | null;
+    canonicalSyncId: string;
+    kind: ReconciliationActionKind;
+}
+
+export interface IdentityReconciliationReport {
+    mergeRequestId: number;
+    applied: boolean;
+    totalPairs: number;
+    alreadyLinked: number;
+    linked: number;
+    assignedNew: number;
+    conflicts: number;
+    actions: IdentityReconciliationAction[];
 }

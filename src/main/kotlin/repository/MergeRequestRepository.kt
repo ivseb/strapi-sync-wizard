@@ -109,6 +109,7 @@ class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepos
                     sourceInstance = sourceInstance,
                     targetInstance = targetInstance,
                     status = mergeRequest.status,
+                    includeDrafts = mergeRequest.includeDrafts,
                     createdAt = mergeRequest.createdAt,
                     updatedAt = mergeRequest.updatedAt
                 )
@@ -140,6 +141,7 @@ class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepos
             sourceInstance = sourceInstance,
             targetInstance = targetInstance,
             status = mergeRequest.status,
+            includeDrafts = mergeRequest.includeDrafts,
             createdAt = mergeRequest.createdAt,
             updatedAt = mergeRequest.updatedAt
         )
@@ -152,6 +154,7 @@ class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepos
             it[sourceInstanceId] = mergeRequestDTO.sourceInstanceId
             it[targetInstanceId] = mergeRequestDTO.targetInstanceId
             it[status] = mergeRequestDTO.status ?: MergeRequestStatus.CREATED
+            it[includeDrafts] = mergeRequestDTO.includeDrafts ?: false
         }
 
         insertStatement.resultedValues?.singleOrNull()?.toMergeRequest()
@@ -165,6 +168,7 @@ class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepos
             mergeRequestDTO.sourceInstanceId.let { srcId -> it[sourceInstanceId] = srcId }
             mergeRequestDTO.targetInstanceId.let { tgtId -> it[targetInstanceId] = tgtId }
             mergeRequestDTO.status?.let { status -> it[MergeRequestsTable.status] = status }
+            mergeRequestDTO.includeDrafts?.let { inc -> it[includeDrafts] = inc }
             it[updatedAt] = OffsetDateTime.now()
         } > 0
     }
@@ -203,6 +207,7 @@ class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepos
         sourceInstanceId = this[MergeRequestsTable.sourceInstanceId],
         targetInstanceId = this[MergeRequestsTable.targetInstanceId],
         status = this[MergeRequestsTable.status],
+        includeDrafts = this[MergeRequestsTable.includeDrafts],
         createdAt = this[MergeRequestsTable.createdAt],
         updatedAt = this[MergeRequestsTable.updatedAt]
     )

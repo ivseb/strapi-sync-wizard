@@ -226,9 +226,9 @@ const MergeFilesStep: React.FC<MergeFilesStepProps> = ({
                         icon="pi pi-link-slash" 
                         label="Scollega" 
                         className="p-button-text p-button-danger p-button-sm"
-                        tooltip="Rimuovi questa associazione automatica o manuale"
+                        tooltip="Remove this mapping"
                         onClick={async () => {
-                            if (!window.confirm('Vuoi davvero rimuovere questa associazione? Il ricalcolo avverrà automaticamente.')) return;
+                            if (!window.confirm('Remove this mapping? The comparison will be recomputed automatically.')) return;
                             try {
                                 setUpdateTableLoading(true);
                                 // Cerchiamo il mapping id tra i mapping salvati
@@ -243,7 +243,7 @@ const MergeFilesStep: React.FC<MergeFilesStepProps> = ({
                                     await axios.delete(`/api/merge-requests/${mergeRequestId}/mappings/${mapping.id}`);
                                     if (onSaved) await onSaved();
                                 } else {
-                                    alert("Associazione persistente non trovata. Potrebbe essere un'associazione temporanea in memoria.");
+                                    alert("Persistent mapping not found. It may be a temporary in-memory mapping.");
                                 }
                             } catch (e) {
                                 console.error('Errore durante la rimozione del mapping', e);
@@ -255,13 +255,13 @@ const MergeFilesStep: React.FC<MergeFilesStepProps> = ({
                     />
                     <Button 
                         icon="pi pi-ban" 
-                        label="Escludi" 
+                        label="Exclude"
                         className="p-button-text p-button-warning p-button-sm"
-                        tooltip="Escludi questo file dalla sincronizzazione (vincolo ambientale)"
+                        tooltip="Exclude this file from sync (environment-specific)"
                         onClick={async () => {
                             const docId = rowData.sourceImage?.metadata.documentId || rowData.targetImage?.metadata.documentId;
                             if (!docId) return;
-                            if (!window.confirm(`Vuoi escludere il file ${docId} dalla sincronizzazione per sempre?`)) return;
+                            if (!window.confirm(`Exclude file ${docId} from sync permanently?`)) return;
                             try {
                                 setUpdateTableLoading(true);
                                 await axios.post(`/api/merge-requests/${mergeRequestId}/exclusions`, {
@@ -287,35 +287,31 @@ const MergeFilesStep: React.FC<MergeFilesStepProps> = ({
 
     return (
         <div>
-            <h3>Merge Files</h3>
-            <p>
-                This step allows you to select which files to create, update, or delete on the target instance.
-                Review the differences and make your selections before proceeding.
-            </p>
-
-            <div className="flex justify-content-between align-items-center mb-3">
+            <div className="flex justify-content-between align-items-center mb-3 gap-2">
                 <span className="p-input-icon-left w-20rem">
                     <i className="pi pi-search" />
                     <InputText
                         type="search"
                         value={globalFilter}
                         onChange={(e) => setGlobalFilter(e.target.value)}
-                        placeholder="Ricerca globale..."
+                        placeholder="Search..."
                         className="w-full"
                     />
                 </span>
+                <div className="flex gap-2">
                 <Button
-                    label="Associa manualmente (files)"
+                    label="Manual mapping"
                     icon="pi pi-link"
-                    className="mr-2"
+                    outlined
                     onClick={() => setShowManualMapper(true)}
                 />
                 <Button
-                    label="Gestisci vincoli"
+                    label="Manage exclusions"
                     icon="pi pi-ban"
-                    severity="warning"
+                    outlined
                     onClick={() => setShowExclusionsManager(true)}
                 />
+                </div>
             </div>
 
             <TabView activeIndex={activeTabIndex} onTabChange={(e) => setActiveTabIndex(e.index)}>

@@ -49,10 +49,8 @@ fun Application.configureSSE() {
             SyncProgressService.registerConnection(mergeRequestId, channel)
 
             channel.consumeAsFlow().collect { update ->
-                println("SEND MESSAGE: $update")
                 try {
                     send(ServerSentEvent(JsonParser.encodeToString(SyncProgressUpdate.serializer(), update)))
-                    println("SENT MESSAGE: $update")
                 } catch (e:Throwable) {
                     log.error("Error sending SSE message for merge request $mergeRequestId: ${e.message}", e)
                     throw e
@@ -154,8 +152,6 @@ object SyncProgressService {
      * Send a progress update to all connected clients for a merge request
      */
     suspend fun sendProgressUpdate(update: SyncProgressUpdate) {
-
-        println("SEND MESSAGE: $update")
         connections[update.mergeRequestId]?.forEach { channel ->
             try {
                 if (!channel.isClosedForSend) {

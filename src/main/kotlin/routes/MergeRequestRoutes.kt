@@ -127,7 +127,35 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
 
             try {
                 val result = mergeRequestService.checkSchemaCompatibility(id, force)
-                call.respond(SchemaCompatibilityResponse(result.isCompatible))
+
+                // Build human-readable blocking reasons (prevent merge) and warnings (informational).
+                val blocking = buildList {
+                    result.blockingContentTypes.forEach {
+                        add("Content type \"$it\" exists in source but is missing in target — it cannot be created there.")
+                    }
+                    result.blockingColumnTypes.forEach {
+                        add("Field \"$it\" has an incompatible column type between source and target.")
+                    }
+                }
+
+                val warnings = buildList {
+                    result.missingTablesInSource.forEach {
+                        add("Content type \"$it\" exists only in target — it will be left untouched.")
+                    }
+                    result.tableDifferences.forEach { td ->
+                        if (td.missingColumnsInTarget.isNotEmpty()) {
+                            add("\"${td.table}\": ${td.missingColumnsInTarget.joinToString(", ")} exist only in source — they will be dropped on merge.")
+                        }
+                        if (td.missingColumnsInSource.isNotEmpty()) {
+                            add("\"${td.table}\": ${td.missingColumnsInSource.joinToString(", ")} exist only in target — they will be left untouched.")
+                        }
+                        if (td.differentColumns.isNotEmpty()) {
+                            add("\"${td.table}\": ${td.differentColumns.joinToString(", ") { it.column }} differ in definition (non-blocking).")
+                        }
+                    }
+                }
+
+                call.respond(SchemaCompatibilityResponse(result.isCompatible, blocking, warnings))
             } catch (e: IllegalArgumentException) {
                 call.respond(HttpStatusCode.NotFound, e.message ?: "Merge request not found")
             } catch (e: Exception) {
@@ -174,6 +202,25 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
                     HttpStatusCode.InternalServerError, 
                     "Error during content comparison: ${e.message}"
                 )
+            }
+        }
+
+        // Identity reconciliation (Phase 1): link a shared sync_id across instances for matched pairs.
+        // ?apply=false (default) is a dry-run returning the proposed actions; ?apply=true writes sidecars.
+        post("/{id}/identity/reconcile") {
+            val id = call.parameters["id"]?.toIntOrNull()
+                ?: return@post call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+            val apply = call.queryParameters["apply"]?.toBooleanStrictOrNull() ?: false
+            try {
+                val report = mergeRequestService.reconcileIdentity(id, apply)
+                call.respond(HttpStatusCode.OK, report)
+            } catch (e: IllegalArgumentException) {
+                call.respond(HttpStatusCode.NotFound, e.message ?: "Merge request not found")
+            } catch (e: IllegalStateException) {
+                call.respond(HttpStatusCode.BadRequest, e.message ?: "Invalid state for reconciliation")
+            } catch (e: Exception) {
+                logger.error("Error during identity reconciliation for merge request $id", e)
+                call.respond(HttpStatusCode.InternalServerError, "Error during identity reconciliation: ${e.message}")
             }
         }
 
@@ -434,24 +481,31 @@ fun Route.configureMergeRequestRoutes(mergeRequestService: MergeRequestService) 
             }
         }
 
+        // Post-sync verification: confirm the target is actually consistent for synced items
+        post("/{id}/verify") {
+            val id = call.parameters["id"]?.toIntOrNull()
+                ?: return@post call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
+            try {
+                call.respond(HttpStatusCode.OK, mergeRequestService.verifyMergeRequest(id))
+            } catch (e: Exception) {
+                logger.error("Verification failed for MR $id", e)
+                call.respond(HttpStatusCode.InternalServerError, MergeResponse(success = false, message = e.message ?: "Verification failed"))
+            }
+        }
+
         // Complete merge request
         post("/{id}/complete") {
             val id = call.parameters["id"]?.toIntOrNull()
                 ?: return@post call.respond(HttpStatusCode.BadRequest, "Invalid ID format")
 
+            val onlyFailed = call.request.queryParameters["onlyFailed"]?.toBoolean() ?: false
+            val rollbackOnFailure = call.request.queryParameters["rollbackOnFailure"]?.toBoolean() ?: false
+
             try {
-                val success = mergeRequestService.completeMergeRequest(id)
-                if (success) {
-                    call.respond(
-                        HttpStatusCode.OK,
-                        MergeResponse(success = true, message = "Merge request completed successfully")
-                    )
-                } else {
-                    call.respond(
-                        HttpStatusCode.InternalServerError,
-                        MergeResponse(success = false, message = "Failed to complete merge request")
-                    )
-                }
+                // The run executed (even with partial failures) — respond 200 with the honest outcome
+                // counts so the UI can distinguish full success from "completed with N errors".
+                val result = mergeRequestService.completeMergeRequest(id, onlyFailed, rollbackOnFailure)
+                call.respond(HttpStatusCode.OK, result)
             } catch (e: Exception) {
                 // Log the exception
                 e.printStackTrace()

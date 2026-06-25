@@ -7,23 +7,23 @@ val kotlin_version: String by project
 val logback_version: String by project
 
 plugins {
-    kotlin("jvm") version "2.1.10"
-    id("io.ktor.plugin") version "3.1.3"
-    id("org.jetbrains.kotlin.plugin.serialization") version "2.1.10"
+    kotlin("jvm") version "2.4.0"
+    id("io.ktor.plugin") version "3.5.0"
+    id("org.jetbrains.kotlin.plugin.serialization") version "2.4.0"
 }
 java {
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
 }
 kotlin {
-    jvmToolchain(17)
+    jvmToolchain(21)
 }
 
 
 
 
 group = "it.sebi"
-version = "0.3.1"
+version = "1.0.0"
 
 application {
     mainClass = "io.ktor.server.netty.EngineMain"
@@ -49,7 +49,7 @@ dependencies {
     implementation("org.jetbrains.exposed:exposed-core:$exposed_version")
     implementation("org.jetbrains.exposed:exposed-crypt:$exposed_version")
     implementation("org.jetbrains.exposed:exposed-jdbc:$exposed_version")
-    implementation("org.bouncycastle:bcprov-jdk15on:1.70")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.84")
 //    implementation("org.jetbrains.exposed:exposed-r2dbc:$exposed_version")
 //    implementation("org.jetbrains.exposed:exposed-migration-r2dbc:$exposed_version")
 //    implementation("org.jetbrains.exposed:exposed-dao:$exposed_version")
@@ -60,19 +60,19 @@ dependencies {
     implementation("io.ktor:ktor-client-cio")
     implementation("io.ktor:ktor-client-content-negotiation")
     implementation("io.ktor:ktor-client-logging")
-    implementation("com.zaxxer:HikariCP:4.0.3")
+    implementation("com.zaxxer:HikariCP:7.1.0")
     implementation("com.h2database:h2:$h2_version")
-    implementation("org.postgresql:postgresql:42.5.4")
+    implementation("org.postgresql:postgresql:42.7.11")
 //    implementation("org.postgresql:r2dbc-postgresql:1.0.7.RELEASE")
     implementation("io.ktor:ktor-server-netty")
     implementation("ch.qos.logback:logback-classic:$logback_version")
-    implementation("io.ktor:ktor-server-cors:3.1.3")
-    implementation("io.ktor:ktor-server-sse:3.1.3")
+    implementation("io.ktor:ktor-server-cors:$ktor_version")
+    implementation("io.ktor:ktor-server-sse:$ktor_version")
     // Robust fingerprinting of PDFs
-    implementation("org.apache.pdfbox:pdfbox:2.0.31")
+    implementation("org.apache.pdfbox:pdfbox:3.0.7")
     testImplementation("io.ktor:ktor-server-test-host")
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit:$kotlin_version")
-    testImplementation("io.mockk:mockk:1.13.5")
+    testImplementation("io.mockk:mockk:1.14.11")
     testImplementation("io.ktor:ktor-client-mock")
 }
 
@@ -82,20 +82,21 @@ tasks.register("buildFrontend") {
     group = "frontend"
     description = "Builda l'applicazione frontend React"
 
+    val frontendDir = file("${project.projectDir}/frontend")
+    val resourcesDir = file("${project.projectDir}/src/main/resources")
     doLast {
-        exec {
-            workingDir("${project.projectDir}/frontend") // adatta il path alla tua struttura
-            commandLine("mkdir", "-p", "${project.projectDir}/src/main/resources")
+        // Gradle 9 removed Project.exec {} — use ProcessBuilder directly.
+        fun run(vararg cmd: String) {
+            val process = ProcessBuilder(*cmd)
+                .directory(frontendDir)
+                .inheritIO()
+                .start()
+            val exit = process.waitFor()
+            if (exit != 0) throw GradleException("Command failed (exit $exit): ${cmd.joinToString(" ")}")
         }
-        exec {
-            workingDir("${project.projectDir}/frontend") // adatta il path alla tua struttura
-            commandLine("npm", "install")
-        }
-
-        exec {
-            workingDir("${project.projectDir}/frontend") // adatta il path alla tua struttura
-            commandLine("npm", "run", "build")
-        }
+        resourcesDir.mkdirs()
+        run("npm", "install")
+        run("npm", "run", "build")
     }
 }
 
@@ -113,7 +114,7 @@ fun String.toKebabCase(): String {
 
 ktor {
     docker {
-        jreVersion.set(JavaVersion.VERSION_17)
+        jreVersion.set(JavaVersion.VERSION_21)
         localImageName.set("sample-docker-image")
         imageTag.set(rootProject.version.toString())
         environmentVariables.set(listOf(

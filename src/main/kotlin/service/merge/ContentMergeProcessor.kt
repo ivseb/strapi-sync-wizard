@@ -7,10 +7,17 @@ import it.sebi.database.dbQuery
 import it.sebi.models.*
 import it.sebi.repository.MergeRequestSelectionsRepository
 import it.sebi.service.MergeRequestService
+import it.sebi.service.identity.SyncIdentityService
 import it.sebi.service.merge.ContentJsonUtils.normalizeKeyName
 import it.sebi.service.resolveComponentTableName
 import it.sebi.tables.MergeRequestDocumentMappingTable
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.json.*
+import java.util.concurrent.ConcurrentHashMap
 import org.jetbrains.exposed.v1.core.Op
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
@@ -23,6 +30,39 @@ import org.slf4j.LoggerFactory
 
 class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeRequestSelectionsRepository) {
     private val logger = LoggerFactory.getLogger(ContentMergeProcessor::class.java)
+
+    companion object {
+        // Max concurrent items processed within a single dependency batch.
+        private const val MAX_PARALLEL_CONTENT = 8
+    }
+
+    // Target content-type attributes (by collectionName), used to auto-drop source-only fields so a
+    // COMPATIBLE-but-not-identical schema can still merge (target rejects unknown fields otherwise).
+    private var targetAttrsByTable: Map<String, Set<String>> = emptyMap()
+    private var targetAttrsNormByTable: Map<String, Set<String>> = emptyMap()
+
+    private suspend fun loadTargetAttrs(targetClient: StrapiClient) {
+        targetAttrsByTable = try {
+            targetClient.getContentTypes().associate { it.schema.collectionName to it.schema.attributes.keys }
+        } catch (e: Exception) {
+            logger.warn("Could not load target content types for field filtering: ${e.message}")
+            emptyMap()
+        }
+        targetAttrsNormByTable = targetAttrsByTable.mapValues { (_, v) -> v.map { normalizeKeyName(it) }.toSet() }
+    }
+
+    /** Remove fields the source has but the target schema doesn't, so writes aren't rejected. */
+    private fun dropForeignFields(tableName: String, data: JsonObject): JsonObject {
+        val allowed = targetAttrsByTable[tableName] ?: return data
+        val allowedNorm = targetAttrsNormByTable[tableName] ?: emptySet()
+        val dropped = mutableListOf<String>()
+        val kept = data.filterKeys { k ->
+            if (k.startsWith("__") || allowed.contains(k) || allowedNorm.contains(normalizeKeyName(k))) true
+            else { dropped.add(k); false }
+        }
+        if (dropped.isNotEmpty()) logger.info("[schema-compat] '$tableName': dropping source-only fields absent in target: $dropped")
+        return JsonObject(kept)
+    }
 
     /**
      * Second pass: update only circular dependency relations for items whose dependencies succeeded.
@@ -39,6 +79,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
         mappingMap: MutableMap<String, MutableMap<String, MergeRequestDocumentMapping>> = mutableMapOf()
     ) {
         val contentTypeMappingByTable: Map<String, DbTable> = schema.tables.associateBy { it.name }
+        if (targetAttrsByTable.isEmpty()) loadTargetAttrs(targetClient)
 
         // Group circular edges by source item (from)
         val circularByFrom: Map<Pair<String, String>, List<MergeRequestService.CircularDependencyEdge>> =
@@ -64,26 +105,26 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
 
 
 
-            val linkToProcess: List<StrapiLinkRef> = sourceContent.links
-            val dataToCreate = ContentJsonUtils.processJsonElementNew(
-                comparisonDataMap,
-                sourceContent.rawData,
-                schemaTable,
-                schema,
-                contentTypeMappingByTable,
-                linkToProcess,
-                allTargetFileIdByDoc,
-                mappingMap
-            ).jsonObject
-
-
             try {
-                // Use upsert by documentId mapped to TARGET
+                val linkToProcess: List<StrapiLinkRef> = sourceContent.links
+                val dataToCreate = ContentJsonUtils.processJsonElementNew(
+                    comparisonDataMap,
+                    sourceContent.rawData,
+                    schemaTable,
+                    schema,
+                    contentTypeMappingByTable,
+                    linkToProcess,
+                    allTargetFileIdByDoc,
+                    mappingMap
+                ).jsonObject
+                // Use upsert by documentId mapped to TARGET.
+                // mappingMap is keyed by the content-type apiUid (not the table name).
                 val srcDoc = sourceContent.metadata.documentId
-                val targetDocumentId = mappingMap[selection.tableName]?.get(srcDoc)?.targetDocumentId ?: srcDoc
+                val apiUid = schemaTable.metadata?.apiUid
+                val targetDocumentId = apiUid?.let { mappingMap[it]?.get(srcDoc)?.targetDocumentId } ?: srcDoc
                 targetClient.upsertContentEntry(
                     schemaTable.metadata!!.queryName,
-                    dataToCreate,
+                    dropForeignFields(schemaTable.name, dataToCreate),
                     entry.kind,
                     sourceContent.metadata.documentId,
                     targetDocumentId
@@ -118,6 +159,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
         mappingMap: MutableMap<String, MutableMap<String, MergeRequestDocumentMapping>> = mutableMapOf()
     ) {
         val contentTypeMappingByTable: Map<String, DbTable> = schema.tables.associateBy { it.name }
+        loadTargetAttrs(targetClient)
 
         // Build the set of all selected keys (table, documentId) to detect intra-selection dependencies
         val selectedKeys: Set<Pair<String, String>> = batches
@@ -125,95 +167,102 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
             .map { it.selection.tableName to it.selection.documentId }
             .toSet()
 
-        // Track success/failure of processed items
-        val processedStatus = mutableMapOf<Pair<String, String>, Boolean>()
+        // Track success/failure of processed items (concurrent: items in a batch run in parallel).
+        val processedStatus = ConcurrentHashMap<Pair<String, String>, Boolean>()
+
+        // Pre-create a thread-safe mapping bucket per content type that may be written this run, so
+        // parallel items never race on bucket creation and writes/reads are concurrency-safe.
+        batches.flatten()
+            .mapNotNull { contentTypeMappingByTable[it.selection.tableName]?.metadata?.apiUid }
+            .distinct()
+            .forEach { uid ->
+                val existing = mappingMap[uid]
+                mappingMap[uid] = if (existing is ConcurrentHashMap) existing else ConcurrentHashMap(existing ?: emptyMap())
+            }
+
+        // Items in the same batch are independent by construction (dependencies live in earlier
+        // batches, already complete), so we process them concurrently. Each batch is a barrier.
+        val semaphore = Semaphore(MAX_PARALLEL_CONTENT)
 
         for (batch in batches) {
-            for (item in batch) {
-                val selection = item.selection
-                val entry = item.entry
-                val tableName = selection.tableName
-                val key = tableName to selection.documentId
+            coroutineScope {
+                batch.map { item ->
+                    async {
+                        semaphore.withPermit {
+                            val selection = item.selection
+                            val entry = item.entry
+                            val tableName = selection.tableName
+                            val key = tableName to selection.documentId
+                            try {
+                                val schemaTable: DbTable = contentTypeMappingByTable[tableName] ?: return@withPermit
 
-                val schemaTable: DbTable = contentTypeMappingByTable[tableName] ?: continue
+                                // Skip if any dependency inside the selection previously failed
+                                val depsInsideSelection: List<Pair<String, String>> = (entry.sourceContent?.links ?: emptyList())
+                                    .filter { it.targetTable != "files" } // files are processed separately
+                                    .mapNotNull { link ->
+                                        val table = link.targetTable
+                                        contentTypeMappingByTable[table]?.metadata?.let { schemaLinkMeta ->
+                                            val docId = resolveTargetDocIdForLink(
+                                                table,
+                                                schemaLinkMeta.apiUid,
+                                                link.targetId,
+                                                comparisonDataMap,
+                                                mappingMap
+                                            )
+                                            if (docId != null) link.targetTable to docId else null
+                                        }
+                                    }
+                                    .filter { selectedKeys.contains(it) }
 
-                // Determine if any dependency inside the selection previously failed
-                val depsInsideSelection: List<Pair<String, String>> = (entry.sourceContent?.links ?: emptyList())
-                    .filter { it.targetTable != "files" } // files are processed separately
-                    .mapNotNull { link ->
-                        val table = link.targetTable
-                        contentTypeMappingByTable[table]?.metadata?.let { schemaLinkMeta ->
-                            val docId = resolveTargetDocIdForLink(
-                                table,
-                                schemaLinkMeta.apiUid,
-                                link.targetId,
-                                comparisonDataMap,
-                                mappingMap
-                            )
-                            if (docId != null) link.targetTable to docId else null
+                                val failedDeps = depsInsideSelection.filter { processedStatus[it] == false }
+                                if (failedDeps.isNotEmpty()) {
+                                    val reason =
+                                        "Skipped due to failed dependency: ${failedDeps.joinToString { it.first + ":" + it.second }}"
+                                    mergeRequestSelectionsRepository.updateSyncStatus(selection.id, false, reason)
+                                    processedStatus[key] = false
+                                    return@withPermit
+                                }
+
+                                when (entry.kind) {
+                                    StrapiContentTypeKind.SingleType -> {
+                                        processedStatus[key] = processSingleType(
+                                            tableName, schemaTable, schema, selection, entry,
+                                            sourceStrapiInstance, targetStrapiInstance, targetClient, comparisonDataMap,
+                                            contentTypeMappingByTable,
+                                            circularEdges.filter { it.fromTable == tableName && it.fromDocumentId == selection.documentId }
+                                                .map { it.viaLink }.toSet(),
+                                            allTargetFileIdByDoc, mappingMap
+                                        )
+                                    }
+
+                                    StrapiContentTypeKind.CollectionType -> {
+                                        processedStatus[key] = processCollectionType(
+                                            tableName, schemaTable, schema, selection, entry,
+                                            sourceStrapiInstance, targetStrapiInstance, targetClient, comparisonDataMap,
+                                            contentTypeMappingByTable,
+                                            circularEdges.filter { it.fromTable == tableName && it.fromDocumentId == selection.documentId }
+                                                .map { it.viaLink }.toSet(),
+                                            allTargetFileIdByDoc, mappingMap
+                                        )
+                                    }
+
+                                    StrapiContentTypeKind.Files, StrapiContentTypeKind.Component -> {
+                                        // Files are handled separately in MergeRequestService; skip here.
+                                        return@withPermit
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                // Failover: a single bad item (payload build, dependency resolution,
+                                // dispatch) must not abort the whole merge. Record it and move on.
+                                logger.error("Unexpected error processing $tableName:${selection.documentId}: ${e.message}", e)
+                                try {
+                                    mergeRequestSelectionsRepository.updateSyncStatus(selection.id, false, e.message ?: "Unexpected error")
+                                } catch (_: Exception) { /* ignore */ }
+                                processedStatus[key] = false
+                            }
                         }
-
                     }
-                    .filter { selectedKeys.contains(it) }
-
-                val failedDeps = depsInsideSelection.filter { processedStatus[it] == false }
-                if (failedDeps.isNotEmpty()) {
-                    val reason =
-                        "Skipped due to failed dependency: ${failedDeps.joinToString { it.first + ":" + it.second }}"
-                    mergeRequestSelectionsRepository.updateSyncStatus(selection.id, false, reason)
-                    processedStatus[key] = false
-                    continue
-                }
-
-                when (entry.kind) {
-                    StrapiContentTypeKind.SingleType -> {
-                        val ok = processSingleType(
-                            tableName,
-                            schemaTable,
-                            schema,
-                            selection,
-                            entry,
-                            sourceStrapiInstance,
-                            targetStrapiInstance,
-                            targetClient,
-                            comparisonDataMap,
-                            // Exclude circular dependency links for this item
-                            contentTypeMappingByTable,
-                            circularEdges.filter { it.fromTable == tableName && it.fromDocumentId == selection.documentId }
-                                .map { it.viaLink }
-                                .toSet(),
-                            allTargetFileIdByDoc,
-                            mappingMap
-                        )
-                        processedStatus[key] = ok
-                    }
-
-                    StrapiContentTypeKind.CollectionType -> {
-                        val ok = processCollectionType(
-                            tableName,
-                            schemaTable,
-                            schema,
-                            selection,
-                            entry,
-                            sourceStrapiInstance,
-                            targetStrapiInstance,
-                            targetClient,
-                            comparisonDataMap,
-                            contentTypeMappingByTable,
-                            circularEdges.filter { it.fromTable == tableName && it.fromDocumentId == selection.documentId }
-                                .map { it.viaLink }
-                                .toSet(),
-                            allTargetFileIdByDoc,
-                            mappingMap
-                        )
-                        processedStatus[key] = ok
-                    }
-
-                    StrapiContentTypeKind.Files, StrapiContentTypeKind.Component -> {
-                        // Files are handled separately in MergeRequestService; skip here.
-                        continue
-                    }
-                }
+                }.awaitAll()
             }
         }
     }
@@ -276,6 +325,67 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
         }
     }
 
+    /**
+     * Draft & Publish fidelity (Strapi v5), run AFTER the primary published write succeeds:
+     *  - MODIFIED (source has a divergent draft overlay): write the draft body to the same target
+     *    document with `?status=draft`, so the target reproduces the "modified" state (published v1
+     *    + pending draft v2) without re-publishing.
+     *  - DRAFT_ONLY (source has no published row): the primary write already went to the draft channel
+     *    (status=draft); here we additionally unpublish the target if it still has a published row
+     *    (e.g. it was previously published), so it ends up draft-only like the source.
+     * No-op when includeDrafts is off (no overlay, not draft-only).
+     */
+    private suspend fun applyDraftFidelity(
+        sourceEntry: it.sebi.models.StrapiContent,
+        targetContent: it.sebi.models.StrapiContent?,
+        targetDocumentId: String,
+        contentTypeSchema: DbTable,
+        dbSchema: DbSchema,
+        kind: StrapiContentTypeKind,
+        targetClient: StrapiClient,
+        comparisonDataMap: ContentTypeComparisonResultMapWithRelationships,
+        contentTypeMappingByTable: Map<String, DbTable>,
+        excludeLinks: Set<StrapiLinkRef>,
+        allTargetFileIdByDoc: Map<String, Int>,
+        mappingMap: MutableMap<String, MutableMap<String, MergeRequestDocumentMapping>>
+    ) {
+        if (targetDocumentId.isBlank()) return
+        val apiUid = contentTypeSchema.metadata!!.apiUid
+        if (sourceEntry.metadata.isDraftOnly) {
+            // Source is draft-only: make sure the target has no lingering published row.
+            if (targetContent != null && !targetContent.metadata.isDraftOnly) {
+                try {
+                    targetClient.unpublishEntry(apiUid, targetDocumentId, kind)
+                } catch (e: Exception) {
+                    logger.error("Draft fidelity: failed to unpublish $apiUid/$targetDocumentId: ${e.message}", e)
+                    throw e
+                }
+            }
+            return
+        }
+        // MODIFIED: apply the divergent draft overlay on top of the just-published version.
+        val overlay = sourceEntry.draft ?: return
+        val draftLinks = overlay.links.filterNot { excludeLinks.contains(it) }
+        val draftPayload = ContentJsonUtils.processJsonElementNew(
+            comparisonDataMap,
+            overlay.rawData,
+            contentTypeSchema,
+            dbSchema,
+            contentTypeMappingByTable,
+            draftLinks,
+            allTargetFileIdByDoc,
+            mappingMap
+        ).jsonObject
+        targetClient.upsertContentEntry(
+            contentTypeSchema.metadata!!.queryName,
+            dropForeignFields(contentTypeSchema.name, draftPayload),
+            kind,
+            sourceEntry.metadata.documentId,
+            targetDocumentId,
+            status = "draft"
+        )
+    }
+
     private suspend fun processSingleType(
         contentTypeUid: String,
         contentTypeSchema: DbTable,
@@ -307,12 +417,20 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                     mappingMap
                 ).jsonObject
                 try {
+                    // Idempotent re-run: fall back to the previously-created target (mapping) so a
+                    // re-run updates in place instead of duplicating / hitting unique-field errors.
+                    val targetDocForUpsert = comparisonResult.targetContent?.metadata?.documentId
+                        ?: mappingMap[contentTypeSchema.metadata!!.apiUid]?.get(sourceEntry.metadata.documentId)?.targetDocumentId
+                    // Draft & Publish fidelity (v5): a draft-only source writes to the draft channel and
+                    // is NOT published; everything else writes+publishes the published body as usual.
+                    val primaryStatus = if (sourceEntry.metadata.isDraftOnly) "draft" else null
                     val response = targetClient.upsertContentEntry(
                         contentTypeSchema.metadata!!.queryName,
-                        dataToCreate,
+                        dropForeignFields(contentTypeSchema.name, dataToCreate),
                         StrapiContentTypeKind.SingleType,
                         sourceEntry.metadata.documentId,
-                        comparisonResult.targetContent?.metadata?.documentId
+                        targetDocForUpsert,
+                        status = primaryStatus
                     )
                     val data = response["data"]?.jsonObject
                     val targetDocumentId = data?.get("documentId")?.jsonPrimitive?.contentOrNull ?: ""
@@ -364,6 +482,25 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                             targetDocumentId = targetDocumentId
                         )
                     }
+                    // Anti-drift (Phase 1): propagate the SOURCE syncId onto the target sidecar so
+                    // identity stays shared after apply (prevents phantom diffs on re-compare).
+                    val srcSyncId = sourceEntry.metadata.syncId
+                    if (!srcSyncId.isNullOrBlank() && targetDocumentId.isNotBlank()) {
+                        SyncIdentityService.upsertIdentity(
+                            targetStrapiInstance,
+                            contentTypeSchema.metadata!!.apiUid,
+                            targetDocumentId,
+                            sourceEntry.metadata.locale,
+                            srcSyncId
+                        )
+                    }
+                    // Draft & Publish fidelity: write the divergent draft overlay (modified) or ensure
+                    // the target is unpublished (draft-only). No-op when includeDrafts is off.
+                    applyDraftFidelity(
+                        sourceEntry, comparisonResult.targetContent, targetDocumentId,
+                        contentTypeSchema, dbSchema, StrapiContentTypeKind.SingleType, targetClient,
+                        comparisonDataMap, contentTypeMappingByTable, excludeLinks, allTargetFileIdByDoc, mappingMap
+                    )
                     mergeRequestSelectionsRepository.updateSyncStatus(selection.id, true, null)
                     true
                 } catch (clex: ClientRequestException) {
@@ -447,12 +584,21 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
 //                    }
 //                }
                 try {
+                    // Idempotent re-run: if this source entry was already created in a previous run
+                    // (mapping exists), upsert against that target documentId instead of creating a
+                    // duplicate (or hitting a unique-field ValidationError).
+                    val targetDocForUpsert = entry.targetContent?.metadata?.documentId
+                        ?: mappingMap[contentTypeSchema.metadata!!.apiUid]?.get(sourceContent.metadata.documentId)?.targetDocumentId
+                    // Draft & Publish fidelity (v5): a draft-only source writes to the draft channel and
+                    // is NOT published; everything else writes+publishes the published body as usual.
+                    val primaryStatus = if (sourceContent.metadata.isDraftOnly) "draft" else null
                     val response = targetClient.upsertContentEntry(
                         contentTypeSchema.metadata!!.queryName,
-                        dataToCreate,
+                        dropForeignFields(contentTypeSchema.name, dataToCreate),
                         StrapiContentTypeKind.CollectionType,
                         sourceContent.metadata.documentId,
-                        entry.targetContent?.metadata?.documentId
+                        targetDocForUpsert,
+                        status = primaryStatus
                     )
                     val data = response["data"]?.jsonObject
                     val targetDocumentId = data?.get("documentId")?.jsonPrimitive?.contentOrNull ?: ""
@@ -503,6 +649,25 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                             targetDocumentId = targetDocumentId
                         )
                     }
+                    // Anti-drift (Phase 1): propagate the SOURCE syncId onto the target sidecar so
+                    // identity stays shared after apply (prevents phantom diffs on re-compare).
+                    val srcSyncId = sourceContent.metadata.syncId
+                    if (!srcSyncId.isNullOrBlank() && targetDocumentId.isNotBlank()) {
+                        SyncIdentityService.upsertIdentity(
+                            targetStrapiInstance,
+                            contentTypeSchema.metadata!!.apiUid,
+                            targetDocumentId,
+                            sourceContent.metadata.locale,
+                            srcSyncId
+                        )
+                    }
+                    // Draft & Publish fidelity: write the divergent draft overlay (modified) or ensure
+                    // the target is unpublished (draft-only). No-op when includeDrafts is off.
+                    applyDraftFidelity(
+                        sourceContent, entry.targetContent, targetDocumentId,
+                        contentTypeSchema, dbSchema, StrapiContentTypeKind.CollectionType, targetClient,
+                        comparisonDataMap, contentTypeMappingByTable, excludeLinks, allTargetFileIdByDoc, mappingMap
+                    )
                     mergeRequestSelectionsRepository.updateSyncStatus(selection.id, true, null)
                     true
                 } catch (e: Exception) {

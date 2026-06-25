@@ -17,6 +17,9 @@ object MergeRequestsTable : IntIdTable("merge_requests") {
     val sourceInstanceId = integer("source_instance_id").references(StrapiInstancesTable.id)
     val targetInstanceId = integer("target_instance_id").references(StrapiInstancesTable.id)
     val status = enumeration("status", MergeRequestStatus::class)
+    // Strapi v5 Draft & Publish fidelity: when true, the comparison/merge also carries the draft
+    // channel (modified drafts, draft-only entries). Default false = published-only (legacy behavior).
+    val includeDrafts = bool("include_drafts").default(false)
     val createdAt = timestampWithTimeZone("created_at").default(OffsetDateTime.now())
     val updatedAt = timestampWithTimeZone("updated_at").default(OffsetDateTime.now())
 }

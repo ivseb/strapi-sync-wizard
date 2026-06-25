@@ -101,24 +101,27 @@ suspend fun SyncService.checkSchemaCompatibilityDb(
         }
     }
 
-    val isCompatible = missingInTarget.isEmpty() && missingInSource.isEmpty() && tableDiffs.isEmpty()
+    // Directional compatibility: block only on source content-types missing in target or shared
+    // columns with incompatible base type. Other differences are tolerated (see computeBlocking).
+    val (blockingTables, typeMismatches) = computeBlocking(sourceDef, targetDef)
+    val isCompatible = blockingTables.isEmpty() && typeMismatches.isEmpty()
 
-    val extracted: DbSchema? = if (isCompatible) {
-        // Build enriched schema from source DB JSON and Strapi metadata
+    // Always build the enriched (source) schema; the merge needs it even when not strictly identical.
+    val extracted: DbSchema? = run {
         val contentTypesMeta: Map<String, StrapiContentType> =
             sourceInstance.client().getContentTypes().associateBy { it.schema.collectionName }
         val componentMeta: Map<String, StrapiComponent> =
             sourceInstance.client().getComponentSchema().associateBy { it.schema.collectionName }
-//        val metadataList = fetchStrapiMetadataJsonFromDb(sourceInstance)
-//        val metaByCollection = metadataList.associateBy { it.collectionName }
         parseDbSchemaModel(sourceJson, contentTypesMeta, componentMeta)
-    } else null
+    }
 
     val result = SchemaDbCompatibilityResult(
         isCompatible = isCompatible,
         missingTablesInTarget = missingInTarget,
         missingTablesInSource = missingInSource,
         tableDifferences = tableDiffs.sortedBy { it.table },
+        blockingContentTypes = blockingTables,
+        blockingColumnTypes = typeMismatches,
         extractedSchema = extracted
     )
 
@@ -130,9 +133,32 @@ suspend fun SyncService.checkSchemaCompatibilityDb(
 
 private data class TableDef(
     val columns: Map<String, String>,
+    val types: Map<String, String>,
     val indexes: Map<String, String>,
     val foreignKeys: Map<String, String>
 )
+
+/**
+ * Directional compatibility (source -> target). Blocking issues only:
+ *  - a source content-type (table) missing in target  -> can't be created there
+ *  - a shared column whose base TYPE differs           -> would break writes
+ * Non-blocking (allowed): target-only tables/columns, source-only columns (auto-dropped on merge),
+ * index/FK differences, and cosmetic column diffs (default/nullable/unsigned/args).
+ */
+private fun computeBlocking(
+    sourceDef: Map<String, TableDef>,
+    targetDef: Map<String, TableDef>
+): Pair<List<String>, List<String>> {
+    val tablesMissingInTarget = sourceDef.keys.minus(targetDef.keys).sorted()
+    val typeMismatches = sourceDef.keys.intersect(targetDef.keys).flatMap { table ->
+        val s = sourceDef.getValue(table)
+        val t = targetDef.getValue(table)
+        s.types.keys.intersect(t.types.keys)
+            .filter { c -> s.types[c] != null && t.types[c] != null && s.types[c] != t.types[c] }
+            .map { "$table.$it" }
+    }.sorted()
+    return tablesMissingInTarget to typeMismatches
+}
 
 private fun parseStrapiDbSchema(json: String): Map<String, TableDef> {
     val root = Json.parseToJsonElement(json).jsonObject
@@ -173,10 +199,14 @@ private fun parseStrapiDbSchema(json: String): Map<String, TableDef> {
         if (name.startsWith("strapi_")) continue
 
         val colMap = mutableMapOf<String, String>()
+        val typeMap = mutableMapOf<String, String>()
         (to["columns"] as? JsonArray)?.forEach { c ->
             val co = c.jsonObject
             val cn = co["name"]?.jsonPrimitive?.content
-            if (cn != null) colMap[cn] = colSig(co)
+            if (cn != null) {
+                colMap[cn] = colSig(co)
+                co["type"]?.jsonPrimitive?.contentOrNull?.let { typeMap[cn] = it }
+            }
         }
 
         val idxMap = mutableMapOf<String, String>()
@@ -193,7 +223,7 @@ private fun parseStrapiDbSchema(json: String): Map<String, TableDef> {
             if (fkName != null) fkMap[fkName] = fkSig(fko)
         }
 
-        map[name] = TableDef(columns = colMap, indexes = idxMap, foreignKeys = fkMap)
+        map[name] = TableDef(columns = colMap, types = typeMap, indexes = idxMap, foreignKeys = fkMap)
     }
     return map.filterNot { it.key.startsWith("strapi_") }
 }
@@ -348,6 +378,18 @@ private fun parseDbSchemaModel(
     return DbSchema(parsed)
 }
 
+/**
+ * Reads the schema JSON from the instance's `strapi_database_schema` (single row Strapi maintains).
+ * The resulting table count is taken verbatim from this JSON.
+ *
+ * CAVEAT (known, by-design): this reflects whatever Strapi last wrote. If the instance Strapi is still
+ * BOOTSTRAPPING (e.g. just restarted, or its DB was just reloaded and Strapi is re-syncing the schema),
+ * this row can transiently hold a partial/core-only schema (far fewer tables) until the boot finishes —
+ * `/_health` returns ready BEFORE the schema sync completes. A compare run started in that window will
+ * see a truncated schema and an almost-empty comparison. This does NOT happen with a steady, already-up
+ * instance. If you just restarted/reloaded a Strapi instance, wait for it to finish booting before
+ * running check-schema/compare (re-running check-schema once it's up yields the full schema).
+ */
 private fun fetchStrapiSchemaJsonFromDb(instance: StrapiInstance): String? {
     val logger = LoggerFactory.getLogger("SyncServiceDb")
 
@@ -557,9 +599,10 @@ private fun buildTableDefFromDbSchema(schema: DbSchema): Map<String, TableDef> {
     val map = mutableMapOf<String, TableDef>()
     for (t in schema.tables) {
         val colMap = t.columns.associate { it.name to colSig(it) }
+        val typeMap = t.columns.mapNotNull { c -> c.type?.let { c.name to it } }.toMap()
         val idxMap = t.indexes.associate { it.name to idxSig(it) }
         val fkMap = t.foreignKeys.associate { it.name to fkSig(it) }
-        map[t.name] = TableDef(colMap, idxMap, fkMap)
+        map[t.name] = TableDef(colMap, typeMap, idxMap, fkMap)
     }
     return map
 }
@@ -643,14 +686,17 @@ suspend fun SyncService.checkSchemaCompatibilityAgainstTarget(
         }
     }
 
-    val isCompatible = missingInTarget.isEmpty() && missingInSource.isEmpty() && tableDiffs.isEmpty()
-    val extracted: DbSchema? = if (isCompatible) sourceSchema else null
+    val (blockingTables, typeMismatches) = computeBlocking(sourceDef, targetDef)
+    val isCompatible = blockingTables.isEmpty() && typeMismatches.isEmpty()
+    val extracted: DbSchema? = sourceSchema // always available for the merge
 
     return SchemaDbCompatibilityResult(
         isCompatible = isCompatible,
         missingTablesInTarget = missingInTarget,
         missingTablesInSource = missingInSource,
         tableDifferences = tableDiffs.sortedBy { it.table },
+        blockingContentTypes = blockingTables,
+        blockingColumnTypes = typeMismatches,
         extractedSchema = extracted
     )
 }

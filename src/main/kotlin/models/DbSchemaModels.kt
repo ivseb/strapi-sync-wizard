@@ -9,6 +9,9 @@ data class SchemaDbCompatibilityResult(
     val missingTablesInTarget: List<String> = emptyList(),
     val missingTablesInSource: List<String> = emptyList(),
     val tableDifferences: List<TableDifference> = emptyList(),
+    // Directional blocking reasons (empty => mergeable). Other differences are warnings.
+    val blockingContentTypes: List<String> = emptyList(),
+    val blockingColumnTypes: List<String> = emptyList(),
     // When compatible, include the parsed schema from one DB (typically the source)
     val extractedSchema: DbSchema? = null
 )

@@ -14,6 +14,7 @@ object FileAnalysisCacheTable : IntIdTable("file_analysis_cache") {
     val updatedAtStr = varchar("updated_at_str", 255).nullable() // Usato per invalidare se il file cambia su Strapi
     val calculatedHash = varchar("calculated_hash", 255)
     val calculatedSizeBytes = long("calculated_size_bytes")
+    val calculatedSha = varchar("calculated_sha", 128).nullable() // sha256 of bytes (exact same-bytes signal)
     val createdAt = timestampWithTimeZone("created_at").default(OffsetDateTime.now())
     val lastUsedAt = timestampWithTimeZone("last_used_at").default(OffsetDateTime.now())
 

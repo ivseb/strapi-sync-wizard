@@ -14,9 +14,21 @@ StrapiSync is a synchronization tool for [Strapi CMS](https://strapi.io/) that a
 - **Instance Management**: Configure and manage multiple Strapi instances
 - **Content Synchronization**: Synchronize content between Strapi instances
 - **Merge Requests**: Create, review, and complete merge requests for content changes
-- **Diff Viewer**: Compare content differences between instances
-- **Media Management**: Synchronize media files and folders
+- **Diff Viewer**: Compare content differences between instances (char-level refinement)
+- **Media Management**: Synchronize media files and folders, with media deduplication
 - **Selective Sync**: Choose which content types and entries to synchronize
+- **Draft & Publish fidelity (Strapi v5)**: Optionally sync the draft channel too — modified
+  drafts, draft-only entries, and explicit unpublish are reproduced on the target. See
+  [docs/draft-publish-sync.md](docs/draft-publish-sync.md).
+- **Stable sync identity**: A cross-instance identity layer reconciles documents by a shared
+  `sync_id` (plus content fingerprint / natural key fallbacks), so re-running a sync is idempotent
+  and doesn't over-report create/delete due to colliding instance-local ids.
+- **Post-sync verification**: After a merge, recompute the comparison against the target and
+  classify each item as consistent, schema-gap, or real mismatch.
+- **Content deduplication**: Detect and collapse duplicate collection entries (like media dedup).
+- **Snapshot management**: Per-instance Postgres snapshots with restore, for safe rollback.
+- **Robust apply**: Per-item failover, honest partial-failure counts, retry-only-failed, and
+  opt-in rollback-on-failure.
 
 ## Architecture
 
@@ -32,7 +44,9 @@ StrapiSync is built with:
 - JDK 17 or higher
 - PostgreSQL database
 - Node.js and npm (for frontend development)
-- Strapi instances (v4.x) to synchronize
+- Strapi instances (v5.x) to synchronize — reads run via direct PostgreSQL access, writes via the
+  Strapi REST/admin API, so the tool needs DB connectivity *and* an API token (plus admin
+  credentials for Draft & Publish operations)
 
 ## Configuration
 
@@ -180,13 +194,21 @@ The merge request workflow in StrapiSync involves several technical steps that i
 5. **Merge Execution**: When completing a merge request, the system:
    - Processes files first, downloading from source and uploading to target
    - Creates folder structures in the target if needed
-   - Processes content entries in dependency order
-   - Maintains relationships between content types
-   - Updates document mappings to track synchronized content
+   - Processes content entries in dependency order (parallelized within a batch)
+   - Maintains relationships between content types (resolved by stable identity, not raw ids)
+   - When *Include drafts* is on, reproduces the Draft & Publish state per document: a divergent
+     draft is written via `?status=draft` on top of the published version; a draft-only entry is
+     created as a draft and left unpublished; an explicit unpublish is replayed via the admin API
+   - Updates document mappings to track synchronized content (idempotent on re-run)
 
-6. **Status Updates**: Throughout the process, the merge request status is updated in the database to reflect progress.
+6. **Post-sync Verification**: After applying, the system recomputes the comparison against the
+   target and classifies each item as *consistent*, *schema-gap*, or *real mismatch*.
 
-All API interactions use the Strapi REST API with proper authentication, handling pagination, and managing relationships between content types.
+7. **Status Updates**: Throughout the process, the merge request status is updated in the database to reflect progress.
+
+All API interactions use the Strapi REST API (and the admin content-manager API for publish/
+unpublish) with proper authentication, handling pagination, and managing relationships between
+content types.
 
 ## Project Background
 

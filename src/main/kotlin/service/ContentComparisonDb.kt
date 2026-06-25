@@ -2,6 +2,7 @@ package it.sebi.service
 
 import it.sebi.database.dbQuery
 import it.sebi.models.*
+import it.sebi.service.identity.SyncIdentityService
 import it.sebi.tables.MergeRequestDocumentMappingTable
 import it.sebi.tables.MergeRequestExclusionTable
 import kotlinx.coroutines.*
@@ -52,14 +53,10 @@ private suspend fun compareFilesFromPrefetch(
     val sourceWithFp = pre.sourceFiles
     val targetWithFp = pre.targetFiles
 
-    val targetByKey: MutableMap<String, StrapiImage> =
-        targetWithFp.associateBy { keyOfTarget(it.metadata) }.toMutableMap()
-    val targetByFp: MutableMap<String, MutableList<StrapiImage>> = mutableMapOf()
-    for (t in targetWithFp) {
-        val fp = t.metadata.calculatedHash
-        if (!fp.isNullOrBlank()) targetByFp.getOrPut(fp) { mutableListOf() }.add(t)
-    }
+    // Deterministic, conservative pairing (see compareFilesFromPrefetch tiers below).
+    val targetByDocKey: Map<String, StrapiImage> = targetWithFp.associateBy { keyOfTarget(it.metadata) }
     val usedTargetIds = mutableSetOf<Int>()
+    val pairedSourceIds = mutableSetOf<Int>()
 
     fun compareStateOf(s: StrapiImage?, t: StrapiImage?): ContentTypeComparisonResultKind {
         if (s != null) {
@@ -144,74 +141,75 @@ private suspend fun compareFilesFromPrefetch(
     }
 
     val results = mutableListOf<ContentTypeFileComparisonResult>()
-    for (s in sourceWithFp) {
-        val sm = s.metadata
-        val mappedDoc = currentFileMapping[sm.documentId]?.targetDocumentId ?: sm.documentId
-        val k = keyOf(mappedDoc, sm.locale)
-        var t: StrapiImage? = targetByKey[k]?.takeIf { usedTargetIds.add(it.metadata.id) }
-        if (t == null) {
-            val fp = sm.calculatedHash
-            if (!fp.isNullOrBlank()) {
-                val candidates = targetByFp[fp]
-                if (!candidates.isNullOrEmpty()) {
-                    // Safety check before pairing: fingerprints match, but do metadata and size also match within reason?
-                    // This prevents auto-pairing very different images that happen to have same dHash (like black logos).
-                    val sourceSize = sm.calculatedSizeBytes ?: sm.size.toLong()
-                    
-                    val filteredCandidates = candidates.filter { cand ->
-                        if (usedTargetIds.contains(cand.metadata.id)) return@filter false
-                        
-                        val targetSize = cand.metadata.calculatedSizeBytes ?: cand.metadata.size.toLong()
-                        val sizeDiff = Math.abs(sourceSize - targetSize).toDouble()
-                        val maxSize = Math.max(sourceSize, targetSize).toDouble()
-                        val sizeToleranceOk = if (maxSize > 0) (sizeDiff / maxSize) < 0.25 else true
-                        
-                        val nameSimilarityOk = sm.name.equals(cand.metadata.name, ignoreCase = true) || 
-                                              sm.name.contains(cand.metadata.name, ignoreCase = true) || 
-                                              cand.metadata.name.contains(sm.name, ignoreCase = true)
-                        
-                        // Accept if either size is similar OR name is similar. 
-                        // If both are very different, it's likely a collision.
-                        sizeToleranceOk || nameSimilarityOk
-                    }
+    fun pairUp(s: StrapiImage, t: StrapiImage) {
+        results.add(ContentTypeFileComparisonResult(sourceImage = s, targetImage = t, compareState = compareStateOf(s, t)))
+        usedTargetIds.add(t.metadata.id)
+        pairedSourceIds.add(s.metadata.id)
+    }
+    fun remainingSources(): List<StrapiImage> = sourceWithFp.filter { it.metadata.id !in pairedSourceIds }
+    fun remainingTargets(): List<StrapiImage> = targetWithFp.filter { it.metadata.id !in usedTargetIds }
+    // Folder NAME path (e.g. "/illustrations") is stable across instances; folderPath (numeric
+    // folder ids like "/4") is environment-specific, so never key on it.
+    fun nameFolderKey(m: StrapiImageMetadata): String =
+        "${m.name.trim().lowercase()}|${m.ext.lowercase()}|${(m.folder ?: "/").lowercase()}|${m.locale ?: ""}"
+    fun nameKey(m: StrapiImageMetadata): String =
+        "${m.name.trim().lowercase()}|${m.ext.lowercase()}|${m.locale ?: ""}"
 
-                    val preferred = filteredCandidates.firstOrNull { it.metadata.locale == sm.locale }
-                    val anyOther = preferred ?: filteredCandidates.firstOrNull()
-                    
-                    if (anyOther != null) {
-                        t = anyOther
-                        usedTargetIds.add(anyOther.metadata.id)
-                        dbQuery {
-                            MergeRequestDocumentMappingTable.insert {
-                                it[MergeRequestDocumentMappingTable.sourceStrapiId] = mergeRequest.sourceInstance.id
-                                it[MergeRequestDocumentMappingTable.targetStrapiId] = mergeRequest.targetInstance.id
-                                it[MergeRequestDocumentMappingTable.contentType] = STRAPI_FILE_CONTENT_TYPE_NAME
-                                it[MergeRequestDocumentMappingTable.sourceId] = s.metadata.id
-                                it[MergeRequestDocumentMappingTable.sourceDocumentId] = s.metadata.documentId
-                                it[MergeRequestDocumentMappingTable.targetId] = t.metadata.id
-                                it[MergeRequestDocumentMappingTable.targetDocumentId] = t.metadata.documentId
-                                it[MergeRequestDocumentMappingTable.locale] = t.metadata.locale
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        val state = compareStateOf(s, t)
-        results.add(ContentTypeFileComparisonResult(sourceImage = s, targetImage = t, compareState = state))
+    // Conservative, deterministic tiers (no greedy dHash — it mis-pairs duplicates and steals
+    // true twins). Ambiguous groups (duplicate names / colliding bytes) are left unpaired for
+    // human review rather than auto-matched. Durable identity is the shared syncId (Tier 1),
+    // written by reconciliation; dHash is only used inside compareStateOf to classify a pair.
+
+    // Tier 0 — explicit, human-confirmed mappings by documentId.
+    for (s in sourceWithFp) {
+        val mapped = currentFileMapping[s.metadata.documentId]?.targetDocumentId ?: continue
+        val t = targetByDocKey[keyOf(mapped, s.metadata.locale)] ?: continue
+        if (t.metadata.id in usedTargetIds) continue
+        pairUp(s, t)
     }
-    for (t in targetWithFp) {
-        if (!usedTargetIds.contains(t.metadata.id)) {
-            results.add(
-                ContentTypeFileComparisonResult(
-                    sourceImage = null,
-                    targetImage = t,
-                    compareState = ContentTypeComparisonResultKind.ONLY_IN_TARGET
-                )
-            )
-            usedTargetIds.add(t.metadata.id)
+    // Tier 1 — durable shared syncId (exact identity join).
+    run {
+        val tgtBySync = remainingTargets().filter { !it.metadata.syncId.isNullOrBlank() }.groupBy { it.metadata.syncId!! }
+        for (s in remainingSources()) {
+            val sid = s.metadata.syncId?.takeIf { it.isNotBlank() } ?: continue
+            val t = tgtBySync[sid]?.firstOrNull { it.metadata.id !in usedTargetIds } ?: continue
+            pairUp(s, t)
         }
     }
+    // Tier 2 — exact same bytes (sha256), only when unique 1:1 on both sides.
+    run {
+        val srcBySha = remainingSources().filter { !it.metadata.calculatedSha.isNullOrBlank() }.groupBy { it.metadata.calculatedSha!! }
+        val tgtBySha = remainingTargets().filter { !it.metadata.calculatedSha.isNullOrBlank() }.groupBy { it.metadata.calculatedSha!! }
+        for ((sha, sList) in srcBySha) {
+            val tList = tgtBySha[sha] ?: continue
+            if (sList.size == 1 && tList.size == 1) pairUp(sList.first(), tList.first())
+        }
+    }
+    // Tier 3 — same name+ext+folder NAME(+locale), only when unique 1:1 (re-encoded asset, same folder).
+    run {
+        val srcByName = remainingSources().groupBy { nameFolderKey(it.metadata) }
+        val tgtByName = remainingTargets().groupBy { nameFolderKey(it.metadata) }
+        for ((k, sList) in srcByName) {
+            val tList = tgtByName[k] ?: continue
+            if (sList.size == 1 && tList.size == 1) pairUp(sList.first(), tList.first())
+        }
+    }
+    // Tier 4 — same name+ext(+locale) ignoring folder, only when unique 1:1 (same asset moved to a
+    // different folder; folder ids differ across instances). Still safe: requires global 1:1.
+    run {
+        val srcByName = remainingSources().groupBy { nameKey(it.metadata) }
+        val tgtByName = remainingTargets().groupBy { nameKey(it.metadata) }
+        for ((k, sList) in srcByName) {
+            val tList = tgtByName[k] ?: continue
+            if (sList.size == 1 && tList.size == 1) pairUp(sList.first(), tList.first())
+        }
+    }
+    // Tier 5 — leftovers: genuinely one-sided OR ambiguous (left for review). compareStateOf keeps
+    // exclusion awareness.
+    for (s in remainingSources())
+        results.add(ContentTypeFileComparisonResult(sourceImage = s, targetImage = null, compareState = compareStateOf(s, null)))
+    for (t in remainingTargets())
+        results.add(ContentTypeFileComparisonResult(sourceImage = null, targetImage = t, compareState = compareStateOf(null, t)))
     return results
 }
 
@@ -222,6 +220,11 @@ suspend fun prefetchComparisonData(
     val logger = LoggerFactory.getLogger("SyncServiceDb")
     logger.info("Prefetching Strapi data for MR ${mergeRequest.id} between '${mergeRequest.sourceInstance.name}' and '${mergeRequest.targetInstance.name}'")
 
+    // Identity layer (Phase 1): ensure the sync_identity sidecar exists on both instances before
+    // any read JOINs it. Idempotent and cheap. Virtual/unconfigured instances are skipped inside.
+    if (!mergeRequest.sourceInstance.isVirtual) SyncIdentityService.ensureTable(mergeRequest.sourceInstance)
+    if (!mergeRequest.targetInstance.isVirtual) SyncIdentityService.ensureTable(mergeRequest.targetInstance)
+
     // Files and relations/components/tables/components definitions
     val srcFilesDef: Deferred<List<StrapiImage>> = async { fetchFilesFromDb(mergeRequest.sourceInstance) }
     val tgtFilesDef: Deferred<List<StrapiImage>> = async { fetchFilesFromDb(mergeRequest.targetInstance) }
@@ -230,8 +233,8 @@ suspend fun prefetchComparisonData(
     val tgtRelDef: Deferred<List<FilesRelatedMph>> = async { fetchFilesRelatedMph(mergeRequest.targetInstance) }
     val srcCMPSDef: Deferred<CmpsMap> = async { fetchCMPS(mergeRequest.sourceInstance, dbSchema) }
     val tgtCMPSDef: Deferred<CmpsMap> = async { fetchCMPS(mergeRequest.targetInstance, dbSchema) }
-    val scrTablesDef: Deferred<TableMap> = async { fetchTables(mergeRequest.sourceInstance, dbSchema) }
-    val tgtTablesDef: Deferred<TableMap> = async { fetchTables(mergeRequest.targetInstance, dbSchema) }
+    val scrTablesDef: Deferred<TableMap> = async { fetchTables(mergeRequest.sourceInstance, dbSchema, mergeRequest.includeDrafts) }
+    val tgtTablesDef: Deferred<TableMap> = async { fetchTables(mergeRequest.targetInstance, dbSchema, mergeRequest.includeDrafts) }
     val srcCompDef: Deferred<MutableMap<String, MutableMap<Int, JsonObject>>> =
         async { fetchComponents(mergeRequest.sourceInstance, dbSchema) }
     val tgtCompDef: Deferred<MutableMap<String, MutableMap<Int, JsonObject>>> =
@@ -286,8 +289,9 @@ suspend fun prefetchComparisonData(
                 cmpsMap = sourceCMPSMap,
                 componentTableCache = srcCompMap,
                 tableMap = sourceTableMap,
-                fileCache = sourceFiles.associate { it.metadata.id to it.metadata.documentId }
-            ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata, excludedFields) }
+                fileCache = sourceFiles.associate { it.metadata.id to it.metadata.documentId },
+                includeDrafts = mergeRequest.includeDrafts
+            ).let { rowsToContent(it, table.metadata, excludedFields, mergeRequest.includeDrafts) }
         }
 
         val targetRowsDef = async(Dispatchers.IO) {
@@ -299,8 +303,9 @@ suspend fun prefetchComparisonData(
                 cmpsMap = targetCMPSMap,
                 componentTableCache = tgtCompMap,
                 tableMap = targetTableMap,
-                fileCache = targetFiles.associate { it.metadata.id to it.metadata.documentId }
-            ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata, excludedFields) }
+                fileCache = targetFiles.associate { it.metadata.id to it.metadata.documentId },
+                includeDrafts = mergeRequest.includeDrafts
+            ).let { rowsToContent(it, table.metadata, excludedFields, mergeRequest.includeDrafts) }
         }
 
         val (sourceRows, targetRows) = awaitAll(sourceRowsDef, targetRowsDef)
@@ -330,16 +335,21 @@ suspend fun prefetchComparisonData(
 @Suppress("RedundantSuspendModifier")
 suspend fun exportSourcePrefetch(
     instance: StrapiInstance,
-    dbSchema: DbSchema
+    dbSchema: DbSchema,
+    includeDrafts: Boolean = false
 ): ComparisonPrefetchCache = coroutineScope {
     val logger = LoggerFactory.getLogger("SyncServiceDb")
     logger.info("Exporting source-only prefetch for instance '${instance.name}'")
+
+    // Identity layer (Phase 1): ensure the sync_identity sidecar exists before reads JOIN it,
+    // so the exported rows carry their shared sync_id across the air-gap.
+    if (!instance.isVirtual) SyncIdentityService.ensureTable(instance)
 
     // Files and relations/components/tables/components definitions for source only
     val filesDef: Deferred<List<StrapiImage>> = async { fetchFilesFromDb(instance) }
     val relDef: Deferred<List<FilesRelatedMph>> = async { fetchFilesRelatedMph(instance) }
     val cmpsDef: Deferred<CmpsMap> = async { fetchCMPS(instance, dbSchema) }
-    val tablesDef: Deferred<TableMap> = async { fetchTables(instance, dbSchema) }
+    val tablesDef: Deferred<TableMap> = async { fetchTables(instance, dbSchema, includeDrafts) }
     val compDef: Deferred<MutableMap<String, MutableMap<Int, JsonObject>>> = async { fetchComponents(instance, dbSchema) }
     // New: folders snapshot from source Strapi (via HTTP API)
     val foldersDef: Deferred<List<StrapiFolder>> = async {
@@ -377,8 +387,9 @@ suspend fun exportSourcePrefetch(
             cmpsMap = cmpsMap,
             componentTableCache = compMap,
             tableMap = tableMap,
-            fileCache = filesWithFp.associate { it.metadata.id to it.metadata.documentId }
-        ).map { (obj, links) -> toStrapiContent(obj, links, table.metadata) }
+            fileCache = filesWithFp.associate { it.metadata.id to it.metadata.documentId },
+            includeDrafts = includeDrafts
+        ).let { rowsToContent(it, table.metadata, includeDrafts = includeDrafts) }
         sourceRowsByUid[uid] = rows
     }
 
@@ -465,6 +476,17 @@ suspend fun computeComparisonFromPrefetch(
             acc.putAll(v); acc
         }
 
+    // documentId -> sync_id per instance (raw identity from the sidecar).
+    val srcSyncByDoc = fetchSyncIdMap(mergeRequest.sourceInstance)
+    val tgtSyncByDoc = fetchSyncIdMap(mergeRequest.targetInstance)
+    // documentId -> CONTENT IDENTITY per instance. Used to normalize relation references during
+    // comparison so duplicate/identical targets (and their order) don't read as changes.
+    val srcIdentity = buildIdentityMap(prefetch.sourceRowsByUid, prefetch.sourceFiles, srcSyncByDoc)
+    val tgtIdentity = buildIdentityMap(prefetch.targetRowsByUid, prefetch.targetFiles, tgtSyncByDoc)
+    // documentId -> readable resolved reference (label + syncId + contentHash + file info) per instance.
+    val srcResolver = buildRefResolver(prefetch.sourceRowsByUid, prefetch.sourceFiles, srcIdentity)
+    val tgtResolver = buildRefResolver(prefetch.targetRowsByUid, prefetch.targetFiles, tgtIdentity)
+
     // Build maps for single and collection types
     val singleTypes = mutableMapOf<String, ContentTypeComparisonResultWithRelationships>()
     val collectionTypes = mutableMapOf<String, List<ContentTypeComparisonResultWithRelationships>>()
@@ -482,11 +504,11 @@ suspend fun computeComparisonFromPrefetch(
             StrapiContentTypeKind.SingleType -> {
                 val source = sourceRows.maxByOrNull { it.metadata.id ?: 0 }
                 val target = targetRows.maxByOrNull { it.metadata.id ?: 0 }
-                singleTypes[table.name] = compareSingleType(table.name, uid, source, target, kind, fileMapping, contentMapping, prefetch.exclusions)
+                singleTypes[table.name] = compareSingleType(table.name, uid, source, target, kind, fileMapping, contentMapping, prefetch.exclusions, srcIdentity, tgtIdentity, srcResolver, tgtResolver)
             }
             StrapiContentTypeKind.CollectionType -> {
                 collectionTypes[table.name] =
-                    compareCollectionType(table.name, uid, sourceRows, targetRows, kind, contentMapping, fileMapping, prefetch.exclusions)
+                    compareCollectionType(table.name, uid, sourceRows, targetRows, kind, contentMapping, fileMapping, prefetch.exclusions, srcIdentity, tgtIdentity, srcResolver, tgtResolver)
             }
             StrapiContentTypeKind.Files, StrapiContentTypeKind.Component -> {
                 // ignore

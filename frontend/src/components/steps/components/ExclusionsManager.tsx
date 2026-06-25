@@ -40,7 +40,7 @@ const ExclusionsManager: React.FC<ExclusionsManagerProps> = ({
                 setExclusions(res.data.data);
             }
         } catch (e: any) {
-            setError(e.message || 'Errore nel caricamento delle esclusioni');
+            setError(e.message || 'Failed to load exclusions');
         } finally {
             setLoading(false);
         }
@@ -58,7 +58,7 @@ const ExclusionsManager: React.FC<ExclusionsManagerProps> = ({
             await fetchExclusions();
             if (onExclusionsChanged) onExclusionsChanged();
         } catch (e: any) {
-            setError(e.message || "Errore durante l'eliminazione dell'esclusione");
+            setError(e.message || 'Failed to delete exclusion');
         }
     };
 
@@ -70,35 +70,35 @@ const ExclusionsManager: React.FC<ExclusionsManagerProps> = ({
 
     return (
         <Dialog 
-            header="Gestione Vincoli di Sincronizzazione (Esclusioni)" 
+            header="Sync exclusions"
             visible={visible} 
             style={{width: '70vw'}} 
             onHide={onHide}
             modal
         >
             <div className="flex flex-column gap-3">
-                <p>Queste entità o campi non verranno mai sovrascritti o sincronizzati tra gli ambienti.</p>
+                <p>These entries or fields are never overwritten or synced across environments.</p>
                 
                 {error && <Message severity="error" text={error} className="mb-3" />}
 
                 <DataTable 
                     value={exclusions} 
                     loading={loading} 
-                    emptyMessage="Nessun vincolo configurato."
+                    emptyMessage="No exclusions configured."
                     responsiveLayout="scroll"
                 >
-                    <Column header="Tipo" body={typeTemplate} style={{width: '10rem'}} />
-                    <Column field="contentType" header="Content Type" />
-                    <Column field="documentId" header="Document ID / Entità" body={r => r.documentId || '-'} />
-                    <Column field="fieldPath" header="Campo / Path" body={r => r.fieldPath || '-'} />
-                    <Column 
-                        header="Azioni" 
+                    <Column header="Type" body={typeTemplate} style={{width: '10rem'}} />
+                    <Column field="contentType" header="Content type" />
+                    <Column field="documentId" header="Document ID / entry" body={r => r.documentId || '-'} />
+                    <Column field="fieldPath" header="Field / path" body={r => r.fieldPath || '-'} />
+                    <Column
+                        header="Actions"
                         body={(rowData: MergeRequestExclusion) => (
                             <Button 
                                 icon="pi pi-trash" 
                                 className="p-button-text p-button-danger" 
                                 onClick={() => deleteExclusion(rowData.id)}
-                                tooltip="Rimuovi vincolo"
+                                tooltip="Remove exclusion"
                             />
                         )}
                         style={{width: '5rem'}}
