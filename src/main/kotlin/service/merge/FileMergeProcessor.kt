@@ -1,5 +1,7 @@
 package it.sebi.service.merge
 
+import io.ktor.client.plugins.ClientRequestException
+import io.ktor.http.HttpStatusCode
 import it.sebi.client.StrapiClient
 import it.sebi.database.dbQuery
 import it.sebi.models.*
@@ -141,15 +143,33 @@ class FileMergeProcessor(private val mergeRequestSelectionsRepository: MergeRequ
                             existingTargetId != null -> existingTargetId
                             else -> null
                         }
-                        val uploadResponse = targetClient.uploadFile(
-                            id,
-                            file.metadata.name,
-                            sourceFile,
-                            file.metadata.mime,
-                            file.metadata.caption,
-                            file.metadata.alternativeText,
-                            folder
-                        )
+                        val uploadResponse = try {
+                            targetClient.uploadFile(
+                                id,
+                                file.metadata.name,
+                                sourceFile,
+                                file.metadata.mime,
+                                file.metadata.caption,
+                                file.metadata.alternativeText,
+                                folder
+                            )
+                        } catch (e: ClientRequestException) {
+                            // The mapped/paired target file no longer exists (stale mapping, or it
+                            // was deleted between compare and apply): create a new file instead of
+                            // failing the item. The mapping is updated right below with the new id.
+                            if (id != null && e.response.status == HttpStatusCode.NotFound) {
+                                logger.warn("Target file id=$id not found on '${targetStrapiInstance.name}' while syncing '${file.metadata.name}' (stale reference); creating a new file instead")
+                                targetClient.uploadFile(
+                                    null,
+                                    file.metadata.name,
+                                    sourceFile,
+                                    file.metadata.mime,
+                                    file.metadata.caption,
+                                    file.metadata.alternativeText,
+                                    folder
+                                )
+                            } else throw e
+                        }
                         // Save mapping between source and target instead of updating target DB document_id
                         val record =  dbQuery {
                             val sourceDocId = file.metadata.documentId

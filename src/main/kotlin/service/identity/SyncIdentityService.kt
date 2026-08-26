@@ -149,6 +149,19 @@ object SyncIdentityService {
         }
     }
 
+    /**
+     * Remove the identity row for (document_id, locale) on an instance. Used when a pairing is
+     * explicitly UNLINKED by the user: the shared sync_id must be broken too, otherwise the syncId
+     * join would silently re-pair the two entries at the next compare.
+     */
+    suspend fun deleteIdentity(instance: StrapiInstance, documentId: String, locale: String?) {
+        val db = instance.database ?: return
+        val loc = localeLiteral(locale)
+        dbQuery(db) {
+            exec("DELETE FROM $TABLE WHERE document_id = '${documentId.sqlEsc()}' AND locale IS NOT DISTINCT FROM $loc")
+        }
+    }
+
     /** Read the sync_id for a single (document_id, locale) on an instance, or null. */
     suspend fun getSyncId(instance: StrapiInstance, documentId: String, locale: String?): String? {
         val db = instance.database ?: return null

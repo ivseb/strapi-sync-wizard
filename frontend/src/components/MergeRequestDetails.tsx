@@ -151,6 +151,26 @@ const MergeRequestDetails: React.FC = () => {
     } catch (err) { showError(apiErrorMessage(err) || 'Failed to update include-drafts'); }
   };
 
+  const toggleAutoReconcile = async () => {
+    if (!mr) return;
+    const next = !(mr.mergeRequest.autoReconcile ?? true);
+    try {
+      await updateMut.mutateAsync({
+        id: mr.mergeRequest.id, name: mr.mergeRequest.name, description: mr.mergeRequest.description,
+        sourceInstanceId: mr.mergeRequest.sourceInstance.id, targetInstanceId: mr.mergeRequest.targetInstance.id,
+        status: mr.mergeRequest.status, autoReconcile: next,
+      });
+      await refetch();
+      toast.current?.show({
+        severity: 'success', summary: next ? 'Auto-reconcile on' : 'Auto-reconcile off',
+        detail: next
+          ? 'Each compare will persist a durable shared identity for confidently paired entries.'
+          : 'Compare will no longer write identities to the instances (you can still reconcile manually).',
+        life: 4500,
+      });
+    } catch (err) { showError(apiErrorMessage(err) || 'Failed to update auto-reconcile'); }
+  };
+
   const proceedToNextStep = async (nextStep: number) => {
     if (!mr) return;
     const status = mr.mergeRequest.status;
@@ -274,6 +294,14 @@ const MergeRequestDetails: React.FC = () => {
               />
             )}
             {schemaResult && schemaResult.warnings.length > 0 && <Chip cls="warn" icon="pi pi-exclamation-triangle" label={`${schemaResult.warnings.length} warning${schemaResult.warnings.length === 1 ? '' : 's'}`} />}
+            {bothReal && !completed && (
+              <Chip
+                cls={(detail.mergeRequest.autoReconcile ?? true) ? 'info' : ''}
+                icon={(detail.mergeRequest.autoReconcile ?? true) ? 'pi pi-check-circle' : 'pi pi-circle'}
+                label={(detail.mergeRequest.autoReconcile ?? true) ? 'Auto-reconcile: on' : 'Auto-reconcile: off'}
+                onClick={toggleAutoReconcile}
+              />
+            )}
             {bothReal && rank >= 2 && <Chip cls="info" icon="pi pi-id-card" label="Reconcile identity" onClick={() => setShowReconcile(true)} />}
             {rank >= 2 && (
               <>

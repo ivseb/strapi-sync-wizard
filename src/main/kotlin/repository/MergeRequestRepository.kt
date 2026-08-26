@@ -110,6 +110,7 @@ class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepos
                     targetInstance = targetInstance,
                     status = mergeRequest.status,
                     includeDrafts = mergeRequest.includeDrafts,
+                    autoReconcile = mergeRequest.autoReconcile,
                     createdAt = mergeRequest.createdAt,
                     updatedAt = mergeRequest.updatedAt
                 )
@@ -142,6 +143,7 @@ class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepos
             targetInstance = targetInstance,
             status = mergeRequest.status,
             includeDrafts = mergeRequest.includeDrafts,
+            autoReconcile = mergeRequest.autoReconcile,
             createdAt = mergeRequest.createdAt,
             updatedAt = mergeRequest.updatedAt
         )
@@ -155,6 +157,7 @@ class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepos
             it[targetInstanceId] = mergeRequestDTO.targetInstanceId
             it[status] = mergeRequestDTO.status ?: MergeRequestStatus.CREATED
             it[includeDrafts] = mergeRequestDTO.includeDrafts ?: false
+            it[autoReconcile] = mergeRequestDTO.autoReconcile ?: true
         }
 
         insertStatement.resultedValues?.singleOrNull()?.toMergeRequest()
@@ -169,6 +172,7 @@ class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepos
             mergeRequestDTO.targetInstanceId.let { tgtId -> it[targetInstanceId] = tgtId }
             mergeRequestDTO.status?.let { status -> it[MergeRequestsTable.status] = status }
             mergeRequestDTO.includeDrafts?.let { inc -> it[includeDrafts] = inc }
+            mergeRequestDTO.autoReconcile?.let { ar -> it[autoReconcile] = ar }
             it[updatedAt] = OffsetDateTime.now()
         } > 0
     }
@@ -208,6 +212,7 @@ class MergeRequestRepository(private val instanceRepository: StrapiInstanceRepos
         targetInstanceId = this[MergeRequestsTable.targetInstanceId],
         status = this[MergeRequestsTable.status],
         includeDrafts = this[MergeRequestsTable.includeDrafts],
+        autoReconcile = this[MergeRequestsTable.autoReconcile],
         createdAt = this[MergeRequestsTable.createdAt],
         updatedAt = this[MergeRequestsTable.updatedAt]
     )

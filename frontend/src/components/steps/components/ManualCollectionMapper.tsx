@@ -72,7 +72,7 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
     const [editorContent, setEditorContent] = useState<any>(null);
 
     const [activeTab, setActiveTab] = useState<number>(0);
-    type SavedMappingDTO = { id: number; contentType: string; sourceDocumentId?: string | null; targetDocumentId?: string | null; locale?: string | null; sourceJson?: any; targetJson?: any };
+    type SavedMappingDTO = { id: number; contentType: string; sourceDocumentId?: string | null; targetDocumentId?: string | null; locale?: string | null; sourceJson?: any; targetJson?: any; sourceLabel?: string | null; targetLabel?: string | null; sourceMissing?: boolean; targetMissing?: boolean };
     const [savedMappings, setSavedMappings] = useState<SavedMappingDTO[]>([]);
     const [loadingSaved, setLoadingSaved] = useState<boolean>(false);
 
@@ -373,13 +373,21 @@ const ManualCollectionMapper: React.FC<ManualCollectionMapperProps> = ({
                 <TabPanel header="Saved mappings">
                     <DataTable value={savedMappings} loading={loadingSaved} emptyMessage="No saved mappings"
                                paginator rows={5} globalFilter={savedGlobalFilter}
-                               globalFilterFields={['sourceDocumentId', 'targetDocumentId']}
+                               globalFilterFields={['sourceDocumentId', 'targetDocumentId', 'sourceLabel', 'targetLabel']}
                                className="text-sm">
-                        <Column field="sourceDocumentId" header="Source Doc" body={(r: SavedMappingDTO) => (
-                            <span className="flex align-items-center gap-2"><Badge value="S" severity="info"/>{r.sourceDocumentId}</span>
+                        <Column field="sourceLabel" header="Source" body={(r: SavedMappingDTO) => (
+                            <span className="flex align-items-center gap-2" title={r.sourceDocumentId || ''}>
+                                <Badge value="S" severity="info"/>
+                                <span>{r.sourceLabel || r.sourceDocumentId}</span>
+                                {r.sourceMissing && <Badge value="missing" severity="danger" title="This entry no longer exists in the current comparison — the mapping is stale"/>}
+                            </span>
                         )}/>
-                        <Column field="targetDocumentId" header="Target Doc" body={(r: SavedMappingDTO) => (
-                            <span className="flex align-items-center gap-2"><Badge value="T" severity="warning"/>{r.targetDocumentId}</span>
+                        <Column field="targetLabel" header="Target" body={(r: SavedMappingDTO) => (
+                            <span className="flex align-items-center gap-2" title={r.targetDocumentId || ''}>
+                                <Badge value="T" severity="warning"/>
+                                <span>{r.targetLabel || r.targetDocumentId}</span>
+                                {r.targetMissing && <Badge value="missing" severity="danger" title="This entry no longer exists in the current comparison — the mapping is stale"/>}
+                            </span>
                         )}/>
                         <Column header="JSON" body={(r: SavedMappingDTO) => (
                             <Button label="Compare" className="p-button-text p-button-sm" icon="pi pi-eye" onClick={() => {

@@ -42,7 +42,14 @@ data class ManualMappingWithContentDTO(
     val targetDocumentId: String? = null,
     val locale: String? = null,
     val sourceJson: JsonObject? = null,
-    val targetJson: JsonObject? = null
+    val targetJson: JsonObject? = null,
+    // Human-readable labels (file name / content title) so the management UI can show WHAT is
+    // paired, not just the documentIds.
+    val sourceLabel: String? = null,
+    val targetLabel: String? = null,
+    // True when the documentId is set but no longer found in the current comparison (stale side).
+    val sourceMissing: Boolean = false,
+    val targetMissing: Boolean = false
 )
 
 @Serializable

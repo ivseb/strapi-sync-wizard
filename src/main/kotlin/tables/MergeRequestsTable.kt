@@ -20,6 +20,9 @@ object MergeRequestsTable : IntIdTable("merge_requests") {
     // Strapi v5 Draft & Publish fidelity: when true, the comparison/merge also carries the draft
     // channel (modified drafts, draft-only entries). Default false = published-only (legacy behavior).
     val includeDrafts = bool("include_drafts").default(false)
+    // When true (default), every fresh comparison automatically runs identity reconciliation in
+    // apply mode, so confidently paired entries get a durable shared sync_id on both instances.
+    val autoReconcile = bool("auto_reconcile").default(true)
     val createdAt = timestampWithTimeZone("created_at").default(OffsetDateTime.now())
     val updatedAt = timestampWithTimeZone("updated_at").default(OffsetDateTime.now())
 }

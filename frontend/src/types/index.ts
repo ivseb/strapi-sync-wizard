@@ -263,6 +263,7 @@ export interface MergeRequestDetail {
         targetInstance: StrapiInstance;
         status: string;
         includeDrafts?: boolean;
+        autoReconcile?: boolean;
         createdAt: string;
         updatedAt: string;
     };

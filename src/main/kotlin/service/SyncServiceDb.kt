@@ -1331,22 +1331,61 @@ fun contentLabelOf(c: StrapiContent): String {
     return search(c.cleanData, true) ?: search(c.cleanData, false) ?: c.metadata.documentId
 }
 
+private fun md5Hex(s: String): String =
+    java.security.MessageDigest.getInstance("MD5").digest(s.toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it) }
+
 /**
  * documentId -> CONTENT IDENTITY for one instance. Same content yields the same key (even for
  * duplicate entities), so references are compared by what they point to, not by which copy/order.
- * Files: by exact bytes (sha) then syncId then name. Content: by canonical content fingerprint.
+ *
+ * Identity precedence: [pairOverlay] (a cross-instance pairing already established by the current
+ * comparison — both members of a pair share the same token) > sync_id > for files the byte sha >
+ * for content a canonical fingerprint.
+ *
+ * Fingerprints are computed ITERATIVELY: file identities are assigned first, then content
+ * fingerprints are re-derived a few times so that nested references resolve through the identity of
+ * the referenced entity (file sha / sync id / fingerprint) instead of degrading to the
+ * environment-specific "doc:<documentId>" fallback — which could never match across instances and
+ * used to mark every referrer of an un-reconciled entity as DIFFERENT.
  */
-fun buildIdentityMap(rowsByUid: Map<String, List<StrapiContent>>, files: List<StrapiImage>, syncByDoc: Map<String, String>): Map<String, String> {
+fun buildIdentityMap(
+    rowsByUid: Map<String, List<StrapiContent>>,
+    files: List<StrapiImage>,
+    syncByDoc: Map<String, String>,
+    pairOverlay: Map<String, String> = emptyMap()
+): Map<String, String> {
     val m = HashMap<String, String>()
-    // Prefer the stable identity (sync_id): a referenced entity's identity must NOT change when its
-    // own content changes (otherwise the change would wrongly propagate to everything referencing it).
-    // Fall back to a content/byte hash only when there is no sync_id yet, so identical un-linked
-    // duplicates still collapse to one key.
+    // Files first: their identity never depends on other entities, so it is stable input for the
+    // content fingerprints below. A referenced entity's identity must NOT change when its own
+    // content changes (otherwise the change would wrongly propagate to everything referencing it) —
+    // hence overlay/sync_id take precedence over the byte hash.
     files.forEach { f ->
-        m[f.metadata.documentId] = f.metadata.syncId?.let { "id:$it" } ?: ("file:" + (f.metadata.calculatedSha ?: f.metadata.name))
+        val doc = f.metadata.documentId
+        m[doc] = pairOverlay[doc]
+            ?: f.metadata.syncId?.takeIf { it.isNotBlank() }?.let { "id:$it" }
+            ?: ("file:" + (f.metadata.calculatedSha ?: f.metadata.name))
     }
-    rowsByUid.values.flatten().forEach { c ->
-        m[c.metadata.documentId] = c.metadata.syncId?.let { "id:$it" } ?: ("c:" + contentFingerprint(c, syncByDoc))
+    val contents = rowsByUid.values.flatten()
+    // Content entries with a durable identity don't need fingerprinting.
+    contents.forEach { c ->
+        val doc = c.metadata.documentId
+        val fixed = pairOverlay[doc] ?: c.metadata.syncId?.takeIf { it.isNotBlank() }?.let { "id:$it" }
+        if (fixed != null) m[doc] = fixed
+    }
+    // Referenced documents we did not fetch (drafts, other types) still resolve via the sidecar.
+    syncByDoc.forEach { (doc, sync) -> m.putIfAbsent(doc, "id:$sync") }
+    // Fixpoint fingerprinting for the rest: each pass resolves references one level deeper through
+    // already-computed identities. 3 passes bound reference cycles deterministically.
+    repeat(3) {
+        var changed = false
+        contents.forEach { c ->
+            val doc = c.metadata.documentId
+            if (pairOverlay.containsKey(doc) || !c.metadata.syncId.isNullOrBlank()) return@forEach
+            val fp = "c:" + md5Hex(contentFingerprint(c, m))
+            if (m[doc] != fp) { m[doc] = fp; changed = true }
+        }
+        if (!changed) return m
     }
     return m
 }
@@ -1503,18 +1542,16 @@ fun compareCollectionType(
         pair(s, t)
     }
 
-    // 1. Explicit (manual / previously-mapped) document mappings for this uid.
+    // 1. Explicit (manual / previously-mapped) document mappings for this uid. A mapping whose
+    // OTHER side no longer exists (stale — e.g. the target entry was deleted after the mapping was
+    // persisted) must NOT consume the entry: leaving it to the later tiers lets it pair with its
+    // real counterpart instead of being locked into a false ONLY_IN_SOURCE/ONLY_IN_TARGET.
     val mappedSourceToTarget = idMappings.filterValues { it.contentType == uid }.mapValues { it.value.targetDocumentId }
     for ((srcDoc, tgtDoc) in mappedSourceToTarget) {
         if (srcDoc in processedSourceDocs || (tgtDoc != null && tgtDoc in processedTargetDocs)) continue
         val s = sourceByDoc[srcDoc]
         val t = targetByDoc[tgtDoc]
         if (s != null && t != null) pair(s, t)
-        else if (s != null || t != null) {
-            results.add(compareSingleType(tableName, uid, s, t, kind, fileMapping, idMappings, exclusions, srcSyncByDoc, tgtSyncByDoc, srcResolver, tgtResolver))
-            if (s != null) processedSourceDocs.add(srcDoc)
-            if (t != null) processedTargetDocs.add(tgtDoc!!)
-        }
     }
 
     // 2. CONTENT FINGERPRINT (identical content modulo ids/relations, relations normalized by syncId),

@@ -415,54 +415,79 @@ suspend fun computeComparisonFromPrefetch(
     // Load existing id mappings (from our DB). This is cheap and not Strapi-related.
     var idMappingsList: List<MergeRequestDocumentMapping>  = MergeRequestDocumentMappingTable.fetchMappingList(mergeRequest)
 
-    // Sanitize mappings: ensure both source/target documentId and id exist in current prefetch data.
-    val idMappings =  run {
-        // Build sets of valid ids/documentIds for source and target (content + files)
-        val sourceData = mutableSetOf<Pair<String,Int>>()
-        val targetData = mutableSetOf<Pair<String,Int>>()
-      
+    // Mapping hygiene: a mapping whose source or target documentId no longer exists on its instance
+    // is stale — it can never pair anything correctly again, it can only poison pairing (false
+    // ONLY_IN_SOURCE/ONLY_IN_TARGET) and the apply flow (POST /upload?id=<deleted> -> 404). Stale
+    // rows are deleted automatically here, on every compare.
+    //
+    // The existence check reads the full document_id sets straight from each instance DB (so
+    // draft-only entries filtered out of the prefetch don't count as missing). Virtual instances
+    // have no DB: their prefetch/export IS the complete truth. If a direct read fails the side is
+    // treated as unverifiable and nothing is deleted for it.
+    val idMappings = run {
+        val uidToTable = dbSchema.tables.mapNotNull { t -> t.metadata?.apiUid?.let { it to t.name } }.toMap()
+        fun tableFor(uid: String): String? =
+            if (uid == STRAPI_FILE_CONTENT_TYPE_NAME) "files" else uidToTable[uid]
 
-        // Content rows
-        prefetch.sourceRowsByUid.values.flatten().forEach { c ->
-            c.metadata.id?.let { sourceData.add(c.metadata.documentId to it) }
-        }
-        prefetch.targetRowsByUid.values.flatten().forEach { c ->
-            c.metadata.id?.let {
-                targetData.add(c.metadata.documentId to it) }
-          
-        }
-        // Files
-        prefetch.sourceFiles.forEach { f ->
-            sourceData.add(f.metadata.documentId to f.metadata.id)
-        }
-        prefetch.targetFiles.forEach { f ->
-          targetData.add(f.metadata.documentId to f.metadata.id)
-        }
+        val neededTables = idMappingsList.mapNotNull { tableFor(it.contentType) }.toSet()
 
-        // Collect invalid mapping ids
-        val invalidIds = mutableListOf<Int>()
-
-
-
-        idMappingsList = idMappingsList.map { map ->
-                val validSource = map.sourceDocumentId != null && map.sourceId != null &&   sourceData.contains(map.sourceDocumentId to map.sourceId)
-                val validTarget = map.targetDocumentId != null && map.targetId != null && targetData.contains(map.targetDocumentId to map.targetId)
-                if (validSource && validTarget) {
-                  map
-                } else {
-                    // Se non è valido, non lo cancelliamo fisicamente dal DB ora,
-                    // perché potrebbe essere un'entità non ancora sincronizzata in questa sessione
-                    // o filtrata per altri motivi (es. non pubblicata).
-                    // Invece lo teniamo ma lo loggeremo se vogliamo fare cleanup.
-                    // Per ora, lo carichiamo comunque per permettere l'associazione se ricompare.
-                    map
+        suspend fun fetchDocIdsByTable(instance: StrapiInstance): Map<String, Set<String>>? {
+            if (instance.isVirtual || neededTables.isEmpty()) return null
+            return try {
+                dbQuery(instance.database) {
+                    neededTables.associateWith { table ->
+                        val docs = mutableSetOf<String>()
+                        exec("SELECT document_id FROM \"$table\"") { rs ->
+                            while (rs.next()) rs.getString("document_id")?.let { docs.add(it) }
+                        }
+                        docs as Set<String>
+                    }
                 }
+            } catch (e: Exception) {
+                logger.warn("Mapping hygiene: cannot read document ids from '${instance.name}' (${e.message}); skipping stale-mapping cleanup for this side")
+                null
             }
+        }
 
-        // idMappingsList already contains all mappings. 
-        // No physical deletion for now to be safe.
+        fun prefetchDocIds(rowsByUid: Map<String, List<StrapiContent>>, files: List<StrapiImage>): Map<String, Set<String>> {
+            val byTable = mutableMapOf<String, MutableSet<String>>()
+            rowsByUid.forEach { (uid, rows) ->
+                val table = uidToTable[uid] ?: return@forEach
+                byTable.getOrPut(table) { mutableSetOf() }.addAll(rows.map { it.metadata.documentId })
+            }
+            byTable.getOrPut("files") { mutableSetOf() }.addAll(files.map { it.metadata.documentId })
+            return byTable
+        }
 
-        // Rebuild idMappings map to reflect deletions
+        val srcDocs = fetchDocIdsByTable(mergeRequest.sourceInstance)
+            ?: if (mergeRequest.sourceInstance.isVirtual) prefetchDocIds(prefetch.sourceRowsByUid, prefetch.sourceFiles) else null
+        val tgtDocs = fetchDocIdsByTable(mergeRequest.targetInstance)
+            ?: if (mergeRequest.targetInstance.isVirtual) prefetchDocIds(prefetch.targetRowsByUid, prefetch.targetFiles) else null
+
+        val stale = mutableListOf<MergeRequestDocumentMapping>()
+        val kept = mutableListOf<MergeRequestDocumentMapping>()
+        for (map in idMappingsList) {
+            val table = tableFor(map.contentType)
+            if (table == null) { kept.add(map); continue } // unknown content type: don't judge
+            val srcOk = map.sourceDocumentId == null || srcDocs == null ||
+                    (srcDocs[table]?.contains(map.sourceDocumentId) ?: true)
+            val tgtOk = map.targetDocumentId == null || tgtDocs == null ||
+                    (tgtDocs[table]?.contains(map.targetDocumentId) ?: true)
+            if (srcOk && tgtOk) kept.add(map) else stale.add(map)
+        }
+        if (stale.isNotEmpty()) {
+            val staleIds = stale.map { it.id }
+            dbQuery {
+                MergeRequestDocumentMappingTable.deleteWhere { MergeRequestDocumentMappingTable.id inList staleIds }
+            }
+            logger.info(
+                "Mapping hygiene MR ${mergeRequest.id}: removed ${stale.size} stale mapping(s) whose endpoints no longer exist: " +
+                        stale.take(20).joinToString { "${it.contentType}[${it.sourceDocumentId}->${it.targetDocumentId}]" } +
+                        (if (stale.size > 20) " …" else "")
+            )
+            idMappingsList = kept
+        }
+
         idMappingsList.groupBy { it.contentType }
             .mapValues { (_, v) -> v.associateBy { it.sourceDocumentId!! } }
     }
@@ -479,42 +504,79 @@ suspend fun computeComparisonFromPrefetch(
     // documentId -> sync_id per instance (raw identity from the sidecar).
     val srcSyncByDoc = fetchSyncIdMap(mergeRequest.sourceInstance)
     val tgtSyncByDoc = fetchSyncIdMap(mergeRequest.targetInstance)
-    // documentId -> CONTENT IDENTITY per instance. Used to normalize relation references during
-    // comparison so duplicate/identical targets (and their order) don't read as changes.
-    val srcIdentity = buildIdentityMap(prefetch.sourceRowsByUid, prefetch.sourceFiles, srcSyncByDoc)
-    val tgtIdentity = buildIdentityMap(prefetch.targetRowsByUid, prefetch.targetFiles, tgtSyncByDoc)
-    // documentId -> readable resolved reference (label + syncId + contentHash + file info) per instance.
-    val srcResolver = buildRefResolver(prefetch.sourceRowsByUid, prefetch.sourceFiles, srcIdentity)
-    val tgtResolver = buildRefResolver(prefetch.targetRowsByUid, prefetch.targetFiles, tgtIdentity)
 
-    // Build maps for single and collection types
-    val singleTypes = mutableMapOf<String, ContentTypeComparisonResultWithRelationships>()
-    val collectionTypes = mutableMapOf<String, List<ContentTypeComparisonResultWithRelationships>>()
+    // Cross-instance pair overlay: both members of an established pair share one identity token, so
+    // a reference to "the same logical entity" normalizes identically on both sides even before any
+    // reconcile has written durable syncIds. Seeded with the file pairing computed above; extended
+    // with the content pairing after the first compare pass.
+    val srcPairOverlay = mutableMapOf<String, String>()
+    val tgtPairOverlay = mutableMapOf<String, String>()
+    filesResult.forEach { f ->
+        val s = f.sourceImage?.metadata?.documentId ?: return@forEach
+        val t = f.targetImage?.metadata?.documentId ?: return@forEach
+        val token = "pair:f:$s"
+        srcPairOverlay[s] = token
+        tgtPairOverlay[t] = token
+    }
 
-    for (table in dbSchema.tables) {
-        val meta = table.metadata ?: continue
-        val uid = meta.apiUid
-        if (!uid.startsWith("api::")) continue
-        val kind = meta.collectionType
+    // One compare pass over all content types with the given identity maps.
+    fun runPass(
+        srcIdentity: Map<String, String>,
+        tgtIdentity: Map<String, String>,
+        mapping: MutableMap<String, MergeRequestDocumentMapping>
+    ): Pair<MutableMap<String, ContentTypeComparisonResultWithRelationships>, MutableMap<String, List<ContentTypeComparisonResultWithRelationships>>> {
+        val srcResolver = buildRefResolver(prefetch.sourceRowsByUid, prefetch.sourceFiles, srcIdentity)
+        val tgtResolver = buildRefResolver(prefetch.targetRowsByUid, prefetch.targetFiles, tgtIdentity)
+        val singles = mutableMapOf<String, ContentTypeComparisonResultWithRelationships>()
+        val collections = mutableMapOf<String, List<ContentTypeComparisonResultWithRelationships>>()
+        for (table in dbSchema.tables) {
+            val meta = table.metadata ?: continue
+            val uid = meta.apiUid
+            if (!uid.startsWith("api::")) continue
+            val kind = meta.collectionType
 
-        val sourceRows = prefetch.sourceRowsByUid[uid] ?: emptyList()
-        val targetRows = prefetch.targetRowsByUid[uid] ?: emptyList()
+            val sourceRows = prefetch.sourceRowsByUid[uid] ?: emptyList()
+            val targetRows = prefetch.targetRowsByUid[uid] ?: emptyList()
 
-        when (kind) {
-            StrapiContentTypeKind.SingleType -> {
-                val source = sourceRows.maxByOrNull { it.metadata.id ?: 0 }
-                val target = targetRows.maxByOrNull { it.metadata.id ?: 0 }
-                singleTypes[table.name] = compareSingleType(table.name, uid, source, target, kind, fileMapping, contentMapping, prefetch.exclusions, srcIdentity, tgtIdentity, srcResolver, tgtResolver)
-            }
-            StrapiContentTypeKind.CollectionType -> {
-                collectionTypes[table.name] =
-                    compareCollectionType(table.name, uid, sourceRows, targetRows, kind, contentMapping, fileMapping, prefetch.exclusions, srcIdentity, tgtIdentity, srcResolver, tgtResolver)
-            }
-            StrapiContentTypeKind.Files, StrapiContentTypeKind.Component -> {
-                // ignore
+            when (kind) {
+                StrapiContentTypeKind.SingleType -> {
+                    val source = sourceRows.maxByOrNull { it.metadata.id ?: 0 }
+                    val target = targetRows.maxByOrNull { it.metadata.id ?: 0 }
+                    singles[table.name] = compareSingleType(table.name, uid, source, target, kind, fileMapping, mapping, prefetch.exclusions, srcIdentity, tgtIdentity, srcResolver, tgtResolver)
+                }
+                StrapiContentTypeKind.CollectionType -> {
+                    collections[table.name] =
+                        compareCollectionType(table.name, uid, sourceRows, targetRows, kind, mapping, fileMapping, prefetch.exclusions, srcIdentity, tgtIdentity, srcResolver, tgtResolver)
+                }
+                StrapiContentTypeKind.Files, StrapiContentTypeKind.Component -> {
+                    // ignore
+                }
             }
         }
+        return singles to collections
     }
+
+    // PASS 1: identities from syncId / file pairing / content fingerprints. Its job is to establish
+    // the content pairing (which entries are "the same entity" on both sides).
+    val srcIdentity1 = buildIdentityMap(prefetch.sourceRowsByUid, prefetch.sourceFiles, srcSyncByDoc, srcPairOverlay)
+    val tgtIdentity1 = buildIdentityMap(prefetch.targetRowsByUid, prefetch.targetFiles, tgtSyncByDoc, tgtPairOverlay)
+    val (singles1, collections1) = runPass(srcIdentity1, tgtIdentity1, HashMap(contentMapping))
+
+    // Extend the overlay with every content pair found in pass 1, then rebuild identities: now a
+    // reference to a paired-but-not-yet-reconciled entity (or a paired file) matches across
+    // instances, so referrers are no longer reported DIFFERENT for relation reasons alone.
+    (singles1.values + collections1.values.flatten()).forEach { e ->
+        val s = e.sourceContent?.metadata?.documentId ?: return@forEach
+        val t = e.targetContent?.metadata?.documentId ?: return@forEach
+        val token = "pair:c:$s"
+        srcPairOverlay[s] = token
+        tgtPairOverlay[t] = token
+    }
+
+    // PASS 2: final classification with pair-aware identities.
+    val srcIdentity = buildIdentityMap(prefetch.sourceRowsByUid, prefetch.sourceFiles, srcSyncByDoc, srcPairOverlay)
+    val tgtIdentity = buildIdentityMap(prefetch.targetRowsByUid, prefetch.targetFiles, tgtSyncByDoc, tgtPairOverlay)
+    val (singleTypes, collectionTypes) = runPass(srcIdentity, tgtIdentity, contentMapping)
 
     // Post-process collected relationships: mark bidirectional and deduplicate
     val collectedList = prefetch.collectedRelationships.toList()

@@ -29,6 +29,7 @@ export interface CreateMergeRequestDTO {
   sourceInstanceId: number;
   targetInstanceId: number;
   includeDrafts?: boolean;
+  autoReconcile?: boolean;
 }
 
 export interface UnifiedSelection {
@@ -47,6 +48,7 @@ export interface UpdateMergeRequestDTO {
   targetInstanceId: number;
   status?: string;
   includeDrafts?: boolean;
+  autoReconcile?: boolean;
 }
 
 export interface MergeRequestListParams {

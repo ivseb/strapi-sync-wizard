@@ -133,6 +133,58 @@ class SyncServiceDbHelpersTest {
         assertTrue(m["cDoc2"]!!.startsWith("c:"))
     }
 
+    @Test
+    fun `buildIdentityMap resolves references through file identity so two instances agree`() {
+        // Instance A: file fA (sha SHARED) referenced by content c1. Instance B: same logical file
+        // and content but with DIFFERENT documentIds (fB, c2), as documentIds always differ across
+        // environments. Without reference resolution the fingerprints would embed "doc:fA"/"doc:fB"
+        // and never match — every referrer of an un-reconciled file looked DIFFERENT.
+        fun side(fileDoc: String, contentDoc: String): Map<String, String> {
+            val file = image(1, fileDoc, "logo.png", sha = "SHARED")
+            val c = content(contentDoc, buildJsonObject {
+                put("title", "Page")
+                put("__links", buildJsonObject { put("image", buildJsonArray { add(JsonPrimitive(fileDoc)) }) })
+            })
+            return buildIdentityMap(mapOf("api::p.p" to listOf(c)), listOf(file), emptyMap())
+        }
+        val a = side("fA", "c1")
+        val b = side("fB", "c2")
+        assertEquals("file:SHARED", a["fA"])
+        assertEquals(a["c1"], b["c2"]) // identical logical content → identical identity across instances
+    }
+
+    @Test
+    fun `buildIdentityMap resolves nested content references iteratively`() {
+        // parent -> child -> file: the child's identity needs the file identity (pass 1) and the
+        // parent's needs the child's (pass 2). Both sides must converge to the same parent identity.
+        fun side(fileDoc: String, childDoc: String, parentDoc: String): Map<String, String> {
+            val file = image(1, fileDoc, "logo.png", sha = "SHARED")
+            val child = content(childDoc, buildJsonObject {
+                put("title", "Child")
+                put("__links", buildJsonObject { put("image", buildJsonArray { add(JsonPrimitive(fileDoc)) }) })
+            })
+            val parent = content(parentDoc, buildJsonObject {
+                put("title", "Parent")
+                put("__links", buildJsonObject { put("child", buildJsonArray { add(JsonPrimitive(childDoc)) }) })
+            })
+            return buildIdentityMap(mapOf("api::c.c" to listOf(child), "api::p.p" to listOf(parent)), listOf(file), emptyMap())
+        }
+        val a = side("fA", "chA", "paA")
+        val b = side("fB", "chB", "paB")
+        assertEquals(a["chA"], b["chB"])
+        assertEquals(a["paA"], b["paB"])
+    }
+
+    @Test
+    fun `buildIdentityMap pair overlay wins over syncId and fingerprints`() {
+        val file = image(1, "fDoc", "a.png", sha = "SHA-X", syncId = "FSID")
+        val c = content("cDoc", buildJsonObject { put("title", "T") }, syncId = "CSID")
+        val overlay = mapOf("fDoc" to "pair:f:src1", "cDoc" to "pair:c:src2")
+        val m = buildIdentityMap(mapOf("api::a.a" to listOf(c)), listOf(file), emptyMap(), overlay)
+        assertEquals("pair:f:src1", m["fDoc"])
+        assertEquals("pair:c:src2", m["cDoc"])
+    }
+
     // buildRefResolver --------------------------------------------------------
 
     @Test

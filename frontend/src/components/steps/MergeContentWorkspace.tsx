@@ -141,6 +141,29 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
     finally { setRowBusy(k, false); }
   };
 
+  // --- Saved pairings (document mappings): shown as an "unlink" action on the paired row ---
+  type SavedMapping = { id: number; contentType: string; sourceDocumentId?: string | null; targetDocumentId?: string | null };
+  const [savedMappings, setSavedMappings] = useState<SavedMapping[]>([]);
+  const loadMappings = async () => {
+    try { const r = await http.get(`/api/merge-requests/${mergeRequestId}/mappings`); setSavedMappings(r.data?.data || []); } catch { /* ignore */ }
+  };
+  useEffect(() => { loadMappings(); /* eslint-disable-next-line */ }, [mergeRequestId, data]);
+  const mappingFor = (r: ChangeRow): SavedMapping | undefined =>
+    r.sourceDoc && r.targetDoc
+      ? savedMappings.find((m) => m.contentType === r.uid && m.sourceDocumentId === r.sourceDoc && m.targetDocumentId === r.targetDoc)
+      : undefined;
+  const unlinkRow = async (r: ChangeRow, m: SavedMapping) => {
+    const k = `${r.tableName}:${r.documentId}`;
+    setRowBusy(k, true);
+    try {
+      await http.delete(`/api/merge-requests/${mergeRequestId}/mappings/${m.id}`);
+      toast.current?.show({ severity: 'success', summary: 'Unlinked', detail: `${r.label}: the two entries are no longer treated as the same entity`, life: 3500 });
+      onSaved && (await onSaved());
+      await loadMappings();
+    } catch (e) { toast.current?.show({ severity: 'error', summary: 'Unlink failed', detail: apiErrorMessage(e), life: 4000 }); }
+    finally { setRowBusy(k, false); }
+  };
+
   // --- Quick mapping: pick one unmatched entity, then "map here" on its counterpart ---
   const [mapPick, setMapPick] = useState<{ table: string; uid: string; side: 'source' | 'target'; doc: string; id?: number | null; label: string } | null>(null);
   const [mapping, setMapping] = useState(false);
@@ -322,8 +345,8 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
           <input type="checkbox" checked={showIdentical} onChange={(e) => setShowIdentical(e.target.checked)} /> identical ({counts.IDENTICAL || 0})
         </label>
         {(counts.EXCLUDED || 0) > 0 && (
-          <button className={`ss-pill${showExcluded ? ' active' : ''}`} onClick={() => setShowExcluded((v) => !v)} title="Show entities excluded from the merge">
-            <i className="pi pi-eye-slash" aria-hidden="true" /> excluded {counts.EXCLUDED}
+          <button className={`ss-pill${showExcluded ? ' active' : ''}`} onClick={() => setShowExcluded((v) => !v)} title="Show the entries excluded from sync (they are ignored in compare and merge)">
+            <i className="pi pi-ban" aria-hidden="true" /> excluded {counts.EXCLUDED}
           </button>
         )}
         <span style={{ marginLeft: 'auto' }} />
@@ -408,9 +431,14 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
                           <button className="ss-link" title="Pick this entity, then choose its counterpart" onClick={(e) => { e.stopPropagation(); pickForMap(r); }} style={{ fontSize: 12 }}><i className="pi pi-link" aria-hidden="true" /> map</button>
                         ) : null
                       )}
-                      <button className="ss-link" title={excluded ? 'Include in merge' : 'Exclude from merge'} disabled={rowBusy} onClick={(e) => { e.stopPropagation(); toggleExclude(r); }} style={{ fontSize: 12, color: excluded ? 'var(--ss-amber)' : undefined }}>
-                        {rowBusy ? <i className="pi pi-spin pi-spinner" aria-hidden="true" /> : <i className={`pi ${excluded ? 'pi-eye-slash' : 'pi-eye'}`} aria-hidden="true" />}
-                        {excluded ? ' include' : ''}
+                      {(() => { const m = mappingFor(r); return m ? (
+                        <button className="ss-link" title="Unlink this pairing — the two entries will no longer be treated as the same entity and will be compared separately" disabled={rowBusy} onClick={(e) => { e.stopPropagation(); unlinkRow(r, m); }} style={{ fontSize: 12 }}>
+                          <i className="pi pi-times-circle" aria-hidden="true" /> unlink
+                        </button>
+                      ) : null; })()}
+                      <button className="ss-link" title={excluded ? 'Re-include this entry in compare and merge' : 'Exclude from sync — this entry will be ignored in compare and merge'} disabled={rowBusy} onClick={(e) => { e.stopPropagation(); toggleExclude(r); }} style={{ fontSize: 12, color: excluded ? 'var(--ss-amber)' : undefined }}>
+                        {rowBusy ? <i className="pi pi-spin pi-spinner" aria-hidden="true" /> : <i className={`pi ${excluded ? 'pi-undo' : 'pi-ban'}`} aria-hidden="true" />}
+                        {excluded ? ' include' : ' exclude'}
                       </button>
                       <span className={`ss-badge ${chip.cls}`}>{chip.label}</span>
                     </div>

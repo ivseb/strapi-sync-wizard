@@ -17,6 +17,7 @@ import kotlinx.serialization.json.JsonObject
 import org.jetbrains.exposed.v1.core.Op
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.inList
 import org.jetbrains.exposed.v1.core.isNull
 import org.jetbrains.exposed.v1.jdbc.*
 import org.slf4j.LoggerFactory
@@ -58,77 +59,108 @@ class MergeRequestService(
         val mr = mergeRequestRepository.getMergeRequestWithInstances(mergeRequestId)
             ?: throw IllegalArgumentException("Merge request not found")
         val rows = dbQuery {
-            var predicate: Op<Boolean> = (MergeRequestDocumentMappingTable.sourceStrapiId eq mr.sourceInstance.id) and
-                    (MergeRequestDocumentMappingTable.targetStrapiId eq mr.targetInstance.id)
+            // Mappings are shared between the two directions of the same instance pair: accept
+            // both orientations so nothing is hidden from the management UI.
+            var predicate: Op<Boolean> = (MergeRequestDocumentMappingTable.sourceStrapiId inList listOf(mr.sourceInstance.id, mr.targetInstance.id)) and
+                    (MergeRequestDocumentMappingTable.targetStrapiId inList listOf(mr.sourceInstance.id, mr.targetInstance.id))
             if (!contentTypeUid.isNullOrBlank()) {
                 predicate = predicate and (MergeRequestDocumentMappingTable.contentType eq contentTypeUid)
             }
             MergeRequestDocumentMappingTable.selectAll().where { predicate }.toList()
         }
         val comparison = dataFileUtils.getContentComparisonFile(mergeRequestId)
-        fun findJson(uid: String, docId: String?): JsonObject? {
-            if (docId.isNullOrBlank() || comparison == null) return null
-            if (uid == "files") {
+        data class DocInfo(val json: JsonObject?, val label: String?)
+        fun findInfo(uid: String, docId: String?): DocInfo {
+            if (docId.isNullOrBlank() || comparison == null) return DocInfo(null, null)
+            if (uid == "files" || uid == STRAPI_FILE_CONTENT_TYPE_NAME) {
                 val f =
                     comparison.files.find { it.sourceImage?.metadata?.documentId == docId || it.targetImage?.metadata?.documentId == docId }
                 val img = if (f?.sourceImage?.metadata?.documentId == docId) f?.sourceImage else f?.targetImage
-                return img?.rawData
+                return DocInfo(img?.rawData, img?.metadata?.name)
             }
             // singles
             comparison.singleTypes.values.forEach { e ->
                 if (e.contentType == uid) {
-                    if (e.sourceContent?.metadata?.documentId == docId) return e.sourceContent.cleanData
-                    if (e.targetContent?.metadata?.documentId == docId) return e.targetContent.cleanData
+                    if (e.sourceContent?.metadata?.documentId == docId) return DocInfo(e.sourceContent.cleanData, contentLabelOf(e.sourceContent))
+                    if (e.targetContent?.metadata?.documentId == docId) return DocInfo(e.targetContent.cleanData, contentLabelOf(e.targetContent))
                 }
             }
             // collections
             comparison.collectionTypes.values.forEach { list ->
                 list.forEach { e ->
                     if (e.contentType == uid) {
-                        if (e.sourceContent?.metadata?.documentId == docId) return e.sourceContent.cleanData
-                        if (e.targetContent?.metadata?.documentId == docId) return e.targetContent.cleanData
+                        if (e.sourceContent?.metadata?.documentId == docId) return DocInfo(e.sourceContent.cleanData, contentLabelOf(e.sourceContent))
+                        if (e.targetContent?.metadata?.documentId == docId) return DocInfo(e.targetContent.cleanData, contentLabelOf(e.targetContent))
                     }
                 }
             }
-            return null
+            return DocInfo(null, null)
         }
 
         val data = rows.map { r ->
             val id = r[MergeRequestDocumentMappingTable.id].value
             val uid = r[MergeRequestDocumentMappingTable.contentType]
-            val srcDoc = r[MergeRequestDocumentMappingTable.sourceDocumentId]
-            val tgtDoc = r[MergeRequestDocumentMappingTable.targetDocumentId]
+            val flipped = r[MergeRequestDocumentMappingTable.sourceStrapiId].value != mr.sourceInstance.id
+            val srcDoc = if (flipped) r[MergeRequestDocumentMappingTable.targetDocumentId] else r[MergeRequestDocumentMappingTable.sourceDocumentId]
+            val tgtDoc = if (flipped) r[MergeRequestDocumentMappingTable.sourceDocumentId] else r[MergeRequestDocumentMappingTable.targetDocumentId]
             val loc = r[MergeRequestDocumentMappingTable.locale]
+            val srcInfo = findInfo(uid, srcDoc)
+            val tgtInfo = findInfo(uid, tgtDoc)
             ManualMappingWithContentDTO(
                 id = id,
                 contentType = uid,
                 sourceDocumentId = srcDoc,
                 targetDocumentId = tgtDoc,
                 locale = loc,
-                sourceJson = findJson(uid, srcDoc),
-                targetJson = findJson(uid, tgtDoc)
+                sourceJson = srcInfo.json,
+                targetJson = tgtInfo.json,
+                sourceLabel = srcInfo.label,
+                targetLabel = tgtInfo.label,
+                sourceMissing = srcDoc != null && srcInfo.json == null,
+                targetMissing = tgtDoc != null && tgtInfo.json == null
             )
         }
         return ManualMappingsListResponseDTO(success = true, data = data)
     }
 
-    // Delete a single manual mapping and recompute comparison
+    // Delete a single manual mapping (unlink a pairing) and recompute comparison
     suspend fun deleteManualMapping(mergeRequestId: Int, mappingId: Int): MergeRequestData? {
         val mr = mergeRequestRepository.getMergeRequestWithInstances(mergeRequestId)
             ?: throw IllegalArgumentException("Merge request not found")
-        // Verify the mapping belongs to this MR instances
-        val belongs = dbQuery {
-            val rows = MergeRequestDocumentMappingTable.selectAll().where {
+        // Verify the mapping belongs to this MR instance pair (either orientation: mappings are
+        // shared between the two directions of the same pair) and capture its endpoints.
+        data class Unlinked(val srcDoc: String?, val tgtDoc: String?, val locale: String?)
+        val unlinked: Unlinked? = dbQuery {
+            val row = MergeRequestDocumentMappingTable.selectAll().where {
                 (MergeRequestDocumentMappingTable.id eq mappingId) and
-                        (MergeRequestDocumentMappingTable.sourceStrapiId eq mr.sourceInstance.id) and
-                        (MergeRequestDocumentMappingTable.targetStrapiId eq mr.targetInstance.id)
-            }.toList()
-            if (rows.isEmpty()) false else {
-                // delete it
-                MergeRequestDocumentMappingTable.deleteWhere { MergeRequestDocumentMappingTable.id eq mappingId } > 0
-            }
+                        (MergeRequestDocumentMappingTable.sourceStrapiId inList listOf(mr.sourceInstance.id, mr.targetInstance.id)) and
+                        (MergeRequestDocumentMappingTable.targetStrapiId inList listOf(mr.sourceInstance.id, mr.targetInstance.id))
+            }.singleOrNull() ?: return@dbQuery null
+            val flipped = row[MergeRequestDocumentMappingTable.sourceStrapiId].value != mr.sourceInstance.id
+            val srcDoc = if (flipped) row[MergeRequestDocumentMappingTable.targetDocumentId] else row[MergeRequestDocumentMappingTable.sourceDocumentId]
+            val tgtDoc = if (flipped) row[MergeRequestDocumentMappingTable.sourceDocumentId] else row[MergeRequestDocumentMappingTable.targetDocumentId]
+            MergeRequestDocumentMappingTable.deleteWhere { MergeRequestDocumentMappingTable.id eq mappingId }
+            Unlinked(srcDoc, tgtDoc, row[MergeRequestDocumentMappingTable.locale])
         }
-        if (!belongs) throw IllegalArgumentException("Mapping not found or does not belong to this merge request instances")
+        if (unlinked == null) throw IllegalArgumentException("Mapping not found or does not belong to this merge request instances")
+        // If the pair was already reconciled (shared sync_id), break the identity link too —
+        // otherwise the syncId join would silently re-pair the two entries at the next compare.
+        // The target-side row is removed (least invasive: the source keeps its identity, which may
+        // be shared with other instance pairs).
+        try {
+            val srcDoc = unlinked.srcDoc
+            val tgtDoc = unlinked.tgtDoc
+            if (srcDoc != null && tgtDoc != null && !mr.sourceInstance.isVirtual && !mr.targetInstance.isVirtual) {
+                val sSync = it.sebi.service.identity.SyncIdentityService.getSyncId(mr.sourceInstance, srcDoc, unlinked.locale)
+                val tSync = it.sebi.service.identity.SyncIdentityService.getSyncId(mr.targetInstance, tgtDoc, unlinked.locale)
+                if (sSync != null && sSync == tSync) {
+                    it.sebi.service.identity.SyncIdentityService.deleteIdentity(mr.targetInstance, tgtDoc, unlinked.locale)
+                    logger.info("Unlink MR $mergeRequestId: removed shared sync_id $sSync from target doc $tgtDoc")
+                }
+            }
+        } catch (e: Exception) {
+            logger.warn("Unlink MR $mergeRequestId: could not verify/break sync identity for mapping $mappingId: ${e.message}")
+        }
         // Recompute comparison (reuse prefetch cache if present)
         compareContent(mr, CompareMode.Compare)
         return getAllMergeRequestData(mergeRequestId, false)
@@ -889,11 +921,25 @@ class MergeRequestService(
             throw IllegalStateException("Source and target instances are not compatible")
         }
 
-        suspend fun computeAndPersist(prefetch: ComparisonPrefetch): ContentTypeComparisonResultMapWithRelationships {
+        suspend fun computeAndPersist(prefetchRaw: ComparisonPrefetch): ContentTypeComparisonResultMapWithRelationships {
+            // Exclusions must always reflect the CURRENT DB state: a prefetch rebuilt from cache
+            // (fromCache) carries none, which used to silently drop every EXCLUDED classification
+            // on cache-based recomputes.
+            val prefetch = prefetchRaw.copy(exclusions = MergeRequestExclusionTable.fetchExclusions(mergeRequest))
             val comp = computeComparisonFromPrefetch(mergeRequest, schemas.extractedSchema!!, prefetch)
             val finalComp = comp.copy(exclusions = prefetch.exclusions)
             mergeRequestRepository.updateComparisonData(mergeRequest.id)
             dataFileUtils.saveContentComparisonFile(mergeRequest.id, finalComp)
+            // Auto identity reconciliation (opt-out per merge request): persist a durable shared
+            // sync_id for every confidently paired entry, so future comparisons join exactly
+            // instead of relying on heuristics. Failures never break the comparison itself.
+            if (mergeRequest.autoReconcile && !mergeRequest.sourceInstance.isVirtual && !mergeRequest.targetInstance.isVirtual) {
+                try {
+                    it.sebi.service.identity.IdentityReconciliationService.reconcile(mergeRequest, finalComp, apply = true)
+                } catch (e: Exception) {
+                    logger.warn("Auto-reconcile after compare failed for MR ${mergeRequest.id}: ${e.message}")
+                }
+            }
             return finalComp
         }
 

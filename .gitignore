@@ -47,3 +47,4 @@ sync-db.sh
 coso.json
 compare_img
 .output.txt
+sandbox_bundle/

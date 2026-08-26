@@ -1,6 +1,8 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Dialog } from 'primereact/dialog';
 import { ProgressSpinner } from 'primereact/progressspinner';
+import { Toast } from 'primereact/toast';
+import { http, apiErrorMessage } from '../../api/http';
 import {
   ContentTypeComparisonResultKind,
   ContentTypeComparisonResultWithRelationships,
@@ -85,6 +87,38 @@ const MergeFilesWorkspace: React.FC<Props> = ({ mergeRequestId, sourceInstanceId
   const [activeStates, setActiveStates] = useState<Set<string>>(new Set(['ONLY_IN_SOURCE', 'DIFFERENT', 'ONLY_IN_TARGET']));
   const [showExclusions, setShowExclusions] = useState(false);
   const [showMapper, setShowMapper] = useState(false);
+  const toast = useRef<Toast>(null);
+
+  // Saved file pairings (document mappings): shown as an "unlink" action on the paired row, so a
+  // wrong pairing can be dissolved right where it is displayed (no documentId hunting).
+  type SavedMapping = { id: number; contentType: string; sourceDocumentId?: string | null; targetDocumentId?: string | null };
+  const [savedMappings, setSavedMappings] = useState<SavedMapping[]>([]);
+  const [unlinking, setUnlinking] = useState<Set<string>>(new Set());
+  const loadMappings = async () => {
+    try {
+      const r = await http.get(`/api/merge-requests/${mergeRequestId}/mappings`, { params: { contentType: 'plugin::upload.file' } });
+      setSavedMappings(r.data?.data || []);
+    } catch { /* ignore */ }
+  };
+  useEffect(() => { loadMappings(); /* eslint-disable-next-line */ }, [mergeRequestId, filesData]);
+  const mappingFor = (f: ContentTypeFileComparisonResult): SavedMapping | undefined => {
+    const s = f.sourceImage?.metadata?.documentId; const t = f.targetImage?.metadata?.documentId;
+    if (!s || !t) return undefined;
+    return savedMappings.find((m) => m.sourceDocumentId === s && m.targetDocumentId === t);
+  };
+  const unlinkFile = async (f: ContentTypeFileComparisonResult, m: SavedMapping) => {
+    setUnlinking((p) => new Set(p).add(f.id));
+    try {
+      await http.delete(`/api/merge-requests/${mergeRequestId}/mappings/${m.id}`);
+      toast.current?.show({ severity: 'success', summary: 'Unlinked', detail: `${f.sourceImage?.metadata?.name}: the two files are no longer treated as the same asset`, life: 3500 });
+      onSaved && (await onSaved());
+      await loadMappings();
+    } catch (e) {
+      toast.current?.show({ severity: 'error', summary: 'Unlink failed', detail: apiErrorMessage(e), life: 4000 });
+    } finally {
+      setUnlinking((p) => { const n = new Set(p); n.delete(f.id); return n; });
+    }
+  };
 
   const selectedSet = useMemo(() => {
     const s = new Set<string>();
@@ -163,6 +197,7 @@ const MergeFilesWorkspace: React.FC<Props> = ({ mergeRequestId, sourceInstanceId
 
   return (
     <div className="ss-review" style={{ border: 'none' }}>
+      <Toast ref={toast} />
       <div className="ss-review-toolbar">
         <div className="ss-search" style={{ width: 200 }}>
           <i className="pi pi-search" aria-hidden="true" />
@@ -237,9 +272,16 @@ const MergeFilesWorkspace: React.FC<Props> = ({ mergeRequestId, sourceInstanceId
                       {dupN > 1 && <span className="ss-badge warn" style={{ fontSize: 9.5 }} title="Same name appears multiple times in this folder — ambiguous, needs manual mapping">dup ×{dupN}</span>}
                       <span className="ss-erow-summary">{fmtSize(md?.size as number)} · {md?.mime || 'file'}</span>
                       <span style={{ marginLeft: 'auto' }} />
-                      <button className="ss-link" onClick={(e) => { e.stopPropagation(); openZoom(f); }} title="Preview big & references">
+                      <button className="ss-link" onClick={(e) => { e.stopPropagation(); openZoom(f); }} title="Open a large preview with the entities referencing this file">
                         <i className="pi pi-window-maximize" aria-hidden="true" /> view
                       </button>
+                      {(() => { const m = mappingFor(f); return m ? (
+                        <button className="ss-link" disabled={unlinking.has(f.id)}
+                          title="Unlink this pairing — the two files will no longer be treated as the same asset and will be compared separately"
+                          onClick={(e) => { e.stopPropagation(); unlinkFile(f, m); }}>
+                          {unlinking.has(f.id) ? <i className="pi pi-spin pi-spinner" aria-hidden="true" /> : <i className="pi pi-times-circle" aria-hidden="true" />} unlink
+                        </button>
+                      ) : null; })()}
                       <span className={`ss-badge ${chip.cls}`}>{chip.label}</span>
                     </div>
                     {isOpen && both && (

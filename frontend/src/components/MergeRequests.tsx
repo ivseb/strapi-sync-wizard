@@ -63,8 +63,8 @@ const MergeRequests: React.FC = () => {
   const [tab, setTab] = useState<TabKey>('progress');
   const [search, setSearch] = useState('');
   const [showCreate, setShowCreate] = useState(false);
-  const [form, setForm] = useState<{ name: string; description: string; sourceInstanceId: number | null; targetInstanceId: number | null; includeDrafts: boolean }>({
-    name: '', description: '', sourceInstanceId: null, targetInstanceId: null, includeDrafts: false,
+  const [form, setForm] = useState<{ name: string; description: string; sourceInstanceId: number | null; targetInstanceId: number | null; includeDrafts: boolean; autoReconcile: boolean }>({
+    name: '', description: '', sourceInstanceId: null, targetInstanceId: null, includeDrafts: false, autoReconcile: true,
   });
 
   const completedParam = tab === 'all' ? undefined : tab === 'completed';
@@ -105,9 +105,10 @@ const MergeRequests: React.FC = () => {
         sourceInstanceId: form.sourceInstanceId,
         targetInstanceId: form.targetInstanceId,
         includeDrafts: form.includeDrafts,
+        autoReconcile: form.autoReconcile,
       });
       setShowCreate(false);
-      setForm({ name: '', description: '', sourceInstanceId: null, targetInstanceId: null, includeDrafts: false });
+      setForm({ name: '', description: '', sourceInstanceId: null, targetInstanceId: null, includeDrafts: false, autoReconcile: true });
       if (created?.id) navigate(`/merge-requests/${created.id}`);
     } catch (e) {
       toast.current?.show({ severity: 'error', summary: 'Error', detail: apiErrorMessage(e), life: 4000 });
@@ -239,6 +240,18 @@ const MergeRequests: React.FC = () => {
             <small className="ss-muted" style={{ display: 'block', marginTop: '0.35rem' }}>
               Sync the draft channel too: divergent “modified” drafts, draft-only entries and unpublished
               state are reproduced on the target. Leave off to sync only published content.
+            </small>
+          </div>
+          <div className="field">
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+              <Checkbox inputId="mr-reconcile" checked={form.autoReconcile}
+                onChange={(e) => setForm({ ...form, autoReconcile: !!e.checked })} />
+              <label htmlFor="mr-reconcile" style={{ margin: 0, cursor: 'pointer' }}>Auto identity reconciliation (recommended)</label>
+            </div>
+            <small className="ss-muted" style={{ display: 'block', marginTop: '0.35rem' }}>
+              After each compare, confidently paired entries get a durable shared identity (sync id)
+              written to both instances, so future comparisons match them exactly. Disable to keep
+              compare strictly read-only on the instances.
             </small>
           </div>
         </div>
