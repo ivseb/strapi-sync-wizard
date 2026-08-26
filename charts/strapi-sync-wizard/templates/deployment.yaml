@@ -118,6 +118,9 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /app/data
+        {{- if .Values.sidecars }}
+        {{- toYaml .Values.sidecars | nindent 8 }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
