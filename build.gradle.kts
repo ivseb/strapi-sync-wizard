@@ -23,7 +23,7 @@ kotlin {
 
 
 group = "it.sebi"
-version = "1.1.0"
+version = "1.1.1"
 
 application {
     mainClass = "io.ktor.server.netty.EngineMain"

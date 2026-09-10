@@ -36,32 +36,36 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
         private const val MAX_PARALLEL_CONTENT = 8
     }
 
-    // Target content-type attributes (by collectionName), used to auto-drop source-only fields so a
+    // Target content-type and component attributes, used to auto-drop source-only fields so a
     // COMPATIBLE-but-not-identical schema can still merge (target rejects unknown fields otherwise).
-    private var targetAttrsByTable: Map<String, Set<String>> = emptyMap()
-    private var targetAttrsNormByTable: Map<String, Set<String>> = emptyMap()
+    // The filter is RECURSIVE: a source-only field nested inside a component (or a dynamic-zone
+    // item whose component type doesn't exist on the target) must be stripped too — Strapi rejects
+    // the whole write with 'ValidationError: Invalid key <field> at <component>' otherwise.
+    private var targetTypeAttrs: Map<String, Map<String, Attribute>> = emptyMap()      // collectionName -> attributes
+    private var targetComponentAttrs: Map<String, Map<String, Attribute>> = emptyMap() // component uid -> attributes
 
     private suspend fun loadTargetAttrs(targetClient: StrapiClient) {
-        targetAttrsByTable = try {
-            targetClient.getContentTypes().associate { it.schema.collectionName to it.schema.attributes.keys }
+        targetTypeAttrs = try {
+            targetClient.getContentTypes().associate { it.schema.collectionName to it.schema.attributes }
         } catch (e: Exception) {
             logger.warn("Could not load target content types for field filtering: ${e.message}")
             emptyMap()
         }
-        targetAttrsNormByTable = targetAttrsByTable.mapValues { (_, v) -> v.map { normalizeKeyName(it) }.toSet() }
+        targetComponentAttrs = try {
+            targetClient.getComponentSchema().associate { it.uid to it.schema.attributes }
+        } catch (e: Exception) {
+            logger.warn("Could not load target components for field filtering: ${e.message}")
+            emptyMap()
+        }
     }
 
-    /** Remove fields the source has but the target schema doesn't, so writes aren't rejected. */
+    /** Remove fields the source has but the target schema doesn't (at ANY depth), so writes aren't rejected. */
     private fun dropForeignFields(tableName: String, data: JsonObject): JsonObject {
-        val allowed = targetAttrsByTable[tableName] ?: return data
-        val allowedNorm = targetAttrsNormByTable[tableName] ?: emptySet()
+        val attrs = targetTypeAttrs[tableName] ?: return data
         val dropped = mutableListOf<String>()
-        val kept = data.filterKeys { k ->
-            if (k.startsWith("__") || allowed.contains(k) || allowedNorm.contains(normalizeKeyName(k))) true
-            else { dropped.add(k); false }
-        }
+        val result = filterByTargetSchema(attrs, targetComponentAttrs, data, tableName, dropped)
         if (dropped.isNotEmpty()) logger.info("[schema-compat] '$tableName': dropping source-only fields absent in target: $dropped")
-        return JsonObject(kept)
+        return result
     }
 
     /**
@@ -79,7 +83,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
         mappingMap: MutableMap<String, MutableMap<String, MergeRequestDocumentMapping>> = mutableMapOf()
     ) {
         val contentTypeMappingByTable: Map<String, DbTable> = schema.tables.associateBy { it.name }
-        if (targetAttrsByTable.isEmpty()) loadTargetAttrs(targetClient)
+        if (targetTypeAttrs.isEmpty()) loadTargetAttrs(targetClient)
 
         // Group circular edges by source item (from)
         val circularByFrom: Map<Pair<String, String>, List<MergeRequestService.CircularDependencyEdge>> =
@@ -1096,4 +1100,56 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
 //            }
 //        }
 //    }
+}
+/**
+ * Recursively filter a write payload against the TARGET schema: any key the target content type /
+ * component doesn't declare is removed (recorded in [dropped] with its path), descending into
+ * component fields and dynamic zones. A dynamic-zone item whose component type doesn't exist on the
+ * target at all is dropped entirely. Keys starting with "__" (e.g. __component) always pass.
+ *
+ * Without this, a source-only field nested inside a component survives the top-level filter and the
+ * target rejects the WHOLE write: 'ValidationError: Invalid key <field> at <component>'.
+ */
+internal fun filterByTargetSchema(
+    attrs: Map<String, Attribute>,
+    componentAttrs: Map<String, Map<String, Attribute>>,
+    data: JsonObject,
+    path: String,
+    dropped: MutableList<String>
+): JsonObject {
+    val byNorm: Map<String, Attribute> = attrs.entries.associate { ContentJsonUtils.normalizeKeyName(it.key) to it.value }
+    return JsonObject(buildMap {
+        for ((k, v) in data) {
+            if (k.startsWith("__")) { put(k, v); continue }
+            val attr = attrs[k] ?: byNorm[ContentJsonUtils.normalizeKeyName(k)]
+            if (attr == null) { dropped.add("$path.$k"); continue }
+            val compUid = attr.component
+            val newValue: JsonElement = when {
+                attr.type == "component" && compUid != null -> {
+                    val compSchema = componentAttrs[compUid]
+                    when {
+                        compSchema == null -> v // component schema unavailable: pass through unchanged
+                        v is JsonObject -> filterByTargetSchema(compSchema, componentAttrs, v, "$path.$k", dropped)
+                        v is JsonArray -> JsonArray(v.map { el ->
+                            if (el is JsonObject) filterByTargetSchema(compSchema, componentAttrs, el, "$path.$k", dropped) else el
+                        })
+                        else -> v
+                    }
+                }
+                attr.type == "dynamiczone" && v is JsonArray -> JsonArray(v.mapNotNull { el ->
+                    if (el !is JsonObject) el else {
+                        val uid = (el["__component"] as? JsonPrimitive)?.contentOrNull
+                        val compSchema = uid?.let { componentAttrs[it] }
+                        when {
+                            uid == null -> el
+                            compSchema == null -> { dropped.add("$path.$k[$uid]"); null } // component type absent on target
+                            else -> filterByTargetSchema(compSchema, componentAttrs, el, "$path.$k[$uid]", dropped)
+                        }
+                    }
+                })
+                else -> v
+            }
+            put(k, newValue)
+        }
+    })
 }
