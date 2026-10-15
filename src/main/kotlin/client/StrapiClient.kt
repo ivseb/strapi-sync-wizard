@@ -3,7 +3,7 @@ package it.sebi.client
 import io.ktor.client.*
 import io.ktor.client.call.*
 import io.ktor.client.engine.*
-import io.ktor.client.engine.cio.*
+import io.ktor.client.engine.okhttp.*
 import io.ktor.client.plugins.HttpRequestRetry
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.*
@@ -25,12 +25,15 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
+import okhttp3.Dispatcher
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.lang.System.getenv
 import java.security.MessageDigest
+import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.sql.DriverManager
+import javax.net.ssl.SSLContext
 import javax.net.ssl.X509TrustManager
 import kotlin.use
 
@@ -74,7 +77,7 @@ fun StrapiInstance.client(): StrapiClient = StrapiClient(this)
 
 
 
-private fun buildClient(proxyConfig: ProxyConfig?): HttpClient = HttpClient(CIO) {
+private fun buildClient(proxyConfig: ProxyConfig?): HttpClient = HttpClient(OkHttp) {
 
     install(ContentNegotiation) {
         json(JsonParser)
@@ -99,22 +102,26 @@ private fun buildClient(proxyConfig: ProxyConfig?): HttpClient = HttpClient(CIO)
 
     expectSuccess = true
     engine {
-        maxConnectionsCount = 50
-        dispatcher = Dispatchers.IO
-        pipelining = true
-
         proxy = proxyConfig
-        https {
-            trustManager = object : X509TrustManager {
+        config {
+            dispatcher(Dispatcher().apply {
+                maxRequests = 50
+                maxRequestsPerHost = 50
+            })
+            // Trust manager permissivo per certificati interni/self-signed; l'hostname resta verificato
+            val trustAllManager = object : X509TrustManager {
                 override fun checkClientTrusted(p0: Array<out X509Certificate>?, p1: String?) {
                 }
 
                 override fun checkServerTrusted(p0: Array<out X509Certificate>?, p1: String?) {
                 }
 
-                override fun getAcceptedIssuers(): Array<X509Certificate>? = null
-
+                override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
             }
+            val sslContext = SSLContext.getInstance("TLS").apply {
+                init(null, arrayOf(trustAllManager), SecureRandom())
+            }
+            sslSocketFactory(sslContext.socketFactory, trustAllManager)
         }
     }
 }

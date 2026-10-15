@@ -23,7 +23,7 @@ kotlin {
 
 
 group = "it.sebi"
-version = "1.1.1"
+version = "1.1.2"
 
 application {
     mainClass = "io.ktor.server.netty.EngineMain"
@@ -57,7 +57,7 @@ dependencies {
     implementation("org.jetbrains.exposed:exposed-json:$exposed_version")
     implementation("org.jetbrains.exposed:exposed-java-time:$exposed_version")
     implementation("io.ktor:ktor-client-core")
-    implementation("io.ktor:ktor-client-cio")
+    implementation("io.ktor:ktor-client-okhttp")
     implementation("io.ktor:ktor-client-content-negotiation")
     implementation("io.ktor:ktor-client-logging")
     implementation("com.zaxxer:HikariCP:7.1.0")
@@ -74,6 +74,7 @@ dependencies {
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit:$kotlin_version")
     testImplementation("io.mockk:mockk:1.14.11")
     testImplementation("io.ktor:ktor-client-mock")
+    testImplementation("io.ktor:ktor-network-tls-certificates")
 }
 
 
