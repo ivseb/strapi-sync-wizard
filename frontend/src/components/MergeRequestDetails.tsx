@@ -197,6 +197,17 @@ const MergeRequestDetails: React.FC = () => {
     try {
       const res: any = await completeMut.mutateAsync(opts);
       const failed = typeof res?.failed === 'number' ? res.failed : 0;
+      // Fields the target schema doesn't declare were dropped from the payloads; a dropped RELATION
+      // means a reference was not written even though the item counts as synchronized.
+      const dropped: string[] = Array.isArray(res?.droppedFields) ? res.droppedFields : [];
+      if (dropped.length > 0) {
+        const relations = dropped.filter((d) => d.endsWith(' (relation)'));
+        toast.current?.show({
+          severity: 'warn', sticky: true,
+          summary: relations.length > 0 ? `${relations.length} relation field(s) not written` : `${dropped.length} field(s) not on target`,
+          detail: (relations.length > 0 ? relations : dropped).slice(0, 8).join(', ') + (dropped.length > 8 ? ` … (+${dropped.length - 8})` : ''),
+        });
+      }
       if (failed > 0) {
         toast.current?.show({ severity: 'warn', summary: 'Completed with errors', detail: res?.message || `${failed} item(s) failed`, life: 7000 });
       } else {

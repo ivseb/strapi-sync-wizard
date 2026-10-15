@@ -82,5 +82,8 @@ data class MergeResponse(
     // failures honestly instead of always claiming success.
     val total: Int? = null,
     val succeeded: Int? = null,
-    val failed: Int? = null
+    val failed: Int? = null,
+    // Fields the target schema doesn't declare, dropped from the payloads ("table.path.field"; relation
+    // writes suffixed " (relation)"). Items still count as succeeded; this makes the loss visible.
+    val droppedFields: List<String> = emptyList()
 )
