@@ -662,9 +662,12 @@ suspend fun fetchPublishedRowsAsJson(
             val linksForRow: List<StrapiLinkRef> =
                 if (id != null) linksCollector[id]?.toList() ?: emptyList() else emptyList()
 
-            // Build __links object grouped by field path with ordered documentIds
+            // Build __links object grouped by POSITIONAL path ("cardCollection[2].card[0].serviceTags")
+            // with ordered documentIds. Grouping by the plain field path would pool the references of
+            // every item of a repeatable component into one list, so moving a reference from one item
+            // to another compared as IDENTICAL. (Writes use StrapiLinkRef.field + sourceId, unchanged.)
             val linksJson: JsonObject? = if (linksForRow.isNotEmpty()) {
-                val grouped = linksForRow.groupBy { it.field }
+                val grouped = linksForRow.groupBy { it.path ?: it.field }
                 val fieldEntries = grouped.mapNotNull { (field, lst) ->
                     val sorted =
                         lst.sortedWith(compareBy<StrapiLinkRef> { it.order ?: Double.MAX_VALUE }.thenBy { it.id })
@@ -711,6 +714,52 @@ fun resolveComponentTableName(componentType: String?, dbSchema: DbSchema): Strin
         .maxByOrNull { it.length }
     return best2
 }
+
+private fun normalizedAttrKey(name: String): String = name.replace("_", "").lowercase()
+
+/** lodash-style snake_case as Strapi uses it for join-table names (linkBottomServiceTag -> link_bottom_service_tag). */
+internal fun strapiSnakeCase(name: String): String =
+    name.replace(Regex("([a-z0-9])([A-Z])"), "$1_$2").replace("-", "_").lowercase()
+
+/**
+ * The relation ATTRIBUTE stored by the `*_lnk` join table [lnkTable] for the owner table [ownerTable].
+ *
+ * Strapi names a join table `<owner collectionName>_<snake(attribute)>_lnk` (shortened with a hash past
+ * the identifier limit, e.g. `components_health_section_card_he117b2_service_tags_lnk`) but names the
+ * target FK column after the TARGET TYPE (`cta_service_tag_id`). The column is therefore NOT the attribute
+ * name: deriving the field from it turns `serviceTags` into `ctaServiceTag`, a key the target schema
+ * doesn't have — dropped (or rejected) on write, so the relation was silently lost.
+ *
+ * Resolution, most to least certain:
+ *  1. the table name is exactly `<owner>_<attr>_lnk` for one of the owner's relation attributes;
+ *  2. the owner's relation attributes whose target type is [targetTable]: exactly one -> it; several ->
+ *     the one whose snake name is the table-name suffix `_<attr>_lnk`;
+ *  3. any relation attribute whose snake name is that suffix (schemas cached before `target` was kept).
+ * Returns null when nothing matches; the caller then falls back to the legacy FK-column heuristic.
+ */
+internal fun resolveLinkAttributeName(ownerTable: String, lnkTable: String, targetTable: String, dbSchema: DbSchema): String? {
+    val relations = dbSchema.tables.firstOrNull { it.name == ownerTable }?.metadata?.columns
+        ?.filter { it.type == "relation" }.orEmpty()
+    if (relations.isEmpty()) return null
+
+    val prefix = "${ownerTable}_"
+    if (lnkTable.startsWith(prefix) && lnkTable.endsWith("_lnk") && lnkTable.length > prefix.length + 4) {
+        val middle = normalizedAttrKey(lnkTable.substring(prefix.length, lnkTable.length - "_lnk".length))
+        relations.firstOrNull { normalizedAttrKey(it.name) == middle }?.let { return it.name }
+    }
+
+    fun hasSuffix(attr: String) = lnkTable.endsWith("_${strapiSnakeCase(attr)}_lnk")
+    val tableByUid = dbSchema.tables.mapNotNull { t -> t.metadata?.apiUid?.let { it to t.name } }.toMap()
+    val sameTarget = relations.filter { col -> col.target?.let { tableByUid[it] } == targetTable }
+    when {
+        sameTarget.size == 1 -> return sameTarget.first().name
+        sameTarget.size > 1 -> return sameTarget.filter { hasSuffix(it.name) }.maxByOrNull { it.name.length }?.name
+    }
+    return relations.filter { hasSuffix(it.name) }.maxByOrNull { it.name.length }?.name
+}
+
+// Join tables already reported as unmappable (warn once, not once per component row).
+private val unmappedLinkTablesWarned: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
 private suspend fun fetchRowsByIds(
     instance: StrapiInstance,
@@ -759,7 +808,10 @@ private suspend fun enrichTableRowsWithCmps(
     linksCollector: MutableMap<Int, MutableList<StrapiLinkRef>>? = null,
     entityToRoot: Map<Int, Int>? = null,
     pathPrefix: String = "",
-    componentTableCache: MutableMap<String, MutableMap<Int, JsonObject>>
+    componentTableCache: MutableMap<String, MutableMap<Int, JsonObject>>,
+    // Same as pathPrefix but with each component item's position ("cardCollection[2].card[0]"), so a
+    // reference inside a repeatable component is compared against the SAME item on the other side.
+    indexedPrefix: String = pathPrefix,
 ): List<JsonObject> {
     if (depth >= maxDepth) return baseRows
     val logger = LoggerFactory.getLogger("SyncServiceDb")
@@ -801,6 +853,7 @@ private suspend fun enrichTableRowsWithCmps(
             for ((field, rows) in byField) {
                 val resultList = mutableListOf<JsonObject>()
                 for (r in rows.sortedBy { it.order }) {
+                    val itemIndex = resultList.size
                     // Record relationship contentType/component or component/component via *_cmps
                     val compTable = resolveComponentTableName(r.componentType, dbSchema)
                     if (compTable == null) {
@@ -829,6 +882,7 @@ private suspend fun enrichTableRowsWithCmps(
                             o["id"]?.jsonPrimitive?.intOrNull?.let { cid -> cid to (entityToRoot?.get(eid) ?: eid) }
                         }.toMap()
                         val newPrefix = if (pathPrefix.isEmpty()) field else "$pathPrefix.$field"
+                        val newIndexedPrefix = (if (indexedPrefix.isEmpty()) field else "$indexedPrefix.$field") + "[$itemIndex]"
                         val deeply = enrichTableRowsWithCmps(
                             instance,
                             compTable,
@@ -843,7 +897,8 @@ private suspend fun enrichTableRowsWithCmps(
                             linksCollector = linksCollector,
                             entityToRoot = compIdToRoot,
                             pathPrefix = newPrefix,
-                            componentTableCache = componentTableCache
+                            componentTableCache = componentTableCache,
+                            indexedPrefix = newIndexedPrefix
                         )
                         if (deeply.isNotEmpty()) resultList.add(deeply.first())
                     }
@@ -905,6 +960,13 @@ private suspend fun enrichTableRowsWithCmps(
                     for (tfk in targetFks) {
                         val targetCol = tfk.columns.firstOrNull() ?: continue
                         val targetTable = tfk.referencedTable ?: continue
+                        // The relation's real attribute name (see resolveLinkAttributeName); morph-like
+                        // tables carry it in their 'field' column instead.
+                        val attrName = if (hasField) null else resolveLinkAttributeName(tableName, lnk.name, targetTable, dbSchema)
+                        if (!hasField && attrName == null && unmappedLinkTablesWarned.add(lnk.name)) {
+                            logger.warn("[links] '${lnk.name}' does not map to a relation attribute of '$tableName'; " +
+                                "falling back to '${defaultFieldForLink(lnk, tfk)}' (relation may not be written)")
+                        }
                         // Select minimal columns
                         val selectParts = mutableListOf(
                             "\"$parentCol\" as entity_id",
@@ -921,7 +983,7 @@ private suspend fun enrichTableRowsWithCmps(
                             while (rs.next()) {
                                 val eid = (rs.getObject("entity_id") as? Number)?.toInt() ?: continue
                                 val fieldName = if (hasField) rs.getString("field") else null
-                                val derivedField = fieldName ?: defaultFieldForLink(lnk, tfk)
+                                val derivedField = fieldName ?: attrName ?: defaultFieldForLink(lnk, tfk)
                                 val rid = (rs.getObject("related_id") as? Number)?.toInt()
                                 val ord = (rs.getObject("ord") as? Number)?.toDouble()
                                 val id = (rs.getObject("id") as? Number)?.toInt() ?: 0
@@ -1008,6 +1070,7 @@ private suspend fun enrichTableRowsWithCmps(
                             if (linksCollector != null) {
                                 val rootId = entityToRoot?.get(id) ?: id
                                 val fp = if (pathPrefix.isEmpty()) field else "$pathPrefix.$field"
+                                val ip = if (indexedPrefix.isEmpty()) field else "$indexedPrefix.$field"
                                 val list = linksCollector.getOrPut(rootId) { mutableListOf() }
                                 list.add(
                                     StrapiLinkRef(
@@ -1017,7 +1080,8 @@ private suspend fun enrichTableRowsWithCmps(
                                         targetId = r.targetId,
                                         order = r.order,
                                         id = r.id,
-                                        lnkTable = r.lnkTable
+                                        lnkTable = r.lnkTable,
+                                        path = ip
                                     )
                                 )
                             }
@@ -1050,6 +1114,7 @@ private suspend fun enrichTableRowsWithCmps(
                             if (linksCollector != null) {
                                 val rootId = entityToRoot?.get(id) ?: id
                                 val fp = if (pathPrefix.isEmpty()) field else "$pathPrefix.$field"
+                                val ip = if (indexedPrefix.isEmpty()) field else "$indexedPrefix.$field"
                                 val list = linksCollector.getOrPut(rootId) { mutableListOf() }
                                 list.add(
                                     StrapiLinkRef(
@@ -1059,7 +1124,8 @@ private suspend fun enrichTableRowsWithCmps(
                                         targetId = r.fileId,
                                         order = r.order,
                                         id = r.id,
-                                        lnkTable = "files_related_mph"
+                                        lnkTable = "files_related_mph",
+                                        path = ip
                                     )
                                 )
                             }

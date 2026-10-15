@@ -1430,7 +1430,8 @@ class MergeRequestService(
                 },
                 total = total,
                 succeeded = succeeded,
-                failed = failed
+                failed = failed,
+                droppedFields = if (contentSelections.isNotEmpty()) contentMergeProcessor.droppedFieldsReport() else emptyList()
             )
         } catch (e: Exception) {
             logger.error("Merge request $id failed: ${e.message}", e)
@@ -1488,8 +1489,21 @@ class MergeRequestService(
         val prefetch = prefetchComparisonData(mergeRequest, schema)
         val fresh = computeComparisonFromPrefetch(mergeRequest, schema, prefetch)
 
-        // Returns the comparison entry (state + both sides' content) for a documentId in a content type.
-        data class FoundEntry(val state: ContentTypeComparisonResultKind, val src: JsonObject?, val tgt: JsonObject?)
+        // Target schema (same source the merge's field filter uses) to tell a reference the target can't
+        // store (schema gap) from one it can store but doesn't have (relation not written: mismatch).
+        val targetClient = mergeRequest.targetInstance.client()
+        val tgtTypeAttrs: Map<String, Map<String, Attribute>> = try {
+            targetClient.getContentTypes().associate { it.schema.collectionName to it.schema.attributes }
+        } catch (e: Exception) { logger.warn("Verify: could not load target content types: ${e.message}"); emptyMap() }
+        val tgtComponentAttrs: Map<String, Map<String, Attribute>> = try {
+            targetClient.getComponentSchema().associate { it.uid to it.schema.attributes }
+        } catch (e: Exception) { logger.warn("Verify: could not load target components: ${e.message}"); emptyMap() }
+
+        // Returns the comparison entry (state + both sides' content and resolved references) for a documentId.
+        data class FoundEntry(
+            val state: ContentTypeComparisonResultKind, val src: JsonObject?, val tgt: JsonObject?,
+            val srcRefs: Map<String, List<ResolvedRef>> = emptyMap(), val tgtRefs: Map<String, List<ResolvedRef>> = emptyMap(),
+        )
         fun entryOf(ct: String, documentId: String): FoundEntry? {
             if (ct == "files") {
                 val f = fresh.files.firstOrNull {
@@ -1499,11 +1513,11 @@ class MergeRequestService(
             }
             fresh.singleTypes[ct]?.let { e ->
                 if (e.sourceContent?.metadata?.documentId == documentId || e.targetContent?.metadata?.documentId == documentId)
-                    return FoundEntry(e.compareState, e.sourceContent?.cleanData, e.targetContent?.cleanData)
+                    return FoundEntry(e.compareState, e.sourceContent?.cleanData, e.targetContent?.cleanData, e.sourceRefs, e.targetRefs)
             }
             return fresh.collectionTypes[ct]?.firstOrNull {
                 it.sourceContent?.metadata?.documentId == documentId || it.targetContent?.metadata?.documentId == documentId
-            }?.let { FoundEntry(it.compareState, it.sourceContent?.cleanData, it.targetContent?.cleanData) }
+            }?.let { FoundEntry(it.compareState, it.sourceContent?.cleanData, it.targetContent?.cleanData, it.sourceRefs, it.targetRefs) }
         }
 
         val synced = mergeRequestSelectionsRepository.getSelectionsForMergeRequest(id).filter { it.syncSuccess == true }
@@ -1523,7 +1537,10 @@ class MergeRequestService(
             } else if (state == ContentTypeComparisonResultKind.DIFFERENT) {
                 // Distinguish a real value mismatch from "differs only in source-only fields the target
                 // schema can't store" (auto-dropped on apply by design) — the latter is not a failure.
-                val (okDespite, reason) = VerificationDiff.classify(found?.src, found?.tgt)
+                // References count too: a relation the target schema has but didn't receive is a mismatch.
+                val (okDespite, reason) = VerificationDiff.classifyWithReferences(
+                    found?.src, found?.tgt, found?.srcRefs.orEmpty(), found?.tgtRefs.orEmpty()
+                ) { path -> VerificationDiff.targetHasPath(tgtTypeAttrs[sel.tableName], tgtComponentAttrs, path) }
                 MergeVerificationItem(
                     contentType = sel.tableName, documentId = sel.documentId, direction = sel.direction.name,
                     expected = "IDENTICAL", actual = "DIFFERENT",

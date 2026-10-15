@@ -44,6 +44,14 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
     private var targetTypeAttrs: Map<String, Map<String, Attribute>> = emptyMap()      // collectionName -> attributes
     private var targetComponentAttrs: Map<String, Map<String, Attribute>> = emptyMap() // component uid -> attributes
 
+    // Fields dropped by dropForeignFields during the current run ("table.path.field", relation-shaped
+    // ones suffixed " (relation)"), surfaced in the merge response: a silent drop once hid relations
+    // that were never written while the merge reported full success.
+    private val droppedFields: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /** Dropped fields collected since the last [processBatches] start, sorted (system keys excluded). */
+    fun droppedFieldsReport(): List<String> = droppedFields.sorted()
+
     private suspend fun loadTargetAttrs(targetClient: StrapiClient) {
         targetTypeAttrs = try {
             targetClient.getContentTypes().associate { it.schema.collectionName to it.schema.attributes }
@@ -64,7 +72,14 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
         val attrs = targetTypeAttrs[tableName] ?: return data
         val dropped = mutableListOf<String>()
         val result = filterByTargetSchema(attrs, targetComponentAttrs, data, tableName, dropped)
-        if (dropped.isNotEmpty()) logger.info("[schema-compat] '$tableName': dropping source-only fields absent in target: $dropped")
+        if (dropped.isNotEmpty()) {
+            logger.info("[schema-compat] '$tableName': dropping source-only fields absent in target: $dropped")
+            // `locale` & co. are sent in the body but are not schema attributes: expected, not worth a warning.
+            val reportable = dropped.filter { it.substringAfterLast('.') !in SYSTEM_BODY_KEYS }
+            if (reportable.any { it.endsWith(RELATION_SUFFIX) })
+                logger.warn("[schema-compat] '$tableName': RELATION field(s) not on target will not be written: ${reportable.filter { it.endsWith(RELATION_SUFFIX) }}")
+            droppedFields.addAll(reportable)
+        }
         return result
     }
 
@@ -164,6 +179,7 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
     ) {
         val contentTypeMappingByTable: Map<String, DbTable> = schema.tables.associateBy { it.name }
         loadTargetAttrs(targetClient)
+        droppedFields.clear()
 
         // Build the set of all selected keys (table, documentId) to detect intra-selection dependencies
         val selectedKeys: Set<Pair<String, String>> = batches
@@ -1110,6 +1126,13 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
  * Without this, a source-only field nested inside a component survives the top-level filter and the
  * target rejects the WHOLE write: 'ValidationError: Invalid key <field> at <component>'.
  */
+internal const val RELATION_SUFFIX = " (relation)"
+private val SYSTEM_BODY_KEYS = setOf("locale", "documentId", "id", "localizations", "createdAt", "updatedAt", "publishedAt", "createdBy", "updatedBy")
+
+/** A relation write as built by ContentJsonUtils.processJsonElementNew: { "set": [...] } (or connect/disconnect). */
+internal fun isRelationPayload(v: JsonElement): Boolean =
+    v is JsonObject && v.isNotEmpty() && v.keys.all { it == "set" || it == "connect" || it == "disconnect" }
+
 internal fun filterByTargetSchema(
     attrs: Map<String, Attribute>,
     componentAttrs: Map<String, Map<String, Attribute>>,
@@ -1122,7 +1145,7 @@ internal fun filterByTargetSchema(
         for ((k, v) in data) {
             if (k.startsWith("__")) { put(k, v); continue }
             val attr = attrs[k] ?: byNorm[ContentJsonUtils.normalizeKeyName(k)]
-            if (attr == null) { dropped.add("$path.$k"); continue }
+            if (attr == null) { dropped.add("$path.$k" + if (isRelationPayload(v)) RELATION_SUFFIX else ""); continue }
             val compUid = attr.component
             val newValue: JsonElement = when {
                 attr.type == "component" && compUid != null -> {

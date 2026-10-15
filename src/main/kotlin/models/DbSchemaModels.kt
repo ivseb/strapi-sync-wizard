@@ -64,6 +64,8 @@ data class DbColumnMeta(
     val unique: Boolean,
     val repeatable: Boolean,
     val component: String? = null,
+    // Relation target uid (e.g. "api::cta-service-tag.cta-service-tag"); null for non-relations.
+    val target: String? = null,
 )
 
 @Serializable

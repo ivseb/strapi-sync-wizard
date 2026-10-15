@@ -34,7 +34,7 @@ class FilterByTargetSchemaTest {
                 add(buildJsonObject {
                     put("title", "Card")
                     put("link", "/x")
-                    put("cta_service_tag", "TAG") // source-only: target component doesn't declare it
+                    put("cta_service_tag", "TAG") // the target component doesn't declare it
                 })
             })
         }

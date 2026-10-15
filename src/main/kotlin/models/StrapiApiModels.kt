@@ -58,7 +58,10 @@ data class StrapiLinkRef(
     val order: Double? = null,
     val id: Int? = null,
     val lnkTable: String? = null,
-    val isInverse: Boolean = false
+    val isInverse: Boolean = false,
+    // field with each component item's position, e.g. "cardCollection[2].card[0].serviceTags" (compare
+    // key for __links); null for refs cached before it existed (then [field] is used).
+    val path: String? = null
 )
 
 @Serializable

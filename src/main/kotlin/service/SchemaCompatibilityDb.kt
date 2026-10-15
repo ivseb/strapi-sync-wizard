@@ -314,6 +314,7 @@ private fun parseDbSchemaModel(
                     value.unique,
                     value.repeatable ?: false,
                     value.component,
+                    value.target,
                 )
             }
             DbTableMetadata(
@@ -343,6 +344,7 @@ private fun parseDbSchemaModel(
                     value.unique,
                     value.repeatable ?: false,
                     value.component,
+                    value.target,
                 )
             }
             DbTableMetadata(
@@ -541,6 +543,7 @@ private suspend fun fetchStrapiMetadataJsonFromDb(instance: StrapiInstance): Lis
                                 repeatable = v.jsonObject["repeatable"]?.jsonPrimitive?.booleanOrNull ?: false,
                                 type = v.jsonObject["type"]?.jsonPrimitive?.contentOrNull ?: "string",
                                 component = v.jsonObject["component"]?.jsonPrimitive?.contentOrNull,
+                                target = v.jsonObject["target"]?.jsonPrimitive?.contentOrNull,
                             )
                         }
                     } ?: emptyList()
