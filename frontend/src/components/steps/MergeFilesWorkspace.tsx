@@ -259,7 +259,8 @@ const MergeFilesWorkspace: React.FC<Props> = ({ mergeRequestId, sourceInstanceId
                 const dupN = g.dupCount.get(nameOf(f)) || 1;
                 const reprIid = f.sourceImage ? sourceInstanceId : targetInstanceId;
                 return (
-                  <div key={f.id} className={`ss-erow${isOpen ? ' open' : ''}`}>
+                  // f.id is the source documentId; a duplicate copy row shares it with its pair
+                  <div key={`${f.id}|${f.targetImage?.metadata?.documentId ?? ''}`} className={`ss-erow${isOpen ? ' open' : ''}`}>
                     <div className="ss-erow-head" onClick={() => both && toggleOpen(f.id)}>
                       <input type="checkbox" checked={isSel} disabled={f.compareState === 'IDENTICAL'}
                         onClick={(e) => e.stopPropagation()} onChange={(e) => updateAllSelections(StrapiContentTypeKind.Files, e.target.checked, 'files', [f.id])} style={{ width: 14, height: 14 }} />

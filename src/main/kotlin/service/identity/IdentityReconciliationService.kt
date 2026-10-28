@@ -131,9 +131,14 @@ object IdentityReconciliationService {
 
         // File pairs (uid plugin::upload.file). Only matched-on-both-sides pairs are reconciled;
         // ambiguous duplicates / one-sided files are left for manual review.
+        // A document appears in several entries when duplicate copies are attached to its pair:
+        // only its first (real) pair is linked — sync_id is unique per document.
+        val linkedSrc = mutableSetOf<String>()
+        val linkedTgt = mutableSetOf<String>()
         for (f in comparison.files) {
             val s = f.sourceImage ?: continue
             val t = f.targetImage ?: continue
+            if (!linkedSrc.add(s.metadata.documentId) or !linkedTgt.add(t.metadata.documentId)) continue
             linkPair(
                 it.sebi.models.STRAPI_FILE_CONTENT_TYPE_NAME,
                 s.metadata.documentId, s.metadata.locale, s.metadata.syncId?.takeIf { it.isNotBlank() },

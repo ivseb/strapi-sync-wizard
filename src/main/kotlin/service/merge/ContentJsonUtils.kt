@@ -5,8 +5,12 @@ import it.sebi.models.DbSchema
 import it.sebi.models.DbTable
 import it.sebi.models.MergeRequestDocumentMapping
 import it.sebi.models.STRAPI_FILE_CONTENT_TYPE_NAME
+import it.sebi.models.StrapiContentTypeKind
 import it.sebi.models.StrapiLinkRef
+import it.sebi.service.JSON_KEYS
 import it.sebi.service.TECHNICAL_FIELDS
+import it.sebi.service.jsonKeysOf
+import it.sebi.service.readableRelationAttributes
 import it.sebi.service.resolveComponentTableName
 import kotlinx.serialization.json.*
 import kotlin.collections.forEach
@@ -35,7 +39,8 @@ object ContentJsonUtils {
         }
         private fun putPair(table: String, srcDoc: String?, tgtDoc: String?) {
             if (srcDoc == null || tgtDoc == null) return
-            sourceDocToTargetDoc.getOrPut(table) { HashMap() }[srcDoc] = tgtDoc
+            // first pair wins: a file's later entries are duplicate copies, not its counterpart
+            sourceDocToTargetDoc.getOrPut(table) { HashMap() }.putIfAbsent(srcDoc, tgtDoc)
         }
 
         init {
@@ -73,12 +78,14 @@ object ContentJsonUtils {
         targetCollectionUID: String,
         id: Int?,
         comparisonDataMap: ContentTypeComparisonResultMapWithRelationships,
-        mappingMap: Map<String, Map<String, MergeRequestDocumentMapping>> = emptyMap()
+        mappingMap: Map<String, Map<String, MergeRequestDocumentMapping>> = emptyMap(),
+        // StrapiLinkRef.targetDocumentId, when known: the referenced SOURCE document, read with the link.
+        sourceDocumentId: String? = null,
     ): String? {
-        if (id == null) return null
+        if (id == null && sourceDocumentId == null) return null
         val idx = indexFor(comparisonDataMap)
         // The numeric id is a SOURCE id (content being synced comes from source). Resolve source-first.
-        val srcDoc = idx.srcIdToDoc[table]?.get(id)
+        val srcDoc = sourceDocumentId ?: idx.srcIdToDoc[table]?.get(id)
         if (srcDoc != null) {
             // map SOURCE -> TARGET via mappingMap (entities synced in this run)...
             mappingMap[targetCollectionUID]?.get(srcDoc)?.targetDocumentId?.let { return it }
@@ -90,8 +97,33 @@ object ContentJsonUtils {
             return error("Missing mapping for $srcDoc -> $targetCollectionUID")
         }
         // Fallback: the id matched a TARGET entry directly → it already is the target documentId.
-        idx.tgtIdToDoc[table]?.get(id)?.let { return it }
+        // Only for legacy refs without a documentId: a source draft-row id would otherwise collide with
+        // an unrelated target entry (numeric ids overlap across instances) and link the wrong document.
+        if (id != null) idx.tgtIdToDoc[table]?.get(id)?.let { return it }
         return null
+    }
+
+    private fun isRootContent(schema: DbTable): Boolean = schema.metadata?.collectionType.let {
+        it == StrapiContentTypeKind.CollectionType || it == StrapiContentTypeKind.SingleType
+    }
+
+    /** The write for "no references": `{ "set": [] }`. */
+    internal fun emptyReferenceSet(): JsonObject = buildJsonObject { put("set", JsonArray(emptyList())) }
+
+    /** A write that only clears an attribute ({set:[]}, null component, empty list). */
+    internal fun isClearingWrite(v: JsonElement): Boolean =
+        v == emptyReferenceSet() || v is JsonNull || (v is JsonArray && v.isEmpty())
+
+    /**
+     * Reference attributes of a content type whose emptiness on the source is KNOWN, so they may be
+     * cleared on the target: relations read from a join table it owns ([readableRelationAttributes]) and
+     * media fields (always read, from files_related_mph). Components are recreated on every write, so
+     * only root content types need this.
+     */
+    internal fun clearableReferenceAttributes(schema: DbTable, dbSchema: DbSchema): List<String> {
+        val columns = schema.metadata?.columns ?: return emptyList()
+        val readable = readableRelationAttributes(schema.name, dbSchema)
+        return columns.filter { (it.type == "relation" && it.name in readable) || it.type == "media" }.map { it.name }
     }
 
     fun processJsonElementNew(
@@ -114,7 +146,8 @@ object ContentJsonUtils {
                     STRAPI_FILE_CONTENT_TYPE_NAME,
                     link.targetId,
                     comparisonDataMap,
-                    mappingMap
+                    mappingMap,
+                    link.targetDocumentId
                 )
                 val numericId = srcOrTgtDocId?.let { did ->
                     allTargetFileIdByDoc[did]
@@ -130,7 +163,8 @@ object ContentJsonUtils {
                             schemaLinkMeta.apiUid,
                             link.targetId,
                             comparisonDataMap,
-                            mappingMap
+                            mappingMap,
+                            link.targetDocumentId
                         )
                     targetDocId?.let { JsonPrimitive(it) }
                 }
@@ -157,10 +191,28 @@ object ContentJsonUtils {
                             }
                         }
                     }
+                    // A reference attribute the SOURCE leaves empty is written as empty: Strapi keeps any
+                    // attribute missing from an update, so omitting it left the target's old references in
+                    // place. Attributes that have links (even unresolvable ones) are never cleared.
+                    if (currentSchema != null && isRootContent(currentSchema)) {
+                        val withLinks = linkToProcess.filter { !it.field.contains('.') }.map { normalizeKeyName(it.field) }.toSet()
+                        clearableReferenceAttributes(currentSchema, dbSchema)
+                            .filter { normalizeKeyName(it) !in withLinks }
+                            .forEach { put(it, emptyReferenceSet()) }
+                        // Same for components / dynamic zones: the reader embeds every one the source
+                        // HAS (as an array), so an absent one is empty on the source.
+                        val present = element.keys.map { normalizeKeyName(it) }.toSet()
+                        currentSchema.metadata?.columns.orEmpty()
+                            .filter { (it.type == "component" || it.type == "dynamiczone") && normalizeKeyName(it.name) !in present }
+                            .forEach { put(it.name, if (it.type == "dynamiczone" || it.repeatable) JsonArray(emptyList()) else JsonNull) }
+                    }
+                    val opaque = jsonKeysOf(element)
                     for ((key, value) in element) {
-                        if (TECHNICAL_FIELDS.contains(key) || key == "document_id" || key == "__order" || key == "__links" || key == "id") continue
+                        if (TECHNICAL_FIELDS.contains(key) || key == "document_id" || key == "__order" || key == "__links" || key == JSON_KEYS || key == "id") continue
                         val normalized = normalizeKeyName(key)
                         val mappedKey = currentResolver?.get(normalized) ?: key
+                        // JSON attribute: written exactly as read (its inner "id"/timestamps are content).
+                        if (key in opaque) { put(mappedKey, value); continue }
                         val nestedLinkToProcess = linkToProcess.filter { it.field.startsWith("$key.") }
                             .map { it.copy(field = it.field.substring("$key.".length)) }
 

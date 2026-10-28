@@ -1,7 +1,9 @@
 package it.sebi.service
 
+import it.sebi.models.ContentTypeComparisonResultKind
 import it.sebi.models.StrapiContent
 import it.sebi.models.StrapiContentMetadata
+import it.sebi.models.StrapiContentTypeKind
 import it.sebi.models.StrapiImage
 import it.sebi.models.StrapiImageMetadata
 import kotlinx.serialization.json.JsonArray
@@ -208,7 +210,7 @@ class SyncServiceDbHelpersTest {
     // normalizeLinksBySyncId --------------------------------------------------
 
     @Test
-    fun `normalizeLinksBySyncId replaces doc ids with sorted identities`() {
+    fun `normalizeLinksBySyncId replaces doc ids with identities keeping the order`() {
         val obj = mutableMapOf<String, kotlinx.serialization.json.JsonElement>(
             "__links" to buildJsonObject {
                 put("rel", buildJsonArray {
@@ -221,8 +223,32 @@ class SyncServiceDbHelpersTest {
         normalizeLinksBySyncId(obj, mapOf("docA" to "SID-A", "docB" to "SID-B"))
 
         val rel = (obj["__links"] as JsonObject)["rel"]!!.jsonArray.map { it.jsonPrimitive.content }
-        // Sorted; unknown doc ids fall back to "doc:<id>".
-        assertEquals(listOf("SID-A", "SID-B", "doc:docUnknown"), rel)
+        // Source order kept (relation order is content); unknown doc ids fall back to "doc:<id>".
+        assertEquals(listOf("SID-B", "SID-A", "doc:docUnknown"), rel)
+    }
+
+    @Test
+    fun `reordered relations compare as DIFFERENT, swapped duplicates as IDENTICAL`() {
+        fun entry(doc: String, vararg refs: String) = StrapiContent(
+            metadata = StrapiContentMetadata(id = 1, documentId = doc, uniqueKey = doc, locale = null),
+            rawData = JsonObject(emptyMap()),
+            cleanData = buildJsonObject {
+                put("title", "T")
+                put("__links", buildJsonObject { put("cards", buildJsonArray { refs.forEach { add(JsonPrimitive(it)) } }) })
+            },
+        )
+        fun compare(s: StrapiContent, t: StrapiContent, src: Map<String, String>, tgt: Map<String, String>) =
+            compareSingleType("pages", "api::page.page", s, t, StrapiContentTypeKind.SingleType, emptyMap(), mutableMapOf(),
+                srcSyncByDoc = src, tgtSyncByDoc = tgt).compareState
+
+        val src = mapOf("a" to "id:A", "b" to "id:B")
+        val tgt = mapOf("x" to "id:A", "y" to "id:B")
+        assertEquals(ContentTypeComparisonResultKind.IDENTICAL, compare(entry("p", "a", "b"), entry("q", "x", "y"), src, tgt))
+        assertEquals(ContentTypeComparisonResultKind.DIFFERENT, compare(entry("p", "a", "b"), entry("q", "y", "x"), src, tgt))
+        // Two copies of the same content share one identity: swapping them is not a change.
+        val dupTgt = mapOf("x" to "c:same", "y" to "c:same")
+        val dupSrc = mapOf("a" to "c:same", "b" to "c:same")
+        assertEquals(ContentTypeComparisonResultKind.IDENTICAL, compare(entry("p", "a", "b"), entry("q", "y", "x"), dupSrc, dupTgt))
     }
 
     @Test

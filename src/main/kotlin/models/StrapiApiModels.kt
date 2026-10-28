@@ -61,7 +61,11 @@ data class StrapiLinkRef(
     val isInverse: Boolean = false,
     // field with each component item's position, e.g. "cardCollection[2].card[0].serviceTags" (compare
     // key for __links); null for refs cached before it existed (then [field] is used).
-    val path: String? = null
+    val path: String? = null,
+    // documentId of the referenced row on the instance it was read from. Draft rows reference DRAFT
+    // target rows, whose numeric ids are not in the comparison (it indexes published rows), so the
+    // write resolves by this instead of by [targetId]. Null for refs cached before it existed.
+    val targetDocumentId: String? = null,
 )
 
 @Serializable

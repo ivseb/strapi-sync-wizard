@@ -12,9 +12,11 @@ import { Dialog } from 'primereact/dialog';
 // content is identical (different documentId per instance, relations referenced by documentId).
 // They are not "content changes", so they're excluded from the field diff and surfaced separately.
 const IDENTITY = new Set(['id', 'documentId', 'document_id', '__sync_id', '__links']);
+// Backend marker listing a row's JSON attributes: their content is shown whole, inner "id" included.
+const JSON_KEYS = '__json';
 const TECH = new Set([
   ...IDENTITY,
-  '__order', '__component', 'locale',
+  '__order', '__component', JSON_KEYS, 'locale',
   'createdAt', 'updatedAt', 'publishedAt', 'created_at', 'updated_at', 'published_at',
   'created_by_id', 'updated_by_id', 'createdBy', 'updatedBy',
 ]);
@@ -41,7 +43,7 @@ const fmt = (v: any): string => {
   return String(v);
 };
 
-export interface Leaf { path: string; src: any; tgt: any; changed: boolean }
+export interface Leaf { path: string; src: any; tgt: any; changed: boolean; raw?: boolean }
 
 const flatten = (path: string, src: any, tgt: any, out: Leaf[]): void => {
   if (src === undefined && tgt === undefined) return;
@@ -57,9 +59,16 @@ const flatten = (path: string, src: any, tgt: any, out: Leaf[]): void => {
     return;
   }
 
+  const json = new Set<string>([...(isObj(src) ? src[JSON_KEYS] || [] : []), ...(isObj(tgt) ? tgt[JSON_KEYS] || [] : [])]);
   const keys = Array.from(new Set([...keysOf(src), ...keysOf(tgt)]));
   if (keys.length === 0) { out.push({ path, src, tgt, changed: !eq(src, tgt) }); return; }
-  keys.forEach((k) => flatten(path ? `${path}.${k}` : k, isObj(src) ? src[k] : undefined, isObj(tgt) ? tgt[k] : undefined, out));
+  keys.forEach((k) => {
+    const p = path ? `${path}.${k}` : k;
+    const a = isObj(src) ? src[k] : undefined;
+    const b = isObj(tgt) ? tgt[k] : undefined;
+    if (json.has(k)) out.push({ path: p, src: a, tgt: b, changed: !eq(a, b), raw: true });
+    else flatten(p, a, b, out);
+  });
 };
 
 export const computeLeaves = (source: any, target: any): Leaf[] => {
@@ -228,7 +237,7 @@ const RefChip: React.FC<{ r: ResolvedRefT; instanceId?: number; onZoom?: (url: s
   );
 };
 
-const Cell: React.FC<{ v: any; kind: 'src' | 'tgt'; changed: boolean }> = ({ v, kind, changed }) => {
+const Cell: React.FC<{ v: any; kind: 'src' | 'tgt'; changed: boolean; raw?: boolean }> = ({ v, kind, changed, raw }) => {
   const defined = v !== undefined;
   const cls = !defined ? 'empty' : changed ? (kind === 'src' ? 'add' : 'del') : '';
   return (
@@ -238,7 +247,7 @@ const Cell: React.FC<{ v: any; kind: 'src' | 'tgt'; changed: boolean }> = ({ v, 
           <span className="ss-thumb">{v.url ? <img src={v.url} alt="" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} /> : <i className="pi pi-image" aria-hidden="true" />}</span>
           {fmt(v)}
         </span>
-      ) : fmt(v)}
+      ) : raw ? JSON.stringify(v, null, 1) : fmt(v)}
     </div>
   );
 };
@@ -258,8 +267,8 @@ const LeafRow: React.FC<{ leaf: Leaf }> = ({ leaf }) => {
   return (
     <>
       <div className="c k">{leaf.path || '(root)'}</div>
-      <Cell v={leaf.src} kind="src" changed={leaf.changed} />
-      <Cell v={leaf.tgt} kind="tgt" changed={leaf.changed} />
+      <Cell v={leaf.src} kind="src" changed={leaf.changed} raw={leaf.raw} />
+      <Cell v={leaf.tgt} kind="tgt" changed={leaf.changed} raw={leaf.raw} />
     </>
   );
 };
@@ -285,9 +294,13 @@ const FieldDiffSplit: React.FC<{
     return fields.map((field) => {
       const sRefs = sl[field] || [];
       const tRefs = tl[field] || [];
-      // order-insensitive (sorted) — reordering duplicate/identical targets is not a change.
-      const changed = sRefs.map(refKey).sort().join('|') !== tRefs.map(refKey).sort().join('|');
-      return { field, sRefs, tRefs, changed };
+      // order-sensitive, like the backend compare: a reorder is a change. Duplicate targets share one
+      // identity, so swapping two copies of the same content still isn't.
+      const sKeys = sRefs.map(refKey);
+      const tKeys = tRefs.map(refKey);
+      const changed = sKeys.join('|') !== tKeys.join('|');
+      const reorderOnly = changed && [...sKeys].sort().join('|') === [...tKeys].sort().join('|');
+      return { field, sRefs, tRefs, changed, reorderOnly };
     });
   }, [sourceRefs, targetRefs]);
   const changedLinks = linkRows.filter((l) => l.changed);
@@ -311,7 +324,7 @@ const FieldDiffSplit: React.FC<{
           <div className="h">target (current)</div>
           {shownLinks.map((l, i) => (
             <React.Fragment key={'lnk' + i}>
-              <div className="c k">{l.field}</div>
+              <div className="c k">{l.field}{l.reorderOnly && <span className="ss-badge" style={{ fontSize: 9, marginLeft: 6 }}>order</span>}</div>
               <div className={`c ${l.changed ? 'add' : ''}`}>{l.sRefs.length ? l.sRefs.map((r, j) => <RefChip key={j} r={r} instanceId={srcInstanceId} onZoom={(url, label) => setZoom({ url, label })} onOpenRef={onOpenRef} />) : '—'}</div>
               <div className={`c ${l.changed ? 'del' : ''}`}>{l.tRefs.length ? l.tRefs.map((r, j) => <RefChip key={j} r={r} instanceId={tgtInstanceId} onZoom={(url, label) => setZoom({ url, label })} onOpenRef={onOpenRef} />) : '—'}</div>
             </React.Fragment>

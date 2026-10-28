@@ -41,7 +41,7 @@ const shortType = (ct: string) => (ct === 'files' ? 'files' : ct.substring(ct.la
 // mirroring the backend's contentLabelOf: prefer fields whose name hints at a title, then any
 // short text. Returns null when nothing usable is found (caller falls back to the documentId).
 const LABEL_HINTS = ['title', 'name', 'label', 'heading', 'subject', 'slug', 'code', 'key', 'question', 'testo', 'descrizione', 'description'];
-const LABEL_TECH = new Set(['id', 'documentId', 'document_id', '__sync_id', '__component', '__links', '__order',
+const LABEL_TECH = new Set(['id', 'documentId', 'document_id', '__sync_id', '__component', '__links', '__order', '__json',
     'createdAt', 'updatedAt', 'publishedAt', 'created_at', 'updated_at', 'published_at', 'locale',
     'hash', 'ext', 'mime', 'provider', 'url', 'previewUrl']);
 const isShortText = (v: any): v is string => typeof v === 'string' && v.trim().length >= 1 && v.trim().length <= 80;

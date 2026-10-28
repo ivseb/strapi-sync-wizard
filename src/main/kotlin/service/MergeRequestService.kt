@@ -646,7 +646,7 @@ class MergeRequestService(
             val (entry, _) = pair
             val sourceLinks = entry.sourceContent?.links ?: emptyList()
             for (link in sourceLinks) {
-                val targetDocId = resolveDocIdForLinkInternal(link.targetTable, link.targetId, comparison)
+                val targetDocId = link.targetDocumentId ?: resolveDocIdForLinkInternal(link.targetTable, link.targetId, comparison)
                 if (targetDocId == null) {
                     // cannot even resolve the referenced documentId
                     missing += MissingDependency(
@@ -1642,7 +1642,7 @@ class MergeRequestService(
         // Filter out false-positive missing deps for files satisfied by selected files or target presence
         val filteredMissing = order.missingDependencies.filterNot { m ->
             if (m.link.targetTable == "files") {
-                val depDocId = resolveDocIdForLinkInternal("files", m.link.targetId, comparisonDataMap)
+                val depDocId = m.link.targetDocumentId ?: resolveDocIdForLinkInternal("files", m.link.targetId, comparisonDataMap)
                 depDocId != null && (
                         augmentedAllTargetMap.containsKey(depDocId) ||
                                 comparisonDataMap.files.any { it.targetImage?.metadata?.documentId == depDocId }

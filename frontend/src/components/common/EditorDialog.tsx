@@ -56,7 +56,7 @@ const EditorDialog: React.FC<EditorDialogProps> = ({
         const entries = Array.isArray(obj) ? (obj.length > 0 ? Object.entries(obj[0]) : []) : Object.entries(obj);
 
         return entries
-            .filter(([key]) => !['__links', '__order', 'id', 'documentId', 'document_id'].includes(key)) // Hide internal/technical fields
+            .filter(([key]) => !['__links', '__order', '__json', 'id', 'documentId', 'document_id'].includes(key)) // Hide internal/technical fields
             .map(([key, value]) => {
                 const currentPath = path ? `${path}.${key}` : key;
                 const isObject = typeof value === 'object' && value !== null;
