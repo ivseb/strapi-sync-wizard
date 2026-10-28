@@ -20,7 +20,7 @@ import it.sebi.models.ResolvedRef
 object VerificationDiff {
 
     private val techFields = setOf(
-        "id", "documentId", "document_id", "__links", "__order", "__component", "localizations",
+        "id", "documentId", "document_id", "__links", "__order", "__component", JSON_KEYS, "localizations",
         "createdAt", "updatedAt", "publishedAt", "created_at", "updated_at", "published_at",
         "createdBy", "updatedBy", "created_by_id", "updated_by_id", "locale"
     )
@@ -28,7 +28,14 @@ object VerificationDiff {
     internal fun flattenLeaves(el: JsonElement?, path: String, out: MutableMap<String, String?>) {
         when (el) {
             null, is JsonNull -> { if (path.isNotEmpty()) out[path] = null }
-            is JsonObject -> el.forEach { (k, v) -> if (k !in techFields) flattenLeaves(v, if (path.isEmpty()) k else "$path.$k", out) }
+            is JsonObject -> {
+                val opaque = jsonKeysOf(el) // JSON attributes compare as whole values, inner keys included
+                el.forEach { (k, v) ->
+                    val p = if (path.isEmpty()) k else "$path.$k"
+                    if (k in opaque) out[p] = if (v is JsonNull) null else v.toString()
+                    else if (k !in techFields) flattenLeaves(v, p, out)
+                }
+            }
             is JsonArray -> el.forEachIndexed { i, v -> flattenLeaves(v, "$path[$i]", out) }
             is JsonPrimitive -> out[path] = if (el.isString) el.content else el.toString()
         }
@@ -56,12 +63,13 @@ object VerificationDiff {
 
     /**
      * Reference paths (relation/media, positional — "cardCollection[2].card[0].serviceTags") whose
-     * referenced identities differ between source and target, order-insensitive. `__links` is excluded
-     * from [classify] because its raw documentIds are per-instance; this compares their identities.
+     * referenced identities differ between source and target, in order (a reorder is a change, as in
+     * the compare). `__links` is excluded from [classify] because its raw documentIds are
+     * per-instance; this compares their identities.
      */
     fun referenceDiffs(srcRefs: Map<String, List<ResolvedRef>>, tgtRefs: Map<String, List<ResolvedRef>>): List<String> =
         (srcRefs.keys + tgtRefs.keys).filter { path ->
-            srcRefs[path].orEmpty().map(::refKey).sorted() != tgtRefs[path].orEmpty().map(::refKey).sorted()
+            srcRefs[path].orEmpty().map(::refKey) != tgtRefs[path].orEmpty().map(::refKey)
         }.sorted()
 
     /**

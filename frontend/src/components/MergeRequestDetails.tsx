@@ -236,6 +236,11 @@ const MergeRequestDetails: React.FC = () => {
   const data = detail.mergeRequestData;
   const badge = statusBadge(status);
 
+  // selection summary for the sticky action bar
+  const selectedByDir: Record<string, number> = { TO_CREATE: 0, TO_UPDATE: 0, TO_DELETE: 0 };
+  (data?.selections || []).forEach((dto) => (dto.selections || []).forEach((x) => { selectedByDir[x.direction] = (selectedByDir[x.direction] || 0) + 1; }));
+  const selectedTotal = selectedByDir.TO_CREATE + selectedByDir.TO_UPDATE + selectedByDir.TO_DELETE;
+
   // counts for tabs
   const fileCount = (data?.files ? (Object.values(data.files).flat() as any[]).filter((f) => f && f.compareState && f.compareState !== 'IDENTICAL').length : 0);
   const contentCount = (() => {
@@ -356,6 +361,22 @@ const MergeRequestDetails: React.FC = () => {
                 sourceInstanceId={detail.mergeRequest.sourceInstance.id} targetInstanceId={detail.mergeRequest.targetInstance.id}
                 updateAllSelections={updateAllSelections} onSaved={() => { refetch(); }} />
             )}
+            {/* Always reachable while scrolling a long list: what is selected + the way to review. */}
+            <div className="ss-actionbar ss-sticky-bottom">
+              <span style={{ fontSize: 12.5, color: 'var(--ss-text-2)' }}>
+                {selectedTotal === 0
+                  ? 'Nothing selected yet'
+                  : <><strong style={{ color: 'var(--ss-text)' }}>{selectedTotal}</strong> selected
+                      <span className="ss-count add" style={{ marginLeft: 10 }}>+{selectedByDir.TO_CREATE}</span>
+                      <span className="ss-count upd" style={{ marginLeft: 8 }}>~{selectedByDir.TO_UPDATE}</span>
+                      <span className="ss-count del" style={{ marginLeft: 8 }}>−{selectedByDir.TO_DELETE}</span></>}
+              </span>
+              <span style={{ marginLeft: 'auto' }} />
+              <button className="ss-btn subtle" disabled={compareMut.isPending} onClick={compareContent}><i className="pi pi-refresh" aria-hidden="true" /> Re-compare</button>
+              <button className="ss-btn primary" disabled={completed} onClick={() => updateMergeRequestStatus('REVIEW').then(() => refetch())}>
+                Go to review <i className="pi pi-arrow-right" aria-hidden="true" />
+              </button>
+            </div>
           </>
         )}
 
@@ -364,15 +385,9 @@ const MergeRequestDetails: React.FC = () => {
             <SnapshotManager mergeRequestId={idNum} onRestoreComplete={() => refetch()} />
             <div style={{ marginTop: 16 }}>
               <CompleteMergeStep status={status} completing={completeMut.isPending} completeMerge={completeMerge}
-                selections={data?.selections} allMergeData={data} />
+                selections={data?.selections} allMergeData={data} mergeRequestId={idNum}
+                onBack={() => { setActiveStep(1); updateMergeRequestStatus('MERGED_COLLECTIONS').then(() => refetch()); }} />
             </div>
-            {!completed && (
-              <div style={{ marginTop: 16 }}>
-                <button className="ss-btn" onClick={() => { setActiveStep(1); updateMergeRequestStatus('MERGED_COLLECTIONS').then(() => refetch()); }}>
-                  <i className="pi pi-arrow-left" aria-hidden="true" /> Back to changes
-                </button>
-              </div>
-            )}
           </div>
         )}
       </div>

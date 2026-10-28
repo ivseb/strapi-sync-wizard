@@ -646,7 +646,7 @@ class MergeRequestService(
             val (entry, _) = pair
             val sourceLinks = entry.sourceContent?.links ?: emptyList()
             for (link in sourceLinks) {
-                val targetDocId = resolveDocIdForLinkInternal(link.targetTable, link.targetId, comparison)
+                val targetDocId = link.targetDocumentId ?: resolveDocIdForLinkInternal(link.targetTable, link.targetId, comparison)
                 if (targetDocId == null) {
                     // cannot even resolve the referenced documentId
                     missing += MissingDependency(
@@ -1134,6 +1134,13 @@ class MergeRequestService(
      * @param id Merge request ID
      * @return MergeRequestData containing all the necessary information
      */
+    private fun typeLabelsOf(schema: DbSchema?): List<ContentTypeLabel> =
+        schema?.tables.orEmpty().mapNotNull { t ->
+            val m = t.metadata ?: return@mapNotNull null
+            if (m.collectionType != StrapiContentTypeKind.SingleType && m.collectionType != StrapiContentTypeKind.CollectionType) return@mapNotNull null
+            ContentTypeLabel(uid = m.apiUid, tableName = t.name, displayName = m.displayName)
+        }
+
     suspend fun getAllMergeRequestData(id: Int, forceCompare: Boolean): MergeRequestData? {
         return getAllMergeRequestDataIfCompared(id, forceCompare)
     }
@@ -1170,7 +1177,8 @@ class MergeRequestService(
                 singleTypes = compareResult.singleTypes,
                 collectionTypes = compareResult.collectionTypes,
                 contentTypeRelationships = compareResult.contentTypeRelationships,
-                selections = selections
+                selections = selections,
+                typeLabels = typeLabelsOf(dataFileUtils.getSchemaCompatibilityFile(id)?.extractedSchema)
             )
         }
     }
@@ -1642,7 +1650,7 @@ class MergeRequestService(
         // Filter out false-positive missing deps for files satisfied by selected files or target presence
         val filteredMissing = order.missingDependencies.filterNot { m ->
             if (m.link.targetTable == "files") {
-                val depDocId = resolveDocIdForLinkInternal("files", m.link.targetId, comparisonDataMap)
+                val depDocId = m.link.targetDocumentId ?: resolveDocIdForLinkInternal("files", m.link.targetId, comparisonDataMap)
                 depDocId != null && (
                         augmentedAllTargetMap.containsKey(depDocId) ||
                                 comparisonDataMap.files.any { it.targetImage?.metadata?.documentId == depDocId }

@@ -4,6 +4,9 @@ import { MergeRequestSelectionDTO, MergeRequestData, MergeRequestSelection, Stra
 import { getRepresentativeAttributes } from '../../utils/attributeUtils';
 import EditorDialog from '../common/EditorDialog';
 import SyncPlanGraph from './components/SyncPlanGraph';
+import { ExpandCollapseAll, groupDomId, IndexItem, jumpToGroup, TypeIndex, TypeJump, TypeLabel } from '../common/GroupNav';
+import { makeTypeNamer, typeText } from '../../utils/typeNames';
+import { usePersistentSet, usePersistentState } from '../../hooks/usePersistentState';
 
 // Interface for sync progress updates from the WebSocket
 interface SyncProgressUpdate {
@@ -23,6 +26,9 @@ interface CompleteMergeStepProps {
     completeMerge: (opts?: { onlyFailed?: boolean; rollbackOnFailure?: boolean }) => void;
     selections?: MergeRequestSelectionDTO[];
     allMergeData?: MergeRequestData;
+    mergeRequestId?: number;
+    /** Back to the changes (selection) step; shown in the action bar when the run hasn't completed. */
+    onBack?: () => void;
 }
 
 type Operation = 'create' | 'update' | 'delete';
@@ -35,13 +41,11 @@ interface ReviewItem {
     statusInfo?: MergeRequestSelection;
 }
 
-const shortType = (ct: string) => (ct === 'files' ? 'files' : ct.substring(ct.lastIndexOf('.') + 1));
-
 // Recursive search for a readable label inside a (possibly relation-/component-only) entry,
 // mirroring the backend's contentLabelOf: prefer fields whose name hints at a title, then any
 // short text. Returns null when nothing usable is found (caller falls back to the documentId).
 const LABEL_HINTS = ['title', 'name', 'label', 'heading', 'subject', 'slug', 'code', 'key', 'question', 'testo', 'descrizione', 'description'];
-const LABEL_TECH = new Set(['id', 'documentId', 'document_id', '__sync_id', '__component', '__links', '__order',
+const LABEL_TECH = new Set(['id', 'documentId', 'document_id', '__sync_id', '__component', '__links', '__order', '__json',
     'createdAt', 'updatedAt', 'publishedAt', 'created_at', 'updated_at', 'published_at', 'locale',
     'hash', 'ext', 'mime', 'provider', 'url', 'previewUrl']);
 const isShortText = (v: any): v is string => typeof v === 'string' && v.trim().length >= 1 && v.trim().length <= 80;
@@ -77,8 +81,11 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                                                                  completing,
                                                                  completeMerge,
                                                                  selections = [],
-                                                                 allMergeData
+                                                                 allMergeData,
+                                                                 mergeRequestId,
+                                                                 onBack
                                                              }) => {
+    const typeName = useMemo(() => makeTypeNamer(allMergeData?.typeLabels), [allMergeData?.typeLabels]);
     // ---- counts -------------------------------------------------------------
     const totalToCreate = selections.reduce((s, dto) => s + ((dto.selections || []).filter(x => x.direction === 'TO_CREATE').length), 0);
     const totalToUpdate = selections.reduce((s, dto) => s + ((dto.selections || []).filter(x => x.direction === 'TO_UPDATE').length), 0);
@@ -113,11 +120,12 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
     const [planError, setPlanError] = useState<string | null>(null);
     const [showPlan, setShowPlan] = useState(false);
 
-    // ---- view filters -------------------------------------------------------
-    const [query, setQuery] = useState('');
-    const [opFilter, setOpFilter] = useState<Set<Operation>>(new Set(['create', 'update', 'delete']));
-    const [statusFilter, setStatusFilter] = useState<'all' | EffStatus>('all');
-    const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+    // ---- view filters (remembered per merge request) --------------------------
+    const pk = `ss:mr:${mergeRequestId ?? 'x'}:review:`;
+    const [query, setQuery] = usePersistentState(pk + 'search', '');
+    const [opFilter, setOpFilter] = usePersistentSet<Operation>(pk + 'ops', new Set(['create', 'update', 'delete']));
+    const [statusFilter, setStatusFilter] = usePersistentState<'all' | EffStatus>(pk + 'status', 'all');
+    const [collapsed, setCollapsed] = usePersistentSet<string>(pk + 'collapsed', new Set());
 
     const loadPlan = () => {
         const parts = window.location.pathname.split('/');
@@ -377,7 +385,7 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
             if (!opFilter.has(it.operation)) return false;
             if (statusFilter !== 'all' && effStatus(it) !== statusFilter) return false;
             if (q) {
-                const hay = `${shortType(it.contentType)} ${itemLabel(it.contentType, it.documentId)} ${it.documentId}`.toLowerCase();
+                const hay = `${typeText(typeName(it.contentType))} ${itemLabel(it.contentType, it.documentId)} ${it.documentId}`.toLowerCase();
                 if (!hay.includes(q)) return false;
             }
             return true;
@@ -387,8 +395,19 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
     const groups = useMemo(() => {
         const m = new Map<string, ReviewItem[]>();
         filtered.forEach(it => { const a = m.get(it.contentType) || []; a.push(it); m.set(it.contentType, a); });
-        return Array.from(m.entries()).sort((a, b) => a[0].localeCompare(b[0]));
-    }, [filtered]);
+        return Array.from(m.entries()).sort((a, b) => typeName(a[0]).admin.localeCompare(typeName(b[0]).admin));
+    }, [filtered, typeName]);
+
+    const indexItems: IndexItem[] = groups.map(([ct, items]) => ({
+        key: ct, name: typeName(ct),
+        add: items.filter(i => i.operation === 'create').length,
+        upd: items.filter(i => i.operation === 'update').length,
+        del: items.filter(i => i.operation === 'delete').length,
+    }));
+    const jumpTo = (ct: string) => {
+        setCollapsed(prev => { const n = new Set(prev); n.delete(ct); return n; });
+        jumpToGroup('review', ct);
+    };
 
     const toggleOp = (op: Operation) => setOpFilter(prev => {
         const n = new Set(prev);
@@ -444,8 +463,9 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
             <div className="ss-review-toolbar">
                 <div className="ss-search" style={{ width: 200 }}>
                     <i className="pi pi-search" aria-hidden="true" />
-                    <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search items…" />
+                    <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search by name or type…" />
                 </div>
+                <TypeJump items={indexItems} onJump={jumpTo} />
                 <Pill op="create" n={totalToCreate} />
                 <Pill op="update" n={totalToUpdate} />
                 <Pill op="delete" n={totalToDelete} />
@@ -460,6 +480,7 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                 )}
 
                 <span style={{ marginLeft: 'auto' }} />
+                <ExpandCollapseAll onExpand={() => setCollapsed(new Set())} onCollapse={() => setCollapsed(new Set(groups.map(([ct]) => ct)))} />
                 <button className={`ss-btn subtle${showPlan ? ' active' : ''}`} onClick={() => setShowPlan(v => !v)}>
                     <i className={`pi ${showPlan ? 'pi-chevron-up' : 'pi-sitemap'}`} aria-hidden="true" /> Execution order
                 </button>
@@ -499,14 +520,14 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                     {planError && <div style={{ fontSize: 12, color: 'var(--ss-red)' }}>{planError}</div>}
                     {!planLoading && !planError && syncPlan && (syncPlan.batches.length === 0
                         ? <div className="ss-dim" style={{ fontSize: 12 }}>No dependencies to resolve — items are processed directly.</div>
-                        : <SyncPlanGraph syncPlan={syncPlan} syncItemsStatus={syncItemsStatus} onInspect={inspectItem} labelFor={itemLabel} />)}
+                        : <SyncPlanGraph syncPlan={syncPlan} syncItemsStatus={syncItemsStatus} onInspect={inspectItem} labelFor={itemLabel} typeNameOf={(t) => typeName(t).admin} />)}
 
                     {syncPlan && syncPlan.missingDependencies.length > 0 && (
                         <div style={{ marginTop: 10 }}>
                             <span className="ss-chip warn"><i className="pi pi-exclamation-triangle" /> {syncPlan.missingDependencies.length} missing dependencies</span>
                             <ul style={{ margin: '6px 0 0', paddingLeft: 18, fontSize: 12, color: 'var(--ss-text-2)' }}>
                                 {syncPlan.missingDependencies.map((m, i) => (
-                                    <li key={i}>{shortType(m.fromTable)}:{m.fromDocumentId} requires <code>{shortType(m.linkTargetTable)}.{m.linkField}</code> — {m.reason}</li>
+                                    <li key={i}>{typeName(m.fromTable).admin}:{m.fromDocumentId} requires <code>{typeName(m.linkTargetTable).api}.{m.linkField}</code> — {m.reason}</li>
                                 ))}
                             </ul>
                         </div>
@@ -519,7 +540,10 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                 </div>
             )}
 
-            {/* Item list grouped by content type */}
+            {/* Item list grouped by content type, with a side index for quick access */}
+            <div className={`ss-withindex${groups.length > 0 ? ' has-index' : ''}`}>
+            {groups.length > 0 && <TypeIndex items={indexItems} onJump={jumpTo} />}
+            <div className="ss-groups">
             {groups.length === 0 ? (
                 <div className="ss-empty"><i className="pi pi-filter-slash" aria-hidden="true" />No items match the current filters.</div>
             ) : groups.map(([ct, items]) => {
@@ -528,14 +552,14 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                 const nU = items.filter(i => i.operation === 'update').length;
                 const nD = items.filter(i => i.operation === 'delete').length;
                 return (
-                    <div key={ct}>
+                    <div key={ct} id={groupDomId('review', ct)}>
                         <div className="ss-group-head">
-                            <button onClick={() => toggleGroup(ct)}>
-                                <i className={`pi ${isCollapsed ? 'pi-chevron-right' : 'pi-chevron-down'}`} style={{ fontSize: 10 }} />
-                                {shortType(ct)}
-                                <span className="ss-dim" style={{ textTransform: 'none', letterSpacing: 0 }}>{items.length}</span>
+                            <button onClick={() => toggleGroup(ct)} aria-expanded={!isCollapsed}>
+                                <i className={`pi ${isCollapsed ? 'pi-chevron-right' : 'pi-chevron-down'}`} aria-hidden="true" />
+                                <TypeLabel name={typeName(ct)} />
+                                <span className="ss-group-n">{items.length}</span>
                             </button>
-                            <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 8 }}>
+                            <span style={{ display: 'inline-flex', gap: 8 }}>
                                 {nC > 0 && <span className="ss-count add">+{nC}</span>}
                                 {nU > 0 && <span className="ss-count upd">~{nU}</span>}
                                 {nD > 0 && <span className="ss-count del">−{nD}</span>}
@@ -565,6 +589,8 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                     </div>
                 );
             })}
+            </div>
+            </div>
 
             {/* Verification report */}
             {verifyReport && (
@@ -580,14 +606,17 @@ const CompleteMergeStep: React.FC<CompleteMergeStepProps> = ({
                     {verifyReport.items.filter(i => i.severity !== 'ok').map((it, idx) => (
                         <div key={idx} style={{ fontSize: 11.5, color: it.severity === 'mismatch' ? 'var(--ss-red)' : 'var(--ss-text-3)', padding: '2px 0' }}>
                             <span className={`ss-state-dot ${it.severity === 'mismatch' ? 'del' : 'upd'}`} style={{ display: 'inline-block', marginRight: 6 }} />
-                            <code>{it.contentType}</code> · {it.documentId} — {it.reason || it.actual}
+                            <TypeLabel name={typeName(it.contentType)} /> · {it.documentId} — {it.reason || it.actual}
                         </div>
                     ))}
                 </div>
             )}
 
-            {/* Action bar */}
-            <div className="ss-actionbar">
+            {/* Action bar — sticks to the bottom of the screen while scrolling the list */}
+            <div className="ss-actionbar ss-sticky-bottom">
+                {onBack && !completed && !syncInProgress && (
+                    <button className="ss-btn" onClick={onBack}><i className="pi pi-arrow-left" aria-hidden="true" /> Back to changes</button>
+                )}
                 <span style={{ fontSize: 12, color: 'var(--ss-text-2)' }}>
                     <strong style={{ color: 'var(--ss-text)' }}>{totalItems}</strong> items
                     <span className="ss-count add" style={{ marginLeft: 10 }}>+{totalToCreate}</span>

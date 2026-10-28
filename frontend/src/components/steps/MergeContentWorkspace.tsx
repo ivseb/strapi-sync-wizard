@@ -14,6 +14,9 @@ import { getRepresentativeAttributes } from '../../utils/attributeUtils';
 import FieldDiffSplit, { changeSummary, computeLeaves } from '../common/FieldDiffSplit';
 import ExclusionsManager from './components/ExclusionsManager';
 import ManualCollectionMapper from './components/ManualCollectionMapper';
+import { ExpandCollapseAll, groupDomId, IndexItem, jumpToGroup, TypeIndex, TypeJump, TypeLabel } from '../common/GroupNav';
+import { makeTypeNamer, TypeName, typeText } from '../../utils/typeNames';
+import { usePersistentSet, usePersistentState } from '../../hooks/usePersistentState';
 
 interface Props {
   mergeRequestId: number;
@@ -72,12 +75,15 @@ const stateChip = (s: string): { label: string; cls: string } => {
 };
 
 const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceInstanceId, targetInstanceId, updateAllSelections, onSaved }) => {
-  const [search, setSearch] = useState('');
-  const [showIdentical, setShowIdentical] = useState(false);
-  const [showExcluded, setShowExcluded] = useState(false);
+  // Filters and collapsed groups are remembered per merge request (tab switches, reloads).
+  const pk = `ss:mr:${mergeRequestId}:content:`;
+  const [search, setSearch] = usePersistentState(pk + 'search', '');
+  const [showIdentical, setShowIdentical] = usePersistentState(pk + 'identical', false);
+  const [showExcluded, setShowExcluded] = usePersistentState(pk + 'excluded', false);
   const [open, setOpen] = useState<Set<string>>(new Set());
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
-  const [activeStates, setActiveStates] = useState<Set<string>>(new Set(['ONLY_IN_SOURCE', 'DIFFERENT', 'ONLY_IN_TARGET']));
+  const [collapsedGroups, setCollapsedGroups] = usePersistentSet<string>(pk + 'collapsed', new Set());
+  const [activeStates, setActiveStates] = usePersistentSet<string>(pk + 'states', new Set(['ONLY_IN_SOURCE', 'DIFFERENT', 'ONLY_IN_TARGET']));
+  const typeName = useMemo(() => makeTypeNamer(data.typeLabels), [data.typeLabels]);
   const [showExclusions, setShowExclusions] = useState(false);
   const [mapperTable, setMapperTable] = useState<string | null>(null);
   const [busy, setBusy] = useState<Set<string>>(new Set());
@@ -93,7 +99,7 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
       const node: RefNode = {
         source: r.sourceContent?.cleanData, target: r.targetContent?.cleanData,
         sourceRefs: r.sourceRefs, targetRefs: r.targetRefs,
-        type: r.contentType.split('.').pop() || r.contentType, state: r.compareState,
+        type: typeName(r.contentType).admin, state: r.compareState,
         sourceDoc: r.sourceContent?.metadata?.documentId, targetDoc: r.targetContent?.metadata?.documentId,
       };
       const sd = r.sourceContent?.metadata?.documentId; const td = r.targetContent?.metadata?.documentId;
@@ -204,7 +210,7 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
     ];
     rows.forEach((r) => {
       const label = labelOf(r);
-      const type = r.contentType.split('.').pop() || r.contentType;
+      const type = typeName(r.contentType).admin;
       const openDoc = r.sourceContent?.metadata?.documentId || r.targetContent?.metadata?.documentId || r.id;
       const key = r.sourceContent?.metadata?.syncId || r.targetContent?.metadata?.syncId || openDoc;
       [r.sourceRefs, r.targetRefs].forEach((refs) => {
@@ -218,7 +224,7 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
       });
     });
     return m;
-  }, [data.singleTypes, data.collectionTypes]);
+  }, [data.singleTypes, data.collectionTypes, typeName]);
 
   const referrersFor = (sourceDoc?: string, targetDoc?: string): Referrer[] => {
     const all = [...(sourceDoc ? reverseIndex.get(sourceDoc) || [] : []), ...(targetDoc ? reverseIndex.get(targetDoc) || [] : [])];
@@ -256,7 +262,7 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
   }, [data.selections]);
 
   const groups = useMemo(() => {
-    const map = new Map<string, { uid: string; tableName: string; kind: StrapiContentTypeKind; displayName: string; rows: ChangeRow[] }>();
+    const map = new Map<string, { uid: string; tableName: string; kind: StrapiContentTypeKind; name: TypeName; rows: ChangeRow[] }>();
     const push = (r: ContentTypeComparisonResultWithRelationships, kind: StrapiContentTypeKind) => {
       const c = r.sourceContent || r.targetContent;
       const documentId = c?.metadata?.documentId || r.id;
@@ -278,14 +284,14 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
           return null;
         })(),
       };
-      const g = map.get(r.contentType) || { uid: r.contentType, tableName: r.tableName, kind, displayName: r.contentType.split('.').pop() || r.contentType, rows: [] };
+      const g = map.get(r.contentType) || { uid: r.contentType, tableName: r.tableName, kind, name: typeName(r.contentType), rows: [] };
       g.rows.push(row);
       map.set(r.contentType, g);
     };
     Object.values(data.singleTypes || {}).forEach((r) => push(r, StrapiContentTypeKind.SingleType));
     Object.values(data.collectionTypes || {}).forEach((arr) => (arr || []).forEach((r) => push(r, StrapiContentTypeKind.CollectionType)));
-    return Array.from(map.values());
-  }, [data.singleTypes, data.collectionTypes]);
+    return Array.from(map.values()).sort((a, b) => a.name.admin.localeCompare(b.name.admin));
+  }, [data.singleTypes, data.collectionTypes, typeName]);
 
   const counts = useMemo(() => {
     const c: Record<string, number> = { ONLY_IN_SOURCE: 0, DIFFERENT: 0, ONLY_IN_TARGET: 0, IDENTICAL: 0, EXCLUDED: 0 };
@@ -297,15 +303,19 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
   const visibleGroups = useMemo(() => {
     const q = search.trim().toLowerCase();
     return groups
-      .map((g) => ({
+      .map((g) => {
+        // searching a type name shows that whole type
+        const typeHit = !!q && typeText(g.name).toLowerCase().includes(q);
+        return {
         ...g,
         rows: g.rows.filter((r) => {
-          if (q && !(`${r.label} ${r.documentId}`.toLowerCase().includes(q))) return false;
+          if (q && !typeHit && !(`${r.label} ${r.documentId}`.toLowerCase().includes(q))) return false;
           if (isExcluded(r)) return showExcluded;                // excluded hidden unless its filter is on
           if (r.state === 'IDENTICAL') return showIdentical;
           return activeStates.has(r.state);
         }),
-      }))
+        };
+      })
       .filter((g) => g.rows.length > 0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groups, search, showIdentical, showExcluded, activeStates, excludedSet]);
@@ -318,6 +328,16 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
     setOpen((prev) => { const n = new Set(prev); n.has(k) ? n.delete(k) : n.add(k); return n; });
   const toggleGroupCollapse = (uid: string) =>
     setCollapsedGroups((prev) => { const n = new Set(prev); n.has(uid) ? n.delete(uid) : n.add(uid); return n; });
+  const indexItems: IndexItem[] = visibleGroups.map((g) => ({
+    key: g.uid, name: g.name,
+    add: g.rows.filter((r) => r.state === 'ONLY_IN_SOURCE').length,
+    upd: g.rows.filter((r) => r.state === 'DIFFERENT').length,
+    del: g.rows.filter((r) => r.state === 'ONLY_IN_TARGET').length,
+  }));
+  const jumpTo = (uid: string) => {
+    setCollapsedGroups((prev) => { const n = new Set(prev); n.delete(uid); return n; });
+    jumpToGroup('content', uid);
+  };
 
   const toggleRow = async (r: ChangeRow, selected: boolean) => { await updateAllSelections(r.kind, selected, r.tableName, [r.documentId]); };
   const toggleGroupSel = async (g: { kind: StrapiContentTypeKind; tableName: string; rows: ChangeRow[] }, selected: boolean) => {
@@ -335,8 +355,9 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
       <div className="ss-review-toolbar">
         <div className="ss-search" style={{ width: 200 }}>
           <i className="pi pi-search" aria-hidden="true" />
-          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Filter…" />
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Filter by name or type…" />
         </div>
+        <TypeJump items={indexItems} onJump={jumpTo} />
         <span className={`ss-pill${activeStates.size === 3 ? ' active' : ''}`} style={{ cursor: 'default' }}>All {total}</span>
         <Pill s="ONLY_IN_SOURCE" cls="add" label="+" />
         <Pill s="DIFFERENT" cls="upd" label="~" />
@@ -350,6 +371,7 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
           </button>
         )}
         <span style={{ marginLeft: 'auto' }} />
+        <ExpandCollapseAll onExpand={() => setCollapsedGroups(new Set())} onCollapse={() => setCollapsedGroups(new Set(groups.map((g) => g.uid)))} />
         <button className="ss-btn subtle" onClick={() => setShowExclusions(true)}><i className="pi pi-ban" aria-hidden="true" /> Exclusions</button>
       </div>
 
@@ -359,13 +381,16 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
           <span style={{ fontSize: 12 }}>
             Mapping <span className={`ss-count ${mapPick.side === 'source' ? 'add' : 'del'}`}>{mapPick.label}</span>
             {' '}({mapPick.side}) — now click <strong style={{ fontWeight: 500 }}>“map here”</strong> on the matching{' '}
-            <strong style={{ fontWeight: 500 }}>{mapPick.side === 'source' ? 'Del (target)' : 'New (source)'}</strong> entity in <code>{mapPick.table.split('.').pop()}</code>.
+            <strong style={{ fontWeight: 500 }}>{mapPick.side === 'source' ? 'Del (target)' : 'New (source)'}</strong> entity in <strong style={{ fontWeight: 500 }}>{typeName(mapPick.uid).admin}</strong>.
           </span>
           <span style={{ marginLeft: 'auto' }} />
           <button className="ss-btn subtle" onClick={() => setMapPick(null)}>Cancel</button>
         </div>
       )}
 
+      <div className={`ss-withindex${visibleGroups.length > 0 ? ' has-index' : ''}`}>
+      {visibleGroups.length > 0 && <TypeIndex items={indexItems} onJump={jumpTo} />}
+      <div className="ss-groups">
       {visibleGroups.length === 0 ? (
         <div className="ss-empty"><i className="pi pi-inbox" aria-hidden="true" />No changes match the current filters.</div>
       ) : (
@@ -374,17 +399,18 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
           const allSelected = selectable.length > 0 && selectable.every((r) => selectedSet.has(`${r.tableName}:${r.documentId}`));
           const groupCollapsed = collapsedGroups.has(g.uid);
           return (
-            <div key={g.uid}>
+            <div key={g.uid} id={groupDomId('content', g.uid)}>
               <div className="ss-group-head">
-                <button onClick={() => toggleGroupCollapse(g.uid)}>
+                <button onClick={() => toggleGroupCollapse(g.uid)} aria-expanded={!groupCollapsed}>
                   <i className={`pi pi-chevron-${groupCollapsed ? 'right' : 'down'}`} aria-hidden="true" />
-                  {g.displayName} · {g.rows.length}
+                  <TypeLabel name={g.name} />
+                  <span className="ss-group-n">{g.rows.length}</span>
                 </button>
                 <span style={{ marginLeft: 'auto' }} />
                 {g.kind === StrapiContentTypeKind.CollectionType && (
                   <button className="ss-link" onClick={() => setMapperTable(g.tableName)}><i className="pi pi-link" aria-hidden="true" /> mapping</button>
                 )}
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 10.5, cursor: 'pointer', textTransform: 'none', letterSpacing: 0 }}>
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, cursor: 'pointer' }}>
                   <input type="checkbox" checked={allSelected} disabled={selectable.length === 0} onChange={(e) => toggleGroupSel(g, e.target.checked)} /> all
                 </label>
               </div>
@@ -457,6 +483,8 @@ const MergeContentWorkspace: React.FC<Props> = ({ mergeRequestId, data, sourceIn
           );
         })
       )}
+      </div>
+      </div>
 
       <ExclusionsManager
         visible={showExclusions}

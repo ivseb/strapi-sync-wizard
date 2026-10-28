@@ -45,8 +45,7 @@ private fun keyOf(documentId: String, locale: String?): String {
 
 private fun keyOfTarget(m: StrapiImageMetadata): String = keyOf(m.documentId, m.locale)
 
-private suspend fun compareFilesFromPrefetch(
-    mergeRequest: MergeRequestWithInstancesDTO,
+internal fun compareFilesFromPrefetch(
     pre: ComparisonPrefetch,
     currentFileMapping: Map<String, MergeRequestDocumentMapping>
 ): List<ContentTypeFileComparisonResult> {
@@ -176,13 +175,17 @@ private suspend fun compareFilesFromPrefetch(
             pairUp(s, t)
         }
     }
-    // Tier 2 — exact same bytes (sha256), only when unique 1:1 on both sides.
+    // Tier 2 — exact same bytes (sha256). Copies of identical bytes are interchangeable, so a group
+    // is paired even when it isn't 1:1 (the target often holds the same asset uploaded twice):
+    // positionally, same-named copies first. Leaving such groups unpaired made the asset look new
+    // (re-uploaded) and every referrer DIFFERENT. Surplus copies are attached below (duplicates).
     run {
         val srcBySha = remainingSources().filter { !it.metadata.calculatedSha.isNullOrBlank() }.groupBy { it.metadata.calculatedSha!! }
         val tgtBySha = remainingTargets().filter { !it.metadata.calculatedSha.isNullOrBlank() }.groupBy { it.metadata.calculatedSha!! }
+        val preference = compareBy<StrapiImage>({ it.metadata.name.lowercase() }, { it.metadata.syncId.isNullOrBlank() }, { it.metadata.id })
         for ((sha, sList) in srcBySha) {
             val tList = tgtBySha[sha] ?: continue
-            if (sList.size == 1 && tList.size == 1) pairUp(sList.first(), tList.first())
+            sList.sortedWith(preference).zip(tList.sortedWith(preference)).forEach { (s, t) -> pairUp(s, t) }
         }
     }
     // Tier 3 — same name+ext+folder NAME(+locale), only when unique 1:1 (re-encoded asset, same folder).
@@ -202,6 +205,65 @@ private suspend fun compareFilesFromPrefetch(
         for ((k, sList) in srcByName) {
             val tList = tgtByName[k] ?: continue
             if (sList.size == 1 && tList.size == 1) pairUp(sList.first(), tList.first())
+        }
+    }
+    // Same picture: identical fingerprint, or a dHash within the tolerance compareStateOf uses. Only
+    // ever applied inside a same-name group (a bare dHash match across all files mis-pairs simple
+    // images such as logos on white).
+    fun nearDistance(a: StrapiImage, b: StrapiImage): Int? {
+        val x = a.metadata.calculatedHash?.takeIf { it.isNotBlank() } ?: return null
+        val y = b.metadata.calculatedHash?.takeIf { it.isNotBlank() } ?: return null
+        if (x == y) return 0
+        return it.sebi.utils.FileFingerprintUtil.hammingDistance(x, y).takeIf { it <= 12 }
+    }
+    // Tier 4b — same name+ext(+locale) groups that are NOT 1:1: the same asset uploaded more than
+    // once and re-encoded, so the bytes differ. Each source takes its visually nearest target copy,
+    // closest pairs first; the other copies are attached below as duplicates.
+    run {
+        val tgtByName = remainingTargets().groupBy { nameKey(it.metadata) }
+        val candidates = remainingSources().flatMap { s ->
+            tgtByName[nameKey(s.metadata)].orEmpty().mapNotNull { t -> nearDistance(s, t)?.let { Triple(s, t, it) } }
+        }
+        for ((s, t, _) in candidates.sortedWith(compareBy({ it.third }, { it.first.metadata.id }, { it.second.metadata.id }))) {
+            if (s.metadata.id in pairedSourceIds || t.metadata.id in usedTargetIds) continue
+            pairUp(s, t)
+        }
+    }
+    // Duplicates — a leftover that is a COPY of an asset already accounted for is not a new or a
+    // removed asset: either its exact bytes exist on the other side, or it is a copy (same bytes, or
+    // same name and same picture) of a file of its own side that is already paired. Report it as an
+    // IDENTICAL pair with that counterpart (after the real pairs, so link resolution keeps those).
+    // Otherwise the sync would upload a duplicate or offer to delete a copy the target still uses.
+    run {
+        val pairs = results.filter { it.sourceImage != null && it.targetImage != null }
+        val pairedBySrcSha = pairs.groupBy { it.sourceImage!!.metadata.calculatedSha }
+        val pairedByTgtSha = pairs.groupBy { it.targetImage!!.metadata.calculatedSha }
+        val srcBySha = sourceWithFp.filter { !it.metadata.calculatedSha.isNullOrBlank() }.groupBy { it.metadata.calculatedSha!! }
+        val tgtBySha = targetWithFp.filter { !it.metadata.calculatedSha.isNullOrBlank() }.groupBy { it.metadata.calculatedSha!! }
+        // The paired file of [side] that [f] is a same-side copy of, with its pair.
+        fun sameSideCopy(f: StrapiImage, side: (ContentTypeFileComparisonResult) -> StrapiImage?): ContentTypeFileComparisonResult? {
+            val sha = f.metadata.calculatedSha?.takeIf { it.isNotBlank() }
+            pairs.firstOrNull { sha != null && side(it)!!.metadata.calculatedSha == sha }?.let { return it }
+            return pairs.filter { nameKey(side(it)!!.metadata) == nameKey(f.metadata) }
+                .mapNotNull { p -> nearDistance(f, side(p)!!)?.let { p to it } }
+                .minByOrNull { it.second }?.first
+        }
+        for (s in remainingSources()) {
+            val sha = s.metadata.calculatedSha?.takeIf { it.isNotBlank() }
+            val t = sha?.let { pairedByTgtSha[it]?.firstOrNull()?.targetImage ?: tgtBySha[it]?.firstOrNull() }
+                ?: sameSideCopy(s) { it.sourceImage }?.targetImage
+                ?: continue
+            // a copy of what the other side already has: never a change to sync
+            results.add(ContentTypeFileComparisonResult(sourceImage = s, targetImage = t, compareState = ContentTypeComparisonResultKind.IDENTICAL))
+            pairedSourceIds.add(s.metadata.id)
+        }
+        for (t in remainingTargets()) {
+            val sha = t.metadata.calculatedSha?.takeIf { it.isNotBlank() }
+            val s = sha?.let { pairedBySrcSha[it]?.firstOrNull()?.sourceImage ?: srcBySha[it]?.firstOrNull() }
+                ?: sameSideCopy(t) { it.targetImage }?.sourceImage
+                ?: continue
+            results.add(ContentTypeFileComparisonResult(sourceImage = s, targetImage = t, compareState = ContentTypeComparisonResultKind.IDENTICAL))
+            usedTargetIds.add(t.metadata.id)
         }
     }
     // Tier 5 — leftovers: genuinely one-sided OR ambiguous (left for review). compareStateOf keeps
@@ -494,7 +556,7 @@ suspend fun computeComparisonFromPrefetch(
 
     val fileMapping: Map<String, MergeRequestDocumentMapping> = idMappings[STRAPI_FILE_CONTENT_TYPE_NAME] ?: mapOf()
 
-    val filesResult: List<ContentTypeFileComparisonResult> = compareFilesFromPrefetch(mergeRequest,prefetch, fileMapping)
+    val filesResult: List<ContentTypeFileComparisonResult> = compareFilesFromPrefetch(prefetch, fileMapping)
 
     val contentMapping: MutableMap<String, MergeRequestDocumentMapping> =
         idMappings.filterKeys { it != STRAPI_FILE_CONTENT_TYPE_NAME }.values.fold(mutableMapOf<String, MergeRequestDocumentMapping>()) { acc, v ->
@@ -511,12 +573,14 @@ suspend fun computeComparisonFromPrefetch(
     // with the content pairing after the first compare pass.
     val srcPairOverlay = mutableMapOf<String, String>()
     val tgtPairOverlay = mutableMapOf<String, String>()
+    // Pairs come first in filesResult, duplicate copies after: a copy inherits its counterpart's
+    // token, so references to any copy of the same asset normalize identically.
     filesResult.forEach { f ->
         val s = f.sourceImage?.metadata?.documentId ?: return@forEach
         val t = f.targetImage?.metadata?.documentId ?: return@forEach
-        val token = "pair:f:$s"
-        srcPairOverlay[s] = token
-        tgtPairOverlay[t] = token
+        val token = tgtPairOverlay[t] ?: srcPairOverlay[s] ?: "pair:f:$s"
+        srcPairOverlay.putIfAbsent(s, token)
+        tgtPairOverlay.putIfAbsent(t, token)
     }
 
     // One compare pass over all content types with the given identity maps.

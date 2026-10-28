@@ -235,5 +235,10 @@ data class MergeRequestData(
     val singleTypes: Map<String, ContentTypeComparisonResultWithRelationships>,
     val collectionTypes: Map<String, List<ContentTypeComparisonResultWithRelationships>>,
     val contentTypeRelationships: List<ContentRelationship> = emptyList(),
-    val selections: List<MergeRequestSelectionDTO> = emptyList()
+    val selections: List<MergeRequestSelectionDTO> = emptyList(),
+    val typeLabels: List<ContentTypeLabel> = emptyList(),
 )
+
+/** How a content type is named in the UI: the admin display name, keyed by uid and by table. */
+@Serializable
+data class ContentTypeLabel(val uid: String, val tableName: String, val displayName: String)

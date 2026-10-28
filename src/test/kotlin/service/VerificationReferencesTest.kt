@@ -33,9 +33,16 @@ class VerificationReferencesTest {
     @Test
     fun `same identities with different documentIds are not a difference`() {
         val src = mapOf("cardCollection[0].card[0].serviceTags" to listOf(ref("s1", "id:A"), ref("s2", "id:B")))
-        val tgt = mapOf("cardCollection[0].card[0].serviceTags" to listOf(ref("t2", "id:B"), ref("t1", "id:A")))
+        val tgt = mapOf("cardCollection[0].card[0].serviceTags" to listOf(ref("t1", "id:A"), ref("t2", "id:B")))
         assertTrue(VerificationDiff.referenceDiffs(src, tgt).isEmpty())
         assertEquals(true to "identical after normalization", VerificationDiff.classifyWithReferences(body, body, src, tgt, hasPath))
+    }
+
+    @Test
+    fun `same references in a different order are a mismatch`() {
+        val src = mapOf("cardCollection[0].card[0].serviceTags" to listOf(ref("s1", "id:A"), ref("s2", "id:B")))
+        val tgt = mapOf("cardCollection[0].card[0].serviceTags" to listOf(ref("t2", "id:B"), ref("t1", "id:A")))
+        assertEquals(listOf("cardCollection[0].card[0].serviceTags"), VerificationDiff.referenceDiffs(src, tgt))
     }
 
     @Test

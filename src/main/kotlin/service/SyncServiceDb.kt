@@ -536,9 +536,20 @@ val TECHNICAL_FIELDS = setOf(
 )
 private val IGNORE_COMPARE_FIELDS = TECHNICAL_FIELDS + setOf("locale", "__sync_id")
 
+/**
+ * Row marker listing the row's JSON columns. A JSON attribute is an opaque value: keys inside it
+ * ("id", "created_at"…) are content, so cleaning, fingerprinting and payload building must not
+ * recurse into it the way they do into component rows (whose "id" IS per-instance metadata).
+ */
+const val JSON_KEYS = "__json"
+
+fun jsonKeysOf(o: JsonObject): Set<String> =
+    (o[JSON_KEYS] as? JsonArray)?.mapNotNull { it.jsonPrimitive.contentOrNull }?.toSet().orEmpty()
+
 private fun parseJsonObject(json: String): JsonObject = Json.parseToJsonElement(json).jsonObject
 
 fun cleanObject(o: JsonObject, excludedFields: Set<String> = emptySet(), currentPath: String = ""): JsonObject {
+    val opaque = jsonKeysOf(o)
     val sortedMap = o.entries
         .filter { (key, _) ->
             val fullPath = if (currentPath.isEmpty()) key else "$currentPath.$key"
@@ -547,7 +558,7 @@ fun cleanObject(o: JsonObject, excludedFields: Set<String> = emptySet(), current
         .sortedBy { it.key }
         .associate { (key, value) ->
             val fullPath = if (currentPath.isEmpty()) key else "$currentPath.$key"
-            key to cleanValue(value, excludedFields, fullPath)
+            key to if (key in opaque) value else cleanValue(value, excludedFields, fullPath)
         }
 
     // Usa LinkedHashMap per preservare l'ordine
@@ -682,7 +693,9 @@ suspend fun fetchPublishedRowsAsJson(
             } else null
 
             val rowWithLinks = if (linksJson != null) JsonObject(row + mapOf("__links" to linksJson)) else row
-            val links = linksForRow
+            val links = linksForRow.map { l ->
+                l.copy(targetDocumentId = l.targetId?.let { docIdMaps[l.targetTable]?.get(it) })
+            }
             rowWithLinks to links
         }
     } catch (e: Exception) {
@@ -757,6 +770,27 @@ internal fun resolveLinkAttributeName(ownerTable: String, lnkTable: String, targ
     }
     return relations.filter { hasSuffix(it.name) }.maxByOrNull { it.name.length }?.name
 }
+
+/**
+ * Relation attributes of [ownerTable] whose references the DB reader actually sees: the ones stored in
+ * a `*_lnk` join table it owns (same selection as [enrichTableRowsWithCmps]). Only these can be known
+ * to be EMPTY on the source; an attribute the reader can't see (inverse `mappedBy` side, morph-like
+ * table, target without metadata) must never be written as empty, or it would wipe real references.
+ */
+internal fun readableRelationAttributes(ownerTable: String, dbSchema: DbSchema): Set<String> =
+    dbSchema.tables
+        .filter { t ->
+            t.name.endsWith("_lnk") && t.foreignKeys.firstOrNull()?.referencedTable == ownerTable &&
+                t.columns.none { it.name == "field" }
+        }
+        .flatMap { lnk ->
+            lnk.foreignKeys.filter { it.referencedTable != ownerTable }.mapNotNull { fk ->
+                val target = fk.referencedTable ?: return@mapNotNull null
+                val readable = target == "files" || dbSchema.tables.firstOrNull { it.name == target }?.metadata?.apiUid != null
+                if (readable) resolveLinkAttributeName(ownerTable, lnk.name, target, dbSchema) else null
+            }
+        }
+        .toSet()
 
 // Join tables already reported as unmappable (warn once, not once per component row).
 private val unmappedLinkTablesWarned: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
@@ -1022,9 +1056,13 @@ private suspend fun enrichTableRowsWithCmps(
     }
 
     // 5) Attach data to base rows: embed components and link placeholders
+    val jsonColumns = dbSchema.tables.firstOrNull { it.name == tableName }?.columns
+        ?.filter { it.type == "jsonb" || it.type == "json" }?.map { it.name }.orEmpty()
     val enriched = baseRows.map { row ->
         val id = row["id"]?.jsonPrimitive?.intOrNull
         val additions = mutableMapOf<String, JsonElement>()
+        jsonColumns.filter { row.containsKey(it) }.takeIf { it.isNotEmpty() }
+            ?.let { keys -> additions[JSON_KEYS] = JsonArray(keys.map { JsonPrimitive(it) }) }
 
         // Components
         if (id != null) {
@@ -1332,14 +1370,15 @@ private val FINGERPRINT_DROP = setOf(
 )
 
 /** Replace a __links object's per-field documentId lists with the referenced entities' IDENTITY
- *  (sync_id, else content/file hash via the passed map), SORTED. So the SAME logical references
- *  compare equal across instances regardless of per-instance documentId or order (duplicate targets
- *  referenced in a different order are not a change), while add/remove of a reference still shows. */
+ *  (sync_id, else content/file hash via the passed map), IN ORDER. So the SAME logical references
+ *  compare equal across instances regardless of per-instance documentId, while add/remove AND reorder
+ *  of references show (relation order is content: it is what the frontend renders). Duplicate targets
+ *  share one identity, so swapping two copies of the same content is still not a change. */
 fun normalizeLinksBySyncId(objMap: MutableMap<String, JsonElement>, syncByDoc: Map<String, String>) {
     val links = objMap["__links"] as? JsonObject ?: return
     objMap["__links"] = JsonObject(links.entries.associate { (field, arr) ->
         val a = arr as? JsonArray ?: JsonArray(emptyList())
-        val keys = a.map { v -> v.jsonPrimitive.contentOrNull?.let { id -> syncByDoc[id] ?: "doc:$id" } ?: "null" }.sorted()
+        val keys = a.map { v -> v.jsonPrimitive.contentOrNull?.let { id -> syncByDoc[id] ?: "doc:$id" } ?: "null" }
         field to JsonArray(keys.map { JsonPrimitive(it) })
     })
 }
@@ -1358,10 +1397,13 @@ fun contentFingerprint(c: StrapiContent, syncByDoc: Map<String, String>): String
         })
     }
     fun canon(e: JsonElement): JsonElement = when (e) {
-        is JsonObject -> JsonObject(
-            e.filterKeys { it !in FINGERPRINT_DROP }.toSortedMap()
-                .mapValues { (k, v) -> if (k == "__links") canonLinks(v) else canon(v) }
-        )
+        is JsonObject -> {
+            val opaque = jsonKeysOf(e)
+            JsonObject(
+                e.filterKeys { it !in FINGERPRINT_DROP }.toSortedMap()
+                    .mapValues { (k, v) -> if (k == "__links") canonLinks(v) else if (k in opaque) v else canon(v) }
+            )
+        }
         is JsonArray -> JsonArray(e.map { canon(it) })
         else -> e
     }

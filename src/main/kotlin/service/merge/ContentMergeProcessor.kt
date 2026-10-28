@@ -227,7 +227,8 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
                                                 schemaLinkMeta.apiUid,
                                                 link.targetId,
                                                 comparisonDataMap,
-                                                mappingMap
+                                                mappingMap,
+                                                link.targetDocumentId
                                             )
                                             if (docId != null) link.targetTable to docId else null
                                         }
@@ -721,12 +722,14 @@ class ContentMergeProcessor(private val mergeRequestSelectionsRepository: MergeR
         targetCollectionUID: String,
         id: Int?,
         comparisonDataMap: ContentTypeComparisonResultMapWithRelationships,
-        mappingMap: Map<String, Map<String, MergeRequestDocumentMapping>> = emptyMap()
+        mappingMap: Map<String, Map<String, MergeRequestDocumentMapping>> = emptyMap(),
+        knownSourceDocId: String? = null
     ): String? {
-        if (id == null) return null
-        // Step 1: find the SOURCE documentId for the provided numeric id
-        var sourceDocId: String? = null
-        when (table) {
+        if (id == null && knownSourceDocId == null) return null
+        if (id == null) return mappingMap[targetCollectionUID]?.get(knownSourceDocId!!)?.targetDocumentId ?: knownSourceDocId
+        // Step 1: find the SOURCE documentId for the provided numeric id (unless read with the link)
+        var sourceDocId: String? = knownSourceDocId
+        if (sourceDocId == null) when (table) {
             "files" -> {
                 comparisonDataMap.files.forEach { cmp ->
                     val s = cmp.sourceImage?.metadata
@@ -1145,7 +1148,11 @@ internal fun filterByTargetSchema(
         for ((k, v) in data) {
             if (k.startsWith("__")) { put(k, v); continue }
             val attr = attrs[k] ?: byNorm[ContentJsonUtils.normalizeKeyName(k)]
-            if (attr == null) { dropped.add("$path.$k" + if (isRelationPayload(v)) RELATION_SUFFIX else ""); continue }
+            if (attr == null) {
+                // Clearing an attribute the target doesn't have loses nothing: not worth a warning.
+                if (!ContentJsonUtils.isClearingWrite(v)) dropped.add("$path.$k" + if (isRelationPayload(v)) RELATION_SUFFIX else "")
+                continue
+            }
             val compUid = attr.component
             val newValue: JsonElement = when {
                 attr.type == "component" && compUid != null -> {
