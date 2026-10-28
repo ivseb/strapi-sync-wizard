@@ -15,6 +15,8 @@ import {
 import { mediaApi, FileReferencesResponse } from '../../api/media';
 import ManualCollectionMapper from './components/ManualCollectionMapper';
 import ExclusionsManager from './components/ExclusionsManager';
+import { ExpandCollapseAll } from '../common/GroupNav';
+import { usePersistentSet, usePersistentState } from '../../hooks/usePersistentState';
 
 interface Props {
   mergeRequestId: number;
@@ -79,12 +81,14 @@ const MergeFilesWorkspace: React.FC<Props> = ({ mergeRequestId, sourceInstanceId
       setZoomRefs({ source: s, target: t, loading: false });
     } catch { setZoomRefs({ source: null, target: null, loading: false }); }
   };
-  const [search, setSearch] = useState('');
-  const [showIdentical, setShowIdentical] = useState(false);
+  // Filters and collapsed folders are remembered per merge request (tab switches, reloads).
+  const pk = `ss:mr:${mergeRequestId}:files:`;
+  const [search, setSearch] = usePersistentState(pk + 'search', '');
+  const [showIdentical, setShowIdentical] = usePersistentState(pk + 'identical', false);
   const [open, setOpen] = useState<Set<string>>(new Set());
-  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
-  const [dupOnly, setDupOnly] = useState(false);
-  const [activeStates, setActiveStates] = useState<Set<string>>(new Set(['ONLY_IN_SOURCE', 'DIFFERENT', 'ONLY_IN_TARGET']));
+  const [collapsedFolders, setCollapsedFolders] = usePersistentSet<string>(pk + 'collapsed', new Set());
+  const [dupOnly, setDupOnly] = usePersistentState(pk + 'dupOnly', false);
+  const [activeStates, setActiveStates] = usePersistentSet<string>(pk + 'states', new Set(['ONLY_IN_SOURCE', 'DIFFERENT', 'ONLY_IN_TARGET']));
   const [showExclusions, setShowExclusions] = useState(false);
   const [showMapper, setShowMapper] = useState(false);
   const toast = useRef<Toast>(null);
@@ -216,6 +220,7 @@ const MergeFilesWorkspace: React.FC<Props> = ({ mergeRequestId, sourceInstanceId
           </button>
         )}
         <span style={{ marginLeft: 'auto' }} />
+        <ExpandCollapseAll onExpand={() => setCollapsedFolders(new Set())} onCollapse={() => setCollapsedFolders(new Set(groups.map((g) => g.folder)))} />
         <button className="ss-btn subtle" onClick={() => setShowMapper(true)}><i className="pi pi-link" aria-hidden="true" /> Mapping</button>
         <button className="ss-btn subtle" onClick={() => setShowExclusions(true)}><i className="pi pi-ban" aria-hidden="true" /> Exclusions</button>
       </div>
@@ -230,18 +235,17 @@ const MergeFilesWorkspace: React.FC<Props> = ({ mergeRequestId, sourceInstanceId
           return (
             <div key={g.folder}>
               <div className="ss-group-head">
-                <button onClick={() => toggleFolder(g.folder)}>
-                  <i className={`pi pi-chevron-${collapsed ? 'right' : 'down'}`} style={{ fontSize: 12 }} aria-hidden="true" />
-                  <i className="pi pi-folder" style={{ fontSize: 13 }} aria-hidden="true" />
-                  <span style={{ textTransform: 'none', letterSpacing: 0, color: 'var(--ss-text)' }}>{g.folder}</span>
+                <button onClick={() => toggleFolder(g.folder)} aria-expanded={!collapsed}>
+                  <i className={`pi pi-chevron-${collapsed ? 'right' : 'down'}`} aria-hidden="true" />
+                  <i className="pi pi-folder" aria-hidden="true" />
+                  <span>{g.folder}</span>
+                  <span className="ss-group-n">{g.rows.length}</span>
                 </button>
-                <span className="ss-dim" style={{ fontSize: 10.5 }}>{g.rows.length} file{g.rows.length !== 1 ? 's' : ''}</span>
-                {g.counts.ONLY_IN_SOURCE > 0 && <span className="ss-count add" style={{ fontSize: 10.5 }}>+{g.counts.ONLY_IN_SOURCE}</span>}
-                {g.counts.DIFFERENT > 0 && <span className="ss-count upd" style={{ fontSize: 10.5 }}>~{g.counts.DIFFERENT}</span>}
-                {g.counts.ONLY_IN_TARGET > 0 && <span className="ss-count del" style={{ fontSize: 10.5 }}>−{g.counts.ONLY_IN_TARGET}</span>}
+                {g.counts.ONLY_IN_SOURCE > 0 && <span className="ss-count add">+{g.counts.ONLY_IN_SOURCE}</span>}
+                {g.counts.DIFFERENT > 0 && <span className="ss-count upd">~{g.counts.DIFFERENT}</span>}
+                {g.counts.ONLY_IN_TARGET > 0 && <span className="ss-count del">−{g.counts.ONLY_IN_TARGET}</span>}
                 {g.hasDup && <span className="ss-badge warn" title="Duplicate names in this folder">dup</span>}
-                <span style={{ marginLeft: 'auto' }} />
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 10.5, cursor: 'pointer', textTransform: 'none', letterSpacing: 0, color: 'var(--ss-text-2)' }}
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, cursor: 'pointer', color: 'var(--ss-text-2)' }}
                   title="Select every change in this folder">
                   <input type="checkbox" disabled={selectable.length === 0} checked={allSelected}
                     ref={(el) => { if (el) el.indeterminate = !allSelected && selectable.some((r) => selectedSet.has(r.id)); }}

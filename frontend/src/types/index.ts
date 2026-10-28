@@ -250,6 +250,14 @@ export interface MergeRequestData {
     collectionTypes: Record<string, ContentTypeComparisonResultWithRelationships[]>;
     contentTypeRelationships: ContentRelationship[];
     selections: MergeRequestSelectionDTO[];
+    typeLabels?: ContentTypeLabel[];
+}
+
+/** Admin display name of a content type, keyed by uid and by table name. */
+export interface ContentTypeLabel {
+    uid: string;
+    tableName: string;
+    displayName: string;
 }
 
 // Combined structure returned by the API

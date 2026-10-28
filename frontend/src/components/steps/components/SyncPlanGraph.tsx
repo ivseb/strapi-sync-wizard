@@ -8,6 +8,8 @@ export interface SyncPlanGraphProps {
     onInspect: (tableName: string, documentId: string) => void;
     // Resolve a readable label for an item; falls back to the documentId.
     labelFor?: (tableName: string, documentId: string) => string;
+    /** Display name of a content type (admin name); defaults to the last segment of the key. */
+    typeNameOf?: (tableName: string) => string;
 }
 
 type Op = 'create' | 'update' | 'delete';
@@ -32,7 +34,8 @@ const statusIcon = (status?: string): { char: string; color: string; title: stri
     }
 };
 
-const SyncPlanGraph: React.FC<SyncPlanGraphProps> = ({ syncPlan, syncItemsStatus, onInspect, labelFor }) => {
+const SyncPlanGraph: React.FC<SyncPlanGraphProps> = ({ syncPlan, syncItemsStatus, onInspect, labelFor, typeNameOf }) => {
+    const typeLabel = (t: string) => (typeNameOf ? typeNameOf(t) : shortType(t));
     const [hoveredId, setHoveredId] = useState<string | null>(null);
     const label = (t: string, d: string) => (labelFor ? labelFor(t, d) : d);
     const trunc = (s: string, max = 30) => (s.length > max ? s.slice(0, max - 1) + '…' : s);
@@ -221,7 +224,7 @@ const SyncPlanGraph: React.FC<SyncPlanGraphProps> = ({ syncPlan, syncItemsStatus
                                     <rect x={tbl.x} y={tbl.y} width={tbl.w} height={tbl.h} rx={8} ry={8} fill="var(--ss-surface)" stroke="var(--ss-border)" />
                                     <rect x={tbl.x} y={tbl.y} width={tbl.w} height={tableHeaderH} rx={8} ry={8} fill="var(--ss-surface-3)" stroke="var(--ss-border)" />
                                     <rect x={tbl.x} y={tbl.y + tableHeaderH - 8} width={tbl.w} height={8} fill="var(--ss-surface-3)" />
-                                    <text x={tbl.x + 12} y={tbl.y + 17} fontSize={11.5} fill="var(--ss-text)" fontWeight={600}>{shortType(t.table)}</text>
+                                    <text x={tbl.x + 12} y={tbl.y + 17} fontSize={11.5} fill="var(--ss-text)" fontWeight={600}>{typeLabel(t.table)}</text>
 
                                     {t.entries.map((entry) => {
                                         const key = `${t.table}:${entry.docId}`;

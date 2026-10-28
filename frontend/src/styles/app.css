@@ -60,10 +60,12 @@
 body { background: var(--ss-bg); color: var(--ss-text); }
 
 /* ---------- Shell ---------- */
-.ss-shell { display: flex; min-height: 100vh; background: var(--ss-bg); }
+/* App shell: exactly one screen tall, only .ss-main scrolls — so sticky elements inside it (group
+   headers, side index, bottom action bar) stick to what actually scrolls, and the sidebar stays put. */
+.ss-shell { display: flex; height: 100vh; background: var(--ss-bg); }
 
 .ss-sidebar {
-  width: 210px; flex: 0 0 210px;
+  width: 210px; flex: 0 0 210px; overflow-y: auto;
   border-right: 1px solid var(--ss-border);
   background: var(--ss-surface-2);
   padding: 14px 10px;
@@ -120,16 +122,21 @@ body { background: var(--ss-bg); color: var(--ss-text); }
 .ss-page-head .ss-spacer { margin-left: auto; }
 
 /* ---------- Tabs ---------- */
-.ss-tabs { display: flex; gap: 18px; align-items: center; border-bottom: 1px solid var(--ss-border); margin-bottom: 14px; }
+.ss-tabs { display: flex; gap: 26px; align-items: center; border-bottom: 1px solid var(--ss-border); margin-bottom: 14px; }
 .ss-tab {
   background: none; border: none; cursor: pointer; font: inherit;
-  padding: 0 0 9px; color: var(--ss-text-2); font-size: 13px;
+  padding: 10px 2px 11px; color: var(--ss-text-2); font-size: 14px; font-weight: 500;
   border-bottom: 2px solid transparent; margin-bottom: -1px;
-  display: inline-flex; align-items: center; gap: 6px;
+  display: inline-flex; align-items: center; gap: 8px;
 }
 .ss-tab:hover { color: var(--ss-text); }
 .ss-tab.active { color: var(--ss-text); border-bottom-color: var(--ss-accent); }
-.ss-tab .ss-tab-n { color: var(--ss-text-3); font-size: 12px; }
+/* count as a pill: readable in both states, highlighted on the active tab */
+.ss-tab .ss-tab-n {
+  font-size: 11.5px; font-weight: 600; line-height: 1.5; padding: 0 8px; border-radius: 999px;
+  background: var(--ss-surface-3); color: var(--ss-text-2);
+}
+.ss-tab.active .ss-tab-n { background: var(--ss-accent-soft-bg); color: var(--ss-accent-soft-fg); }
 
 /* ---------- Cards / list rows ---------- */
 .ss-card {
@@ -210,19 +217,56 @@ body { background: var(--ss-bg); color: var(--ss-text); }
 .ss-search input:focus { outline: none; border-color: var(--ss-accent); box-shadow: var(--focus-ring); }
 
 /* ---------- Detail: merge-review feed ---------- */
-.ss-review { border: 1px solid var(--ss-border); border-radius: var(--ss-radius); overflow: hidden; background: var(--ss-surface); }
+.ss-review { border: 1px solid var(--ss-border); border-radius: var(--ss-radius); overflow: clip; background: var(--ss-surface); }
 .ss-review-head { padding: 12px 16px; border-bottom: 1px solid var(--ss-border); }
 .ss-review-toolbar {
   padding: 7px 16px; border-bottom: 1px solid var(--ss-border);
   background: var(--ss-surface-2); display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
 }
 .ss-group-head {
-  padding: 5px 16px; background: var(--ss-surface-2); border-bottom: 1px solid var(--ss-border-soft);
-  display: flex; align-items: center; gap: 8px;
-  font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--ss-text-2);
-  position: sticky; top: 0; z-index: 1;
+  padding: 8px 16px; background: var(--ss-surface-2); border-bottom: 1px solid var(--ss-border-soft);
+  display: flex; align-items: center; gap: 10px;
+  font-size: 13.5px; color: var(--ss-text);
+  position: sticky; top: 0; z-index: 2; scroll-margin-top: 4px;
 }
-.ss-group-head button { background: none; border: none; cursor: pointer; color: inherit; font: inherit; display: inline-flex; align-items: center; gap: 8px; padding: 0; }
+.ss-group-head button { background: none; border: none; cursor: pointer; color: inherit; font: inherit; display: inline-flex; align-items: center; gap: 10px; padding: 0; }
+/* the title button takes the free width: the whole row toggles, not just the label */
+.ss-group-head > button:first-child { flex: 1; min-width: 0; padding: 2px 0; font-weight: 500; text-align: left; }
+.ss-group-head .pi { font-size: 12px; color: var(--ss-text-2); }
+.ss-group-n {
+  font-size: 11.5px; font-weight: 600; line-height: 1.5; padding: 0 8px; border-radius: 999px;
+  background: var(--ss-surface-3); color: var(--ss-text);
+}
+.ss-group-head.ss-flash { animation: ss-flash .9s ease-out; }
+@keyframes ss-flash { from { background: var(--ss-accent-soft-bg); } to { background: var(--ss-surface-2); } }
+
+/* content type name: admin name + API id */
+.ss-type-api { color: var(--ss-text-3); font-weight: 400; font-size: .92em; }
+.ss-expandall { display: inline-flex; gap: 6px; }
+
+/* quick access: side index on wide screens, "jump to" select otherwise */
+.ss-typeindex { display: none; }
+.ss-typejump {
+  height: 30px; font-size: 12px; max-width: 230px; padding: 0 8px;
+  background: var(--ss-surface); color: var(--ss-text); border: 1px solid var(--ss-border); border-radius: var(--ss-radius-sm);
+}
+@media (min-width: 1280px) {
+  .ss-withindex.has-index { display: grid; grid-template-columns: 236px minmax(0, 1fr); align-items: start; }
+  .ss-typeindex {
+    display: flex; flex-direction: column; position: sticky; top: 0;
+    max-height: calc(100vh - 24px); overflow-y: auto; padding: 8px 0;
+    border-right: 1px solid var(--ss-border); background: var(--ss-surface);
+  }
+  .ss-typejump { display: none; }
+}
+.ss-typeindex-title { font-size: 11px; color: var(--ss-text-3); padding: 4px 14px 8px; text-transform: uppercase; letter-spacing: .05em; }
+.ss-typeindex-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 14px;
+  background: none; border: none; cursor: pointer; font: inherit; font-size: 12.5px; text-align: left; color: var(--ss-text-2);
+}
+.ss-typeindex-item:hover { background: var(--ss-surface-2); color: var(--ss-text); }
+.ss-typeindex-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ss-typeindex-counts { display: inline-flex; gap: 5px; flex: none; font-size: 11px; }
 
 .ss-erow { border-bottom: 1px solid var(--ss-border-soft); }
 .ss-erow-head { display: flex; align-items: center; gap: 9px; padding: 7px 16px; cursor: pointer; }
@@ -244,12 +288,13 @@ body { background: var(--ss-bg); color: var(--ss-text); }
 .ss-diff .c.empty { color: var(--ss-text-3); }
 .ss-nested-key { font-size: 10px; color: var(--ss-text-3); }
 
-/* sticky action bar (in-flow, at the bottom of the review) */
+/* action bar (in-flow); with .ss-sticky-bottom it stays at the bottom of the screen while scrolling */
 .ss-actionbar {
-  display: flex; align-items: center; gap: 12px;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
   padding: 10px 16px; background: var(--ss-surface-2);
   border-top: 1px solid var(--ss-border);
 }
+.ss-sticky-bottom { position: sticky; bottom: 0; z-index: 5; box-shadow: 0 -6px 16px rgba(0, 0, 0, .28); }
 .ss-link { color: var(--ss-info); cursor: pointer; font-size: 12px; background: none; border: none; padding: 0; font: inherit; }
 .ss-link:hover { text-decoration: underline; }
 

@@ -1134,6 +1134,13 @@ class MergeRequestService(
      * @param id Merge request ID
      * @return MergeRequestData containing all the necessary information
      */
+    private fun typeLabelsOf(schema: DbSchema?): List<ContentTypeLabel> =
+        schema?.tables.orEmpty().mapNotNull { t ->
+            val m = t.metadata ?: return@mapNotNull null
+            if (m.collectionType != StrapiContentTypeKind.SingleType && m.collectionType != StrapiContentTypeKind.CollectionType) return@mapNotNull null
+            ContentTypeLabel(uid = m.apiUid, tableName = t.name, displayName = m.displayName)
+        }
+
     suspend fun getAllMergeRequestData(id: Int, forceCompare: Boolean): MergeRequestData? {
         return getAllMergeRequestDataIfCompared(id, forceCompare)
     }
@@ -1170,7 +1177,8 @@ class MergeRequestService(
                 singleTypes = compareResult.singleTypes,
                 collectionTypes = compareResult.collectionTypes,
                 contentTypeRelationships = compareResult.contentTypeRelationships,
-                selections = selections
+                selections = selections,
+                typeLabels = typeLabelsOf(dataFileUtils.getSchemaCompatibilityFile(id)?.extractedSchema)
             )
         }
     }
