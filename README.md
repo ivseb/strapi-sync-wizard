@@ -99,6 +99,15 @@ The application can be configured through environment variables or the `applicat
 ./gradlew jibDockerBuild
 ```
 
+The image runs on the Temurin 21 JRE for Alpine. Release images (CI) use a hardened base built from
+`docker/base/Dockerfile` (all Alpine packages patched, build-only packages removed) and are scanned with
+Trivy before publishing: the release fails if any vulnerability with an available fix is found.
+
+```bash
+docker build --pull --platform linux/amd64 -t strapi-sync-wizard-base:21-jre-alpine docker/base
+./gradlew buildImage -PbaseImage=docker://strapi-sync-wizard-base:21-jre-alpine
+```
+
 ### Docker Image
 
 A public Docker image is available and can be used directly. You can find it at the following link:

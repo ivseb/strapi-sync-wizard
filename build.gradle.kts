@@ -8,7 +8,7 @@ val logback_version: String by project
 
 plugins {
     kotlin("jvm") version "2.4.0"
-    id("io.ktor.plugin") version "3.5.0"
+    id("io.ktor.plugin") version "3.5.2"
     id("org.jetbrains.kotlin.plugin.serialization") version "2.4.0"
 }
 java {
@@ -49,7 +49,7 @@ dependencies {
     implementation("org.jetbrains.exposed:exposed-core:$exposed_version")
     implementation("org.jetbrains.exposed:exposed-crypt:$exposed_version")
     implementation("org.jetbrains.exposed:exposed-jdbc:$exposed_version")
-    implementation("org.bouncycastle:bcprov-jdk18on:1.84")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.87")
 //    implementation("org.jetbrains.exposed:exposed-r2dbc:$exposed_version")
 //    implementation("org.jetbrains.exposed:exposed-migration-r2dbc:$exposed_version")
 //    implementation("org.jetbrains.exposed:exposed-dao:$exposed_version")
@@ -62,7 +62,7 @@ dependencies {
     implementation("io.ktor:ktor-client-logging")
     implementation("com.zaxxer:HikariCP:7.1.0")
     implementation("com.h2database:h2:$h2_version")
-    implementation("org.postgresql:postgresql:42.7.11")
+    implementation("org.postgresql:postgresql:42.7.14")
 //    implementation("org.postgresql:r2dbc-postgresql:1.0.7.RELEASE")
     implementation("io.ktor:ktor-server-netty")
     implementation("ch.qos.logback:logback-classic:$logback_version")
@@ -75,6 +75,16 @@ dependencies {
     testImplementation("io.mockk:mockk:1.14.11")
     testImplementation("io.ktor:ktor-client-mock")
     testImplementation("io.ktor:ktor-network-tls-certificates")
+
+    // CVE remediation for transitive dependencies: same release lines, patch versions only.
+    // netty comes from ktor-server-netty, jackson/commons-lang3 from kotlin-asyncapi (swagger-core).
+    implementation(platform("io.netty:netty-bom:4.2.20.Final"))
+    implementation(platform("com.fasterxml.jackson:jackson-bom:2.18.12"))
+    constraints {
+        implementation("org.apache.commons:commons-lang3:3.22.0") {
+            because("CVE-2025-48924 fixed in 3.18.0")
+        }
+    }
 }
 
 
@@ -116,6 +126,9 @@ fun String.toKebabCase(): String {
 ktor {
     docker {
         jreVersion.set(JavaVersion.VERSION_21)
+        // Alpine-based Temurin JRE: same JVM as the Ubuntu default, far fewer OS packages (and CVEs).
+        // CI passes -PbaseImage=docker://… with the hardened image built from docker/base/Dockerfile.
+        customBaseImage.set(providers.gradleProperty("baseImage").orElse("eclipse-temurin:21-jre-alpine"))
         localImageName.set("sample-docker-image")
         imageTag.set(rootProject.version.toString())
         environmentVariables.set(listOf(
