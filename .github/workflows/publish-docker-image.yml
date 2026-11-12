@@ -5,6 +5,10 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+env:
+  BASE_IMAGE: strapi-sync-wizard-base:21-jre-alpine
+  TRIVY_IMAGE: aquasec/trivy:0.76.2
+
 jobs:
   publish:
     runs-on: self-hosted
@@ -27,8 +31,28 @@ jobs:
     - name: Grant execute permission for gradlew
       run: chmod +x ./gradlew
 
+    # Hardened runtime base (Temurin 21 JRE on Alpine, all packages patched), see docker/base/Dockerfile.
+    - name: Build hardened base image
+      run: docker build --pull --platform linux/amd64 -t "$BASE_IMAGE" docker/base
+
+    - name: Build image tarball
+      run: ./gradlew buildFrontend buildImage -PbaseImage="docker://$BASE_IMAGE"
+      env:
+        CI: false
+
+    - name: Audit frontend dependencies
+      working-directory: frontend
+      run: npm audit --audit-level=low
+
+    # Fails the release if the image contains any vulnerability that already has a fix.
+    - name: Scan image for vulnerabilities
+      run: |
+        docker run --rm -v "$PWD/build:/w" -v trivy-cache:/root/.cache "$TRIVY_IMAGE" \
+          image --input /w/jib-image.tar --scanners vuln,secret \
+          --ignore-unfixed --exit-code 1 --skip-version-check
+
     - name: Publish Docker image
-      run: ./gradlew publishImage
+      run: ./gradlew publishImage -PbaseImage="docker://$BASE_IMAGE"
       env:
         DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
         DOCKER_HUB_PASSWORD: ${{ secrets.DOCKER_HUB_PASSWORD }}
