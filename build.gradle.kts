@@ -36,7 +36,7 @@ repositories {
 }
 
 dependencies {
-    implementation("org.openfolder:kotlin-asyncapi-ktor:3.1.1")
+    implementation("org.openfolder:kotlin-asyncapi-ktor:3.2.4")
     implementation("io.ktor:ktor-server-compression")
     implementation("io.ktor:ktor-server-core")
     implementation("io.ktor:ktor-server-host-common")
