@@ -6,5 +6,5 @@
 #
 #   docker build --pull --platform linux/amd64 -t strapi-sync-wizard-base:21-jre-alpine docker/base
 #   ./gradlew buildImage -PbaseImage=docker://strapi-sync-wizard-base:21-jre-alpine
-FROM eclipse-temurin:21-jre-alpine
+FROM eclipse-temurin:25-jre-alpine
 RUN apk upgrade --no-cache && apk del --no-cache gnupg coreutils
