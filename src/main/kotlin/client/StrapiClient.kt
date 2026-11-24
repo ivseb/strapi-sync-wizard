@@ -14,7 +14,6 @@ import io.ktor.client.request.forms.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
-import io.swagger.v3.core.util.Json
 import it.sebi.JsonParser
 import it.sebi.models.*
 import it.sebi.utils.calculateMD5Hash

@@ -36,7 +36,6 @@ repositories {
 }
 
 dependencies {
-    implementation("org.openfolder:kotlin-asyncapi-ktor:3.1.1")
     implementation("io.ktor:ktor-server-compression")
     implementation("io.ktor:ktor-server-core")
     implementation("io.ktor:ktor-server-host-common")
@@ -76,15 +75,9 @@ dependencies {
     testImplementation("io.ktor:ktor-client-mock")
     testImplementation("io.ktor:ktor-network-tls-certificates")
 
-    // CVE remediation for transitive dependencies: same release lines, patch versions only.
-    // netty comes from ktor-server-netty, jackson/commons-lang3 from kotlin-asyncapi (swagger-core).
+    // CVE remediation for transitive dependencies: same release line, patch versions only.
+    // netty comes from ktor-server-netty.
     implementation(platform("io.netty:netty-bom:4.2.21.Final"))
-    implementation(platform("com.fasterxml.jackson:jackson-bom:2.18.12"))
-    constraints {
-        implementation("org.apache.commons:commons-lang3:3.22.0") {
-            because("CVE-2025-48924 fixed in 3.18.0")
-        }
-    }
 }
 
 
