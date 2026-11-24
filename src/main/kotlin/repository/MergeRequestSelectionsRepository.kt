@@ -21,7 +21,10 @@ class MergeRequestSelectionsRepository {
      * Get all selections for a merge request
      */
     suspend fun getSelectionsForMergeRequest(mergeRequestId: Int): List<MergeRequestSelection> = dbQuery {
+        // Explicit order: the sync plan (dependency batches, execution order) is derived from this list,
+        // and without ORDER BY Postgres returns rows in physical order, which changes after updates.
         MergeRequestSelectionsTable.selectAll().where { MergeRequestSelectionsTable.mergeRequestId eq mergeRequestId }
+            .orderBy(MergeRequestSelectionsTable.id)
             .map {
                 MergeRequestSelection(
                     id = it[MergeRequestSelectionsTable.id].value,
@@ -43,6 +46,7 @@ class MergeRequestSelectionsRepository {
     suspend fun getSelectionsGroupedByTableName(mergeRequestId: Int): List<MergeRequestSelectionDTO> = dbQuery {
         val selections = MergeRequestSelectionsTable.selectAll()
             .where { MergeRequestSelectionsTable.mergeRequestId eq mergeRequestId }
+            .orderBy(MergeRequestSelectionsTable.id)
             .map {
                 MergeRequestSelection(
                     id = it[MergeRequestSelectionsTable.id].value,

@@ -13,15 +13,10 @@ updates:
       gradle-minor-patch:
         update-types: [minor, patch]
     ignore:
-      # CVE overrides of transitive deps (see build.gradle.kts): stay on the same release
+      # CVE override of a transitive dep (see build.gradle.kts): stay on the same release
       # line, take patch releases only. Moving line is a deliberate change, not a bot bump.
-      - dependency-name: com.fasterxml.jackson:jackson-bom
-        update-types: [version-update:semver-major, version-update:semver-minor]
       - dependency-name: io.netty:netty-bom
         update-types: [version-update:semver-major, version-update:semver-minor]
-      # kotlin-asyncapi >= 3.1.3 pulls jackson 2.20+ (3.2.x: 2.22+), silently overriding the
-      # 2.18 pin above (platform() is not enforced). Frozen until the jackson line is decided.
-      - dependency-name: org.openfolder:kotlin-asyncapi-ktor
 
   - package-ecosystem: npm
     directory: /frontend

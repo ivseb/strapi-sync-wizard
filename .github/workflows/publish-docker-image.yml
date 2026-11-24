@@ -17,16 +17,18 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v7
 
-    - name: Set up JDK 17
+    # Same JDK as the Gradle toolchain (jvmToolchain(21)) and the runtime image.
+    - name: Set up JDK 21
       uses: actions/setup-java@v6
       with:
-        java-version: '17'
+        java-version: '21'
         distribution: 'temurin'
 
-    - name: Set up Node.js 20
+    # Node 22 LTS (Node 20 is EOL); Vite 8 needs ^20.19 || >=22.12. Keep @types/node on the same major.
+    - name: Set up Node.js 22
       uses: actions/setup-node@v7
       with:
-        node-version: '20'
+        node-version: '22'
 
     - name: Grant execute permission for gradlew
       run: chmod +x ./gradlew
@@ -51,8 +53,26 @@ jobs:
           image --input /w/jib-image.tar --scanners vuln,secret \
           --ignore-unfixed --exit-code 1 --skip-version-check
 
+    # publishImage pushes <version> and latest. A version already on Docker Hub is a release:
+    # never overwrite it, publish latest only. Bump `version` in build.gradle.kts to release.
+    - name: Choose image tag
+      id: tag
+      run: |
+        version=$(sed -n 's/^version = "\(.*\)"$/\1/p' build.gradle.kts)
+        [ -n "$version" ] || { echo "::error::version not found in build.gradle.kts"; exit 1; }
+        code=$(curl -s -o /dev/null -w '%{http_code}' \
+          "https://hub.docker.com/v2/namespaces/$DOCKER_HUB_USERNAME/repositories/strapi-sync-wizard/tags/$version")
+        case "$code" in
+          404) tag="$version" ;;
+          200) tag=latest; echo "::notice::$version is already published: pushing latest only" ;;
+          *) echo "::error::Docker Hub tag lookup returned HTTP $code"; exit 1 ;;
+        esac
+        echo "image_tag=$tag" >> "$GITHUB_OUTPUT"
+      env:
+        DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
+
     - name: Publish Docker image
-      run: ./gradlew publishImage -PbaseImage="docker://$BASE_IMAGE"
+      run: ./gradlew publishImage -PbaseImage="docker://$BASE_IMAGE" -PimageTag="${{ steps.tag.outputs.image_tag }}"
       env:
         DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
         DOCKER_HUB_PASSWORD: ${{ secrets.DOCKER_HUB_PASSWORD }}
