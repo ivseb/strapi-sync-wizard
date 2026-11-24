@@ -1,18 +1,69 @@
+# Every merge on main publishes isebben/strapi-sync-wizard:latest, so updates are grouped
+# to keep the number of merges (and releases) low. Major updates still arrive one per PR,
+# except the ones ignored below on purpose.
 version: 2
 updates:
   - package-ecosystem: gradle
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      gradle-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      # CVE overrides of transitive deps (see build.gradle.kts): stay on the same release
+      # line, take patch releases only. Moving line is a deliberate change, not a bot bump.
+      - dependency-name: com.fasterxml.jackson:jackson-bom
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: io.netty:netty-bom
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      # kotlin-asyncapi 3.2.x pulls jackson 2.22+, silently overriding the 2.18 pin above
+      # (platform() is not enforced). Its minor bumps move with the jackson decision.
+      - dependency-name: org.openfolder:kotlin-asyncapi-ktor
+        update-types: [version-update:semver-major, version-update:semver-minor]
+
   - package-ecosystem: npm
     directory: /frontend
     schedule:
       interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      # PrimeReact 11 / PrimeIcons 8 moved to the commercial "PrimeUI License" (license key
+      # required) and PrimeReact 11 needs React 19. Stay on the MIT 10.x / 7.x lines.
+      - dependency-name: primereact
+        update-types: [version-update:semver-major]
+      - dependency-name: primeicons
+        update-types: [version-update:semver-major]
+      - dependency-name: primeflex
+        update-types: [version-update:semver-major]
+      # Types must follow the Node.js major used to build (setup-node in the publish workflow).
+      - dependency-name: "@types/node"
+        update-types: [version-update:semver-major]
+
   - package-ecosystem: docker
     directory: /docker/base
     schedule:
       interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    ignore:
+      # The app targets Java 21 (jvmToolchain(21)): a JRE major is a deliberate migration.
+      # Patches arrive anyway: the base is rebuilt with --pull + apk upgrade on every publish.
+      - dependency-name: eclipse-temurin
+        update-types: [version-update:semver-major]
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      github-actions:
+        patterns: ["*"]
