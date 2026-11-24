@@ -8,7 +8,7 @@ val logback_version: String by project
 
 plugins {
     kotlin("jvm") version "2.4.0"
-    id("io.ktor.plugin") version "3.5.2"
+    id("io.ktor.plugin") version "3.6.1"
     id("org.jetbrains.kotlin.plugin.serialization") version "2.4.0"
 }
 java {
@@ -72,7 +72,7 @@ dependencies {
     implementation("org.apache.pdfbox:pdfbox:3.0.7")
     testImplementation("io.ktor:ktor-server-test-host")
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit:$kotlin_version")
-    testImplementation("io.mockk:mockk:1.14.11")
+    testImplementation("io.mockk:mockk:1.14.12")
     testImplementation("io.ktor:ktor-client-mock")
     testImplementation("io.ktor:ktor-network-tls-certificates")
 
