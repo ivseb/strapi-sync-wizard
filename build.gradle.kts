@@ -7,9 +7,9 @@ val kotlin_version: String by project
 val logback_version: String by project
 
 plugins {
-    kotlin("jvm") version "2.4.0"
+    kotlin("jvm") version "2.4.21"
     id("io.ktor.plugin") version "3.6.1"
-    id("org.jetbrains.kotlin.plugin.serialization") version "2.4.0"
+    id("org.jetbrains.kotlin.plugin.serialization") version "2.4.21"
 }
 java {
     sourceCompatibility = JavaVersion.VERSION_21
@@ -36,7 +36,7 @@ repositories {
 }
 
 dependencies {
-    implementation("org.openfolder:kotlin-asyncapi-ktor:3.1.1")
+    implementation("org.openfolder:kotlin-asyncapi-ktor:3.1.3")
     implementation("io.ktor:ktor-server-compression")
     implementation("io.ktor:ktor-server-core")
     implementation("io.ktor:ktor-server-host-common")
@@ -69,7 +69,7 @@ dependencies {
     implementation("io.ktor:ktor-server-cors:$ktor_version")
     implementation("io.ktor:ktor-server-sse:$ktor_version")
     // Robust fingerprinting of PDFs
-    implementation("org.apache.pdfbox:pdfbox:3.0.7")
+    implementation("org.apache.pdfbox:pdfbox:3.0.8")
     testImplementation("io.ktor:ktor-server-test-host")
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit:$kotlin_version")
     testImplementation("io.mockk:mockk:1.14.12")
@@ -78,7 +78,7 @@ dependencies {
 
     // CVE remediation for transitive dependencies: same release lines, patch versions only.
     // netty comes from ktor-server-netty, jackson/commons-lang3 from kotlin-asyncapi (swagger-core).
-    implementation(platform("io.netty:netty-bom:4.2.20.Final"))
+    implementation(platform("io.netty:netty-bom:4.2.21.Final"))
     implementation(platform("com.fasterxml.jackson:jackson-bom:2.18.12"))
     constraints {
         implementation("org.apache.commons:commons-lang3:3.22.0") {
