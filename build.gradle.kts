@@ -130,7 +130,9 @@ ktor {
         // CI passes -PbaseImage=docker://… with the hardened image built from docker/base/Dockerfile.
         customBaseImage.set(providers.gradleProperty("baseImage").orElse("eclipse-temurin:21-jre-alpine"))
         localImageName.set("sample-docker-image")
-        imageTag.set(rootProject.version.toString())
+        // CI passes -PimageTag=latest when this version is already on Docker Hub, so a merge on main
+        // never overwrites a released version tag (publishImage pushes imageTag + latest).
+        imageTag.set(providers.gradleProperty("imageTag").orElse(rootProject.version.toString()))
         environmentVariables.set(listOf(
             DockerEnvironmentVariable("JAVA_OPTS", "-Xmx2g -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -server"),
             DockerEnvironmentVariable("JVM_OPTS", "-Xmx2g -XX:+UseG1GC")
