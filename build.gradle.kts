@@ -61,7 +61,7 @@ dependencies {
     implementation("io.ktor:ktor-client-logging")
     implementation("com.zaxxer:HikariCP:7.1.0")
     implementation("com.h2database:h2:$h2_version")
-    implementation("org.postgresql:postgresql:42.7.14")
+    implementation("org.postgresql:postgresql:42.7.15")
 //    implementation("org.postgresql:r2dbc-postgresql:1.0.7.RELEASE")
     implementation("io.ktor:ktor-server-netty")
     implementation("ch.qos.logback:logback-classic:$logback_version")
